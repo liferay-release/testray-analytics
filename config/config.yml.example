@@ -1,0 +1,39 @@
+# testray-analytics — config template.
+# Copy to config/config.yml and fill in. NEVER commit config.yml.
+#
+# Same code runs local / UAT / prod — only this config differs
+# (ARCHITECTURE.md decision #5): base_url + per-env credentials.
+
+git:
+  # Persistent liferay-portal checkout (ARCHITECTURE.md §2 / §14). `prepare`
+  # runs `git diff` and `git log A..B` between the two build hashes; it may
+  # `git fetch` if a hash is missing. On Jenkins this is a persistent workspace
+  # that `git pull`s each run — never a fresh clone.
+  repo_path: /path/to/liferay-portal
+  base_branch: master
+
+testray:
+  # Testray REST base_url — the ONLY thing that changes local vs UAT vs prod.
+  #   local DXP:  http://localhost:8080
+  #   prod:       https://testray.liferay.com
+  base_url: "http://localhost:8080"
+
+  # OAuth2 client_credentials for the Testray REST API. Per-environment app:
+  # read scopes on Build / Case / CaseResult, write scope on TriageResult.
+  # Register one headless app per Testray instance. Never commit secrets.
+  client_id: ""
+  client_secret: ""
+
+triage:
+  classifier:
+    api:
+      # Classifier label is `api:<model>` and is model-version-pinned
+      # (ARCHITECTURE.md decision #9). Bumping the model creates new rows
+      # rather than overwriting — deliberate, for measurement.
+      model: claude-opus-4-8
+      effort: xhigh
+      max_chars_per_batch: 400000
+      max_output_tokens: 16000
+      delay_between_batches_seconds: 2
+
+# ANTHROPIC_API_KEY is passed via the environment, never stored here.
