@@ -15,7 +15,12 @@ dependencies = [
 ]
 
 # NOTE: no psycopg2 — the tool is REST-only (api source), no database (decision #4).
-# Console script `testray-analysis` is wired in Stage 2 alongside cli.py.
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+testray-analysis = "testray_analytics.analysis.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["testray_analytics*"]
