@@ -79,6 +79,19 @@ the hunks *and* `suspiciousCommits`. `liferay-portal` is multi-GB, so the Jenkin
 agent keeps a **persistent checkout with the release branches** and `git pull`s each
 run — never a fresh clone (too slow). Checkout strategy = open-Q #3.
 
+**Off-origin build commits.** A Testray build records only its `gitHash` — **not**
+the repo/branch it ran on (verified against a real build). So a commit that isn't
+reachable from `origin` — e.g. a **temp mitigation branch on a fork** (official HEAD
++ a fix commit that never lands upstream) — can't be auto-fetched; there's no
+metadata to derive the source from. The CLI handles this with **`prepare --fetch-ref
+<remote-or-url> <ref>`** (also accepts a GitHub `…/tree/<branch>` URL), which fetches
+the commit into the checkout before diffing; if a hash still can't be resolved,
+`prepare` fails with that guidance rather than a cryptic git error. The eventual
+triage **UI (LPD-95844) must offer the same input** when triaging an off-origin
+build — again, nothing to auto-derive. (Having CI populate repo/branch on the build
+would remove the need, but that's a Testray/CI-side change, outside this module's
+additive scope.)
+
 ---
 
 ## 3. Firm decisions
@@ -198,6 +211,36 @@ Surfacing our clusters as native Subtasks later is a separate, explicit integrat
   own reasoning. (A cluster-level *narrative* summary, if we ever add one, is still
   triage output, not Insights.)
 
+### Classification granularity — `per-test` vs `by-cluster` (LPD-95844)
+
+Two ways to classify, selected by a `--mode {per-test, by-cluster}` toggle. This is
+LPD-95844 work, **not** 95842 — today only `per-test` exists.
+
+- **`per-test`** (current default) — one prompt section per failure → a per-failure
+  verdict + `culprit_file`. `clusterKey` groups the results *after* classification,
+  for the cluster view. Highest fidelity + richest training labels; more tokens (the
+  shared header is cached, per-failure hunks are not).
+- **`by-cluster`** — group failures by **error signature (§5) *before* the API**,
+  classify **once per signature**, and **fan the verdict out to each member
+  `CaseResult`** (so the per-CaseResult grain, decision #6, is preserved). Cheaper,
+  and yields one consistent verdict per root cause. Reuses the existing by-subtask
+  fan-out machinery, keyed on our error signature instead of Testray's `subtask_id`.
+  Risk: an error signature can **over-group** failures with different real culprits,
+  applying one verdict too broadly.
+
+**Timing subtlety:** `clusterKey` = `culprit_file` + error signature, and
+`culprit_file` is an *LLM output* — so the full `clusterKey` is only known **after**
+classification (it's a display grouping). Pre-send clustering can therefore only
+group by **error signature alone**, not the full `clusterKey`.
+
+**Plan:** ship `per-test` as the default; **flip the default to `by-cluster` once §5
+normalization is trusted** (same ship-safe-then-tune logic as NEEDS_REVIEW), keeping
+`per-test` as a fallback for small/ambiguous runs, and offering an A/B of the same
+build pair (cost + verdict agreement). The granularity used is recorded in
+`run.yml`'s `mode` field. Keep the two mode-axes **distinct**: the *selection* mode
+(§8 → `analysisMode`: build-vs-build / routine-history / suite-vs-pr) is orthogonal
+to this *classification granularity*.
+
 ---
 
 ## 8. Use-case flows = `api`-sourced build-selection modes
@@ -224,12 +267,51 @@ All three cluster use cases are `api`-sourced and share the same rubric; only
 > *all-or-nothing* suite where consecutive failed builds accumulate, so a wrong
 > baseline hurts most there.
 
-> **Triggers (routine-dependent):** Stable + Acceptance fire on **build completion**;
-> Release on **promotion**; PR is **user-driven**.
-
 CLI gains `--mode {build-vs-build,routine-history,suite-vs-pr}` (default
 `build-vs-build`). The `TriageResult` schema carries `analysisMode` so all three
 coexist and the later modes slot in with no rework.
+
+### Per-routine workflow defaults
+
+Each routine has a **type** that sets its baseline rule, trigger, and commit
+expectations. The pipeline **infers type from the routine name** — the routine object
+(`/o/c/routines/{id}`) exposes a `name` but **no formal type field**. Verified across
+the canonical routines, keyword-matchable (case-insensitive substring):
+
+- `82964` → `"EE Package Tester"` → **Release** (`package tester`)
+- `79529` → `"[master] ci:test:stable"` → **Stable** (`stable`)
+- `590307` → `"EE Development Acceptance (master)"` → **Acceptance** (`acceptance`)
+
+A small **config override** (`routines:` block) covers names that don't match a
+pattern. Name-inference beats a hand-maintained ID map — 20+ routines and growing,
+and the name is already in the API. It's a heuristic, so the tool **logs the inferred
+type** and, on an unrecognized name, falls back to a safe default (+ warning) rather
+than guessing; the override corrects misfires.
+
+Notes: routine names **often embed the official branch** (`[master]`, `(master)`) —
+not universal, not needed for the diff (hash-to-hash), but it confirms these routines
+run **on-origin**, so off-origin is strictly a heavy-dev/PR concern. `autoanalyze` is
+uniformly `false` on these three, so it is **not** a type/trigger discriminator
+(meaning TBD).
+
+| Type | Baseline | Trigger | Commit locality | Tickets |
+|------|----------|---------|-----------------|---------|
+| **Stable** (e.g. 79529) | last fully-clean build (`FAILED`=0) | build completion | origin | **no** (#16) |
+| **Acceptance** (e.g. 590307) | across history | build completion | origin | yes |
+| **Release / EE Pkg** (e.g. 82964) | last **promoted** build | promotion | usually origin, **sometimes off-origin** (release temp/mitigation fixes) → fetch source | yes |
+| **Heavy-dev / PR** | reference build | user-driven | fork/temp → **off-origin common** → fetch source | yes |
+
+**Off-origin handling follows from the type.** Origin-only routines run fully
+automated (no fetch source needed). The types that *can* be off-origin (Release edge
+cases, Heavy-dev/PR) are exactly the ones where a fetch source is supplied — by a
+human at the CLI (`--fetch-ref`) or, for a UI-triggered run, a UI fetch-source input
+(§2). If a diff still can't be computed, the run records a **"diff unavailable —
+off-origin"** status rather than crashing (degraded: error-signature/flake triage
+only, no culprit attribution).
+
+*Status:* framework only. `prepare` today takes explicit build IDs and does not yet
+branch on routine type; the config `routines:` map + per-type baseline/trigger logic
+land with the selection-mode work (LPD-95845+).
 
 ---
 
@@ -276,6 +358,19 @@ REST endpoint.
 > **Ticket linkage is not stored here.** The Jira ticket lives on native
 > `CaseResult.issues` (§11), read via the `CaseResult`→`TriageResult` join. This
 > keeps Testray the source of truth and avoids a duplicate store.
+
+> **Write inclusion policy — what actually gets persisted.** The writer
+> (`testray_writer.py`) persists *actionable* verdicts and, by default,
+> **excludes** two non-actionable,
+> re-derivable classes: **high-confidence `FALSE_POSITIVE`** (a confident
+> not-a-failure) and the **auto/env buckets `DID_NOT_RUN` / `ENV_FAILURE`**
+> (env/infra pre-classification — never diff-analyzed, since a build failure or
+> env issue has no failure-vs-diff relationship to evaluate). Both are toggleable,
+> and run summaries still **count** them (the "auto-dismissed / env-noise volume"
+> KPI is preserved). `DID_NOT_RUN` = `BUILD_FAILURE`/`NO_ERROR`; `ENV_FAILURE` =
+> `ENV_*` — human-readable relabels of the old `AUTO_CLASSIFIED` umbrella (they're
+> auto-buckets, not LLM verdicts, so they sit outside the §4 taxonomy). Keeps the
+> store lean (T3 retention) and the triage view focused on code regressions.
 
 ---
 
@@ -526,6 +621,14 @@ exists), not a throwaway local container.
    one for a routine).
 5. **`ANTHROPIC_API_KEY`** in the environment.
 
+### Run bundles (where output lands)
+
+`prepare` writes each run bundle to **`./runs/r_<id>/`** (cwd-relative) by default —
+never inside the installed package. `classify` and `submit` take the bundle path
+explicitly, so they operate on a bundle located anywhere. On Jenkins, pass
+**`--out <dir>`** to write bundles into the job's workspace/artifacts dir instead of
+`./runs`.
+
 ### Milestones (match §10)
 
 1. **Tool → Object write works** — run the CLI, verify rows via
@@ -538,3 +641,38 @@ exists), not a throwaway local container.
 
 > "Trigger the analysis" in the PoC = **you run the CLI**. A trigger *button in
 > Testray* is the separate "Test trigger" feature (T3 in-scope item 3), later.
+
+---
+
+## 15. First live-run findings (2026-07-14) — tuning backlog
+
+First full Tier-3 run against live Testray (Acceptance routine 590307, builds
+496308678 → 497050886; 819 regressions, 736 classified via the real API). The loop
+works end to end; these are the quality findings that feed later tuning tickets.
+
+- **Hunk extraction was ~77% of the full diff** — barely filtered. The fragment
+  matcher's **fuzzy fallback over-broadened on generic tokens** (`portal`, `resource`,
+  `object`, `commerce`, `headless`) → hundreds of low-relevance files; meanwhile 356
+  of 384 fragments (specific test classes) matched **nothing**. Net: missed the
+  specific culprits, kept the noise. → **hunk-extraction tuning** (don't fuzzy-match
+  generic tokens; prefer exact class-name matches).
+- **74% NEEDS_REVIEW (545/736), 0 BUG, 6 POSSIBLE_BUG** — but the classifier is
+  **sound**: the decisive verdicts were coherent, correctly ticket-attributed
+  (LPD-97230, LPD-97016, LPD-85743) and rubric-correct (TEST_FIX → null culprit). So
+  the NEEDS_REVIEW bloat is **evidence-driven, not reasoning-driven** — fixing hunk
+  extraction should convert much of it into decisive verdicts. Strengthens the case
+  for **by-cluster (§7)** and the **NEEDS_REVIEW-rate guardrail (open-Q #10)**.
+- **Manifest/commits fallback confirmed working** — case 47786
+  (`LayoutSEOLinkManagerPageTitleTest`, a fragment that matched *no* file) was still
+  correctly attributed to `GroupLocalServiceImpl` (LPD-97016) via the commits
+  section. The transitive-dep safety net does its job.
+- **Verdicts cluster naturally** — the 9 decisive verdicts collapsed to ~4 root
+  causes (3× `ObjectEntryFolderResourceImpl`, 2× `GroupLocalServiceImpl`, 3× theme
+  migration). Concrete payoff waiting for `by-cluster`.
+- **component/team blank on api rows** (0/819) — the api reader returns them as IDs,
+  not names. Doesn't affect the product (the CX renders component/team from the
+  native `CaseResult`), only the local debug report. → resolve IDs → names, or switch
+  to the custom DTO (`testrayComponentName`/`testrayTeamName`) in the read-path
+  retarget.
+- **LLM output fidelity** — a few duplicate / out-of-batch / absent case_ids per run
+  (handled gracefully: keep-first / drop / default to NEEDS_REVIEW). 729/736.
