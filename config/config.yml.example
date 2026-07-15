@@ -3,24 +3,31 @@
 #
 # Same code runs local / UAT / prod — only this config differs
 # (ARCHITECTURE.md decision #5): base_url + per-env credentials.
+#
+# base_url and the Testray secrets can also come from the ENVIRONMENT, which
+# overrides the values here — TESTRAY_BASE_URL / TESTRAY_CLIENT_ID /
+# TESTRAY_CLIENT_SECRET (keep them in your shell / Jenkins credentials and leave
+# the fields below blank). ANTHROPIC_API_KEY is env-only.
 
 git:
   # Persistent liferay-portal checkout (ARCHITECTURE.md §2 / §14). `prepare`
   # runs `git diff` and `git log A..B` between the two build hashes; it may
-  # `git fetch` if a hash is missing. On Jenkins this is a persistent workspace
-  # that `git pull`s each run — never a fresh clone.
+  # `git fetch origin` if a hash is missing. On Jenkins this is a persistent
+  # workspace that `git pull`s each run — never a fresh clone.
+  # No branch setting needed: the diff is hash-to-hash (branch-agnostic); any
+  # branch's build hashes work as long as they're reachable in this checkout.
   repo_path: /path/to/liferay-portal
-  base_branch: master
 
 testray:
-  # Testray REST base_url — the ONLY thing that changes local vs UAT vs prod.
-  #   local DXP:  http://localhost:8080
+  # Testray REST base_url (env override: TESTRAY_BASE_URL). Point at the instance
+  # that HAS data — prod has real builds; a vanilla localhost does not:
   #   prod:       https://testray.liferay.com
-  base_url: "http://localhost:8080"
+  #   local DXP:  http://localhost:8080   (only once it's loaded with data)
+  base_url: "https://testray.liferay.com"
 
-  # OAuth2 client_credentials for the Testray REST API. Per-environment app:
-  # read scopes on Build / Case / CaseResult, write scope on TriageResult.
-  # Register one headless app per Testray instance. Never commit secrets.
+  # OAuth2 client_credentials (env overrides: TESTRAY_CLIENT_ID /
+  # TESTRAY_CLIENT_SECRET). Per-environment app: read scopes on
+  # Build / Case / CaseResult, write scope on TriageResult. Never commit secrets.
   client_id: ""
   client_secret: ""
 
