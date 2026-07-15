@@ -313,6 +313,23 @@ only, no culprit attribution).
 branch on routine type; the config `routines:` map + per-type baseline/trigger logic
 land with the selection-mode work (LPD-95845+).
 
+### Default view per context (folded-in 95843 design)
+
+Resolves T3.txt's open "what should the default view be?" — each entry context lands
+on one of the modes above, **rendered clustered by default (§7)**:
+
+| Context | Default mode | Baseline |
+|---------|--------------|----------|
+| **Release** — U / Patch / Quarterly (+ LTS) | `build-vs-build` | last **promoted** build (a U release compares against the last promoted) |
+| **Product Team** — a specific routine | `routine-history` | across the routine's history |
+| **Acceptance** | `routine-history` | across history |
+| **Heavy-dev / PR** | `suite-vs-pr` | reference build (user-driven) |
+
+Raw build-results browse stays available as a **power-user fallback** (T3
+decommissioning note: build indices are no longer the default view, but remain
+reachable) — the default is triage-with-verdicts, clustered. This design was folded
+into **LPD-95842**; the views that render it are **LPD-95844+**.
+
 ---
 
 ## 9. The `TriageResult` Object (integration contract)
@@ -376,8 +393,9 @@ REST endpoint.
 
 ## 10. Build sequence (follows the tickets)
 
-1. **LPD-95842 (foundational):** this doc; repo scaffold; extract `apps/triage`
-   as an api-only, CLI-first tool with the Postgres write removed.
+1. **LPD-95842 (foundational):** this doc (incl. default-view-per-context design,
+   §8); repo scaffold; extract `apps/triage` as an api-only, CLI-first tool with the
+   Postgres write removed.
 2. **`TriageResult` Object (LPD-95843)** in a new `liferay-triage-site-initializer`
    CX (§9) — the contract everything hangs off.
 3. **Headless write-sink (LPD-95843)** — replace the Postgres upsert with `POST
