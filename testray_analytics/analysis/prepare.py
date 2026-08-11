@@ -417,6 +417,12 @@ def fetch_build_caseresults_api(build_id: int, cfg: dict) -> pd.DataFrame:
     fragment-based hunk matcher has something to anchor on. Component, team,
     and jira remain blank (separate per-case lookups — backlog).
 
+    The caseResult's own object `id` is kept as `caseresult_id`: it is the FK
+    the TriageResult write needs
+    (`r_caseResultToTriageResults_c_caseResultId`), and it is only resolvable
+    here — nothing downstream can recover it from a case id alone. Target-side
+    ids are the ones that matter; see `compute_test_diff`.
+
     Also pulls `r_subtaskToCaseResults_c_subtaskId` so subtask-mode triage
     (--by-subtask) can group failures by Testray Subtask without a second
     round-trip. The field is 0/null on builds that don't have a testflow,
@@ -444,6 +450,7 @@ def fetch_build_caseresults_api(build_id: int, cfg: dict) -> pd.DataFrame:
         return pd.DataFrame()
     return pd.DataFrame({
         "case_id":        [it.get("r_caseToCaseResult_c_caseId") for it in items],
+        "caseresult_id":  [it.get("id") for it in items],
         "case_name":      [None] * len(items),
         "case_flaky":     [None] * len(items),
         "component_name": [None] * len(items),
@@ -573,6 +580,20 @@ def compute_test_diff(baseline: pd.DataFrame, target: pd.DataFrame) -> pd.DataFr
         "error_message":          diff["errors_b"],
         "linked_issues":          diff["jira_issue_b"],
     })
+
+    # Propagate the TARGET side's caseresult_id — the TriageResult FK must
+    # point at build B's caseResult (the failure being triaged), never the
+    # baseline's. Same column-suffix cases as subtask_id below.
+    if "caseresult_id_b" in diff.columns:
+        crid = diff["caseresult_id_b"]
+    elif "caseresult_id" in diff.columns and target_has_ids:
+        crid = diff["caseresult_id"]
+    else:
+        crid = None
+    if crid is not None:
+        # Nullable Int64 so the id round-trips through diff_list.csv as an
+        # integer rather than 5.05505733e+08.
+        out["caseresult_id"] = pd.to_numeric(crid, errors="coerce").astype("Int64")
 
     # Propagate target-side subtask_id when present. Column name depends on
     # which sides carried it through the merge: `subtask_id_b` when both
@@ -1743,6 +1764,10 @@ def _finalize_bundle(
         "status_a", "status_b", "known_flaky", "linked_issues",
         "error_message", "pre_classification",
     ]
+    # Carries the TriageResult FK through to submit — absent only when the
+    # target side had no caseresult ids, in which case verdicts write unlinked.
+    if "caseresult_id" in df.columns:
+        diff_list_cols.append("caseresult_id")
     if "subtask_id" in df.columns:
         diff_list_cols.append("subtask_id")
     df[diff_list_cols].to_csv(run_dir / "diff_list.csv", index=False)
