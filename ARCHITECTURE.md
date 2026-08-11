@@ -334,17 +334,30 @@ into **LPD-95842**; the views that render it are **LPD-95844+**.
 
 ## 9. The `TriageResult` Object (integration contract)
 
-Deployed via our own **`liferay-triage-site-initializer`** CX. It is a *new*
-Object; defining it auto-creates its backing table and a `/o/c/triageresults`
-REST endpoint.
+Deployed via our own **`liferay-testray-analytics-site-initializer`** CX (the
+name this shipped under; earlier drafts of this doc called it
+`liferay-triage-site-initializer`). It is a *new* Object; defining it
+auto-creates its backing table and a `/o/c/triageresults` REST endpoint.
 
 - **Relationship:** `oneToMany` from Testray's `CaseResult` → our `TriageResult`.
-  The FK (`r_caseResultToTriageResult_c_caseResultId`) lives on **our**
-  `TriageResult` table — Testray's `CaseResult` definition is not edited.
+  The FK (`r_caseResultToTriageResults_c_caseResultId` — Liferay derives the
+  name from the relationship, so the plural is load-bearing) lives on **our**
+  `TriageResult` table; Testray's `CaseResult` definition is not edited.
+  `deletionType: cascade`.
 - **Idempotency key (logical):** `(caseResult, classifier)` — re-running a
-  classifier overwrites rather than duplicates.
+  classifier overwrites rather than duplicates. Realized as
+  `externalReferenceCode = <buildB>_<caseId>_<classifier>`; see open-Q #1 for
+  why the write is a PUT-by-ERC rather than the bulk batch endpoint.
+- **No `buildId` field.** A build's verdicts are retrieved either by ERC prefix
+  (`startswith(externalReferenceCode,'<buildB>_')`) or through the `CaseResult`
+  side of the relationship.
+- **OAuth scope.** The CX's headless-server app carries
+  `c_triageresult.everything`. Only that plain form resolves — `.read` /
+  `.write` leaves are accepted in the yaml and then **dropped silently at
+  deploy**, surfacing as a 403 at call time rather than a build error. Verify
+  what was actually granted by reading the token's `scope` claim.
 
-**Proposed fields (lean — to finalize against site-initializer JSON patterns):**
+**Fields (as deployed):**
 
 | Field | Type | Notes |
 |-------|------|-------|
@@ -396,10 +409,12 @@ REST endpoint.
 1. **LPD-95842 (foundational):** this doc (incl. default-view-per-context design,
    §8); repo scaffold; extract `apps/triage` as an api-only, CLI-first tool with the
    Postgres write removed.
-2. **`TriageResult` Object (LPD-95843)** in a new `liferay-triage-site-initializer`
-   CX (§9) — the contract everything hangs off.
-3. **Headless write-sink (LPD-95843)** — replace the Postgres upsert with `POST
-   /o/c/triageresults/batch`; register one OAuth2 service-account app.
+2. **`TriageResult` Object (LPD-95843)** in a new
+   `liferay-testray-analytics-site-initializer` CX (§9) — the contract
+   everything hangs off.
+3. **Headless write-sink (LPD-95843)** — replace the Postgres upsert with
+   `PUT /o/c/triageresults/by-external-reference-code/{erc}` per row (open-Q
+   #1); register one OAuth2 service-account app.
 4. **Frontend CX** (custom-element) — cluster view (LPD-95844) + verdicts column
    (LPD-95848), grouping by `clusterKey`.
 5. **Later modes & features** — `routine-history` / `suite-vs-pr`; inline + bulk
@@ -560,11 +575,16 @@ cross-referenced elsewhere in the doc, so they stay stable regardless of order).
 **Resolved**
 
 - **#1 Write idempotency + retry** — per-row idempotent upsert via an
-  `externalReferenceCode` = `(buildB, caseId, classifier)`, through the headless
-  **batch** endpoint (many rows per call, *not* one request per row); a rerun
-  overwrites by ERC. Not a cost concern: one row per *classified failure* (the diff
-  set — hundreds), not per test (~20k reads); the write is negligible next to the
-  Anthropic classification.
+  `externalReferenceCode` = `(buildB, caseId, classifier)`; a rerun overwrites by
+  ERC. **Implemented as one `PUT .../by-external-reference-code/{erc}` per row,
+  not the bulk batch endpoint** (LPD-95843): `POST /o/c/triageresults/batch`
+  *creates* rather than upserts and returns an async job, which loses exactly the
+  idempotency this decision requires. Fanning out PUTs also gives per-row failure
+  isolation — one bad row is collected and reported, the rest still land. Not a
+  cost concern: one row per *classified failure* (the diff set — hundreds), not
+  per test (~20k reads); the write is negligible next to the Anthropic
+  classification. Verified live 2026-08-11: rerunning the same (build pair,
+  classifier) left `totalCount` unchanged.
 - **#2 Read DTO** — sufficient; the custom `TestrayCaseResult` DTO exposes every
   diffed field (+ team/routine/run). No raw-endpoint fallback.
 - **#3 Portal checkout** — persistent checkout, `git pull` each run (§2); never a
@@ -613,8 +633,9 @@ exists), not a throwaway local container.
 ```
 [you] start local Testray DXP @ localhost:8080   (backed by testray_working_db)
   │
-[deploy] liferay-triage-site-initializer CX  → creates the TriageResult Object
-  │                                            + /o/c/triageresults endpoint
+[deploy] liferay-testray-analytics-site-initializer CX
+  │          → TriageResult Object + /o/c/triageresults endpoint
+  │          + the OAuth2 app the CLI authenticates as
 [deploy] frontend custom-element CX          → the cluster view
   │
 [you run the CLI — this is the "Jenkins job"]:
