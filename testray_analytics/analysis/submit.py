@@ -9,14 +9,15 @@ Two bundle modes — selected by `mode:` in run.yml:
 - **by-subtask**: one entry per Testray Subtask with a `case_ids: [...]`
   array; the verdict is fanned out to each member case.
 
-The writer (testray_writer.py) builds the `/o/c/triageresults` batch payload keyed by
-externalReferenceCode = `<buildB>_<caseId>_<classifier>`. In this milestone
-(LPD-95842) it writes that payload locally for inspection; the real headless
-POST lands in LPD-95843.
+The writer (testray_writer.py) builds the `/o/c/triageresults` payload keyed by
+externalReferenceCode = `<buildB>_<caseId>_<classifier>` and upserts it into
+Testray over headless REST (LPD-95843). The payload is also written to the run
+dir as `triageresults_batch.json` for inspection; `--dry-run` stops there.
 
 Usage:
     testray-analysis submit runs/r_<id>
-    testray-analysis submit runs/r_<id> --no-write
+    testray-analysis submit runs/r_<id> --dry-run   # build payload, don't post
+    testray-analysis submit runs/r_<id> --no-write  # report only
 """
 
 import argparse
@@ -27,8 +28,12 @@ from pathlib import Path
 import pandas as pd
 import yaml
 
+from .prepare import load_config
 from .report import render_run
-from .testray_writer import write_triage_batch
+from .testray_writer import (
+    ENDPOINT, FK_FIELD, build_batch, count_excluded, post_batch,
+    write_batch_file,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -401,6 +406,9 @@ def main() -> None:
     ap.add_argument("--no-write", action="store_true",
                     help="Validate + summarize + render the report, but skip "
                          "building the Testray batch payload.")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="Build and save triageresults_batch.json, but don't "
+                         "upsert it into Testray.")
     args = ap.parse_args()
 
     run_dir: Path = args.run_dir.resolve()
@@ -507,13 +515,31 @@ def main() -> None:
         print("\n--no-write set → not building the Testray batch payload.")
         return
 
-    out_path, n_written, n_excluded = write_triage_batch(
-        df, meta, classifier=payload["classifier"], run_dir=run_dir,
-    )
+    items = build_batch(df, meta, classifier=payload["classifier"])
+    out_path = write_batch_file(items, run_dir)
+    n_excluded = count_excluded(df, items)
+    n_linked = sum(1 for it in items if FK_FIELD in it)
     excl = f" ({n_excluded} excluded by write policy)" if n_excluded else ""
-    print(f"\nTriageResult batch ({n_written} rows{excl}) → {out_path}")
-    print("  LPD-95842 stub: LPD-95843 will POST this to "
-          "/o/c/triageresults/batch (headless REST).")
+    print(f"\nTriageResult batch ({len(items)} rows{excl}) → {out_path}")
+    print(f"  CaseResult FK resolved on {n_linked}/{len(items)} rows"
+          f"{' — rest write unlinked' if n_linked < len(items) else ''}")
+
+    if args.dry_run:
+        print("  --dry-run set → not upserting into Testray.")
+        return
+
+    cfg = load_config()["testray"]
+    print(f"  Upserting into {cfg['base_url'].rstrip('/')}{ENDPOINT} …")
+    n_ok, n_fail, failures = post_batch(items, cfg, progress=True)
+    print(f"  Upserted {n_ok}/{len(items)} TriageResults"
+          + (f", {n_fail} failed" if n_fail else ""))
+    for f in failures[:10]:
+        print(f"    ! {f['externalReferenceCode']}: "
+              f"HTTP {f['status']} {f['error']}")
+    if n_fail > 10:
+        print(f"    … and {n_fail - 10} more (see above pattern)")
+    if n_fail:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
