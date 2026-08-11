@@ -70,6 +70,22 @@ python3 tests/manual/cleanup.py            # tidy up
 
 ## Validation log
 
+**2026-08-11 — LPD-95843 write path re-validated on a rebuilt local DXP,
+now through the CLI (`testray-analysis submit`), not just the stage scripts:**
+- OAuth: the CX's headless-server app authenticates; object scopes resolve only
+  as plain `c_<object>.everything` (`.read` / `.write` leaves are dropped
+  silently at deploy). Check the token's `scope` claim, not the yaml.
+- Stage A `(2, 0, [])`, rerun kept `totalCount = 2`; picklists resolved as
+  `{"key":"BUG","name":"Bug"}`. Stage B FK stored (`35894`) and nested back.
+- `submit` end-to-end: 2 rows written, FK resolved 2/2, 12 excluded by the
+  write policy. Second identical `submit` left `totalCount = 2` — upsert, no
+  duplicates. Each row nests back from its CaseResult.
+- Retrieval by build uses the ERC prefix
+  (`startswith(externalReferenceCode,'51996_')`) — TriageResult has no buildId.
+- Caveat: the instance had no routines/builds/cases, so the run's CaseResults
+  were seeded and `diff_list.csv` repointed at the local ids. The full
+  `prepare → classify → submit` still needs real data mirrored in.
+
 **2026-07-15 — LPD-95843 write path, against local DXP (`localhost:8080`):**
 - Stage A: `(2, 0, [])`; rerun kept `totalCount = 2` (upsert, no dupes);
   classification/confidence returned as resolved `{"key","name"}` picklists.
