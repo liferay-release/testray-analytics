@@ -1,29 +1,71 @@
 """
 testray_writer.py — write triage verdicts to Testray as TriageResult objects.
 
-STUB (LPD-95842): builds the `/o/c/triageresults` batch payload — one entry per
-verdict, keyed by an externalReferenceCode of `<buildB>_<caseId>_<classifier>`
-so a rerun upserts rather than duplicates (ARCHITECTURE.md open-Q #1) — and
-writes it to the run dir as `triageresults_batch.json` for inspection.
+The TriageResult Object, its two picklists, and the CaseResult→TriageResult
+relationship ship in the `liferay-testray-analytics-site-initializer` client
+extension (ARCHITECTURE.md §9). This module builds the payload and PUTs it over
+headless REST — no DB credentials anywhere.
+
+Write shape (all four confirmed live against a local DXP — tests/TESTING.md):
+
+- **Picklist fields** (`classification`, `confidence`) are written as
+  `{"key": ...}`, not bare strings. Picklist keys can't contain underscores, so
+  the classification enum is flattened on the way out
+  (`POSSIBLE_BUG` → `POSSIBLEBUG`); `confidence` keys are already the plain
+  lowercase words. Read-back resolves to `{"key": "BUG", "name": "Bug"}`.
+- **The CaseResult FK** is `r_caseResultToTriageResults_c_caseResultId`, set
+  from the row's `caseresult_id` (the target build's caseResult object id).
+  Rows without one are written *unlinked* rather than dropped — the verdict is
+  still worth persisting, and the FK can be backfilled.
+- **Upsert is PUT-by-ERC**, not `POST .../batch`. externalReferenceCode is
+  `<buildB>_<caseId>_<classifier>`, so a rerun of the same (build pair,
+  classifier) overwrites in place instead of duplicating (open-Q #1). Liferay's
+  bulk `/batch` endpoint creates rather than upserts (and returns an async job),
+  which loses the idempotency the ticket requires — so we fan out one PUT per
+  item and collect per-item failures instead.
 
 Inclusion policy (see `_include`): high-confidence FALSE_POSITIVE is excluded
 (a confident "not a failure" — no decision value); the auto/env buckets
 (DID_NOT_RUN, ENV_FAILURE) are excluded by default, toggleable via
 `INCLUDE_AUTO_CLASSIFIED`.
 
-LPD-95843 replaces the local write with a headless
-`POST /o/c/triageresults/batch` against Testray, and wires the CaseResult
-relationship FK (needs the target build's caseResult object ids + the deployed
-TriageResult Object). `clusterKey` (§7) and `suspiciousCommits` (§9) are not
-computed yet and are omitted here.
+`clusterKey` (§7) and `suspiciousCommits` (§9) exist on the Object but aren't
+computed yet, so they're omitted here.
+
+Note: TriageResult carries no buildId field — a build's verdicts are retrieved
+either by ERC prefix (`startswith(externalReferenceCode,'<buildB>_')`) or
+through the CaseResult side of the relationship.
 """
 
 import json
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 import pandas as pd
 
+from .prepare import _testray_oauth_token
+
 BATCH_FILENAME = "triageresults_batch.json"
+
+ENDPOINT = "/o/c/triageresults"
+
+# The relationship FK field, named by Liferay from the relationship name
+# (`caseResultToTriageResults`) — see the site-initializer CX.
+FK_FIELD = "r_caseResultToTriageResults_c_caseResultId"
+
+# Classification enum -> picklist key. Picklist keys can't hold underscores;
+# these keys must stay in lockstep with
+# site-initializer/list-type-definitions/triage-classifications.list-type-entries.json.
+_CLASSIFICATION_KEYS = {
+    "BUG":            "BUG",
+    "POSSIBLE_BUG":   "POSSIBLEBUG",
+    "NEEDS_REVIEW":   "NEEDSREVIEW",
+    "TEST_FIX":       "TESTFIX",
+    "FALSE_POSITIVE": "FALSEPOSITIVE",
+}
 
 
 def _erc(build_id_b, case_id, classifier: str) -> str:
@@ -38,13 +80,45 @@ def _clean(val):
     return s or None
 
 
+def _picklist(val):
+    """Wrap a picklist value as Testray expects it, or None to omit the field."""
+    v = _clean(val)
+    return {"key": v} if v else None
+
+
+def _classification_picklist(val):
+    v = _clean(val)
+    if v is None:
+        return None
+    try:
+        return {"key": _CLASSIFICATION_KEYS[v]}
+    except KeyError:
+        raise ValueError(
+            f"No triage-classifications picklist key for {v!r}. Known: "
+            f"{sorted(_CLASSIFICATION_KEYS)}. Add an entry to the "
+            f"site-initializer list-type-entries before writing it."
+        ) from None
+
+
+def _fk(val):
+    """CaseResult object id, or None when the row can't be linked."""
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return None
+    try:
+        cid = int(val)
+    except (TypeError, ValueError):
+        return None
+    return cid or None  # 0 means 'no link' in Liferay's FK columns
+
+
 # --- Write inclusion policy ------------------------------------------------
 # High-confidence FALSE_POSITIVE is a confident "not a failure" — no decision
 # value, and excluding it keeps the store lean (T3 retention goal). Low/medium
 # FALSE_POSITIVE is uncertain enough to keep for a human glance.
 # The auto/env buckets (DID_NOT_RUN, ENV_FAILURE — env/infra pre-classification,
 # not LLM verdicts, never diff-analyzed) are excluded by default: re-derivable
-# and non-actionable. Flip INCLUDE_AUTO_CLASSIFIED to persist them.
+# and non-actionable. Flip INCLUDE_AUTO_CLASSIFIED to persist them — note that
+# doing so also needs picklist entries for them, or build_batch will raise.
 INCLUDE_AUTO_CLASSIFIED = False
 
 # The auto/env buckets produced by submit._auto_label.
@@ -63,7 +137,8 @@ def _include(classification, confidence) -> bool:
 
 def build_batch(df: pd.DataFrame, meta: dict, classifier: str) -> list[dict]:
     """One TriageResult entry per classified case row. Rows without a
-    testray_case_id are skipped — they can't be keyed to a CaseResult."""
+    testray_case_id are skipped — they can't be keyed to a CaseResult.
+    Null/blank fields are omitted rather than sent as null."""
     build_id_b    = meta.get("build_id_b")
     analysis_mode = meta.get("mode") or "per-test"
 
@@ -74,10 +149,11 @@ def build_batch(df: pd.DataFrame, meta: dict, classifier: str) -> list[dict]:
             continue
         if not _include(row.get("classification"), row.get("confidence")):
             continue
-        items.append({
+
+        item = {
             "externalReferenceCode": _erc(build_id_b, cid, classifier),
-            "classification": _clean(row.get("classification")),
-            "confidence":     _clean(row.get("confidence")),
+            "classification": _classification_picklist(row.get("classification")),
+            "confidence":     _picklist(row.get("confidence")),
             "culpritFile":    _clean(row.get("culprit_file")),
             "specificChange": _clean(row.get("specific_change")),
             "reason":         _clean(row.get("reason")),
@@ -85,22 +161,131 @@ def build_batch(df: pd.DataFrame, meta: dict, classifier: str) -> list[dict]:
             "analysisMode":   analysis_mode,
             "gitHashA":       _clean(meta.get("git_hash_a")),
             "gitHashB":       _clean(meta.get("git_hash_b")),
-            # For the CaseResult FK lookup in LPD-95843:
-            "testrayCaseId":  int(cid),
-            "testrayBuildId": build_id_b,
             # clusterKey (§7) + suspiciousCommits (§9): TODO, not computed yet.
-        })
+        }
+        # Link to the target build's CaseResult when prepare captured its id;
+        # otherwise write unlinked.
+        fk = _fk(row.get("caseresult_id"))
+        if fk is not None:
+            item[FK_FIELD] = fk
+
+        items.append({k: v for k, v in item.items() if v is not None})
     return items
+
+
+# ---------------------------------------------------------------------------
+# Headless write
+# ---------------------------------------------------------------------------
+
+class _Session:
+    """Bearer-token REST session that re-mints its token once on a 401.
+    Testray tokens expire in ~10 min; a large batch can outlive one."""
+
+    def __init__(self, cfg: dict):
+        self.cfg   = cfg
+        self.base  = cfg["base_url"].rstrip("/")
+        self.token = _testray_oauth_token(cfg)
+
+    def _raw(self, method: str, path: str, body=None, timeout: int = 60):
+        headers = {"Authorization": f"Bearer {self.token}",
+                   "Accept": "application/json"}
+        data = None
+        if body is not None:
+            data = json.dumps(body).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        req = urllib.request.Request(f"{self.base}{path}", data=data,
+                                     method=method, headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read()
+        return json.loads(raw) if raw else {}
+
+    def request(self, method: str, path: str, body=None, timeout: int = 60):
+        try:
+            return self._raw(method, path, body, timeout)
+        except urllib.error.HTTPError as e:
+            if e.code != 401:
+                raise
+            self.token = _testray_oauth_token(self.cfg)  # expired — re-mint once
+            return self._raw(method, path, body, timeout)
+
+
+def _erc_path(erc: str) -> str:
+    return f"{ENDPOINT}/by-external-reference-code/{urllib.parse.quote(erc, safe='')}"
+
+
+def post_batch(items: list[dict], cfg: dict, *, max_retries: int = 2,
+               timeout: int = 60, progress: bool = False):
+    """Upsert each item via PUT /o/c/triageresults/by-external-reference-code/{erc}.
+
+    Partial-batch semantics: one item's failure never aborts the rest. Transient
+    failures (5xx, URLError/timeout) are retried with linear backoff; 4xx other
+    than 401 is a payload problem and is not retried.
+
+    Returns (n_ok, n_fail, failures), where each failure is
+    {"externalReferenceCode", "status", "error"} — `status` is the HTTP code or
+    None for a transport error.
+    """
+    if not items:
+        return 0, 0, []
+
+    session = _Session(cfg)
+    n_ok = 0
+    failures: list[dict] = []
+
+    for i, item in enumerate(items, start=1):
+        # The ERC rides in both the path and the body — redundant, but it keeps
+        # the persisted payload self-describing and Liferay accepts it.
+        erc = item["externalReferenceCode"]
+        status, error = None, None
+        for attempt in range(max_retries + 1):
+            try:
+                session.request("PUT", _erc_path(erc), item, timeout=timeout)
+                status, error = None, None
+                break
+            except urllib.error.HTTPError as e:
+                status = e.code
+                error = e.read().decode("utf-8", "replace")[:300]
+                if e.code < 500:
+                    break                      # payload/permission — retrying won't help
+            except (urllib.error.URLError, TimeoutError, OSError) as e:
+                status, error = None, str(e)[:300]
+            if attempt < max_retries:
+                time.sleep(1.0 * (attempt + 1))
+
+        if error is None:
+            n_ok += 1
+        else:
+            failures.append({"externalReferenceCode": erc,
+                             "status": status, "error": error})
+        if progress and (i % 25 == 0 or i == len(items)):
+            print(f"   [triageresults] {i}/{len(items)} "
+                  f"({n_ok} ok, {len(failures)} failed)", flush=True)
+
+    return n_ok, len(failures), failures
+
+
+# ---------------------------------------------------------------------------
+# Local artifact
+# ---------------------------------------------------------------------------
+
+def write_batch_file(items: list[dict], run_dir) -> Path:
+    """Persist the exact payload posted, for inspection / replay."""
+    out = Path(run_dir) / BATCH_FILENAME
+    out.write_text(json.dumps({"items": items}, indent=2, ensure_ascii=False),
+                   encoding="utf-8")
+    return out
+
+
+def count_excluded(df: pd.DataFrame, items: list[dict]) -> int:
+    """How many FK-eligible rows the write policy dropped."""
+    eligible = (int(df["testray_case_id"].notna().sum())
+                if "testray_case_id" in df.columns else len(df))
+    return max(0, eligible - len(items))
 
 
 def write_triage_batch(df: pd.DataFrame, meta: dict, classifier: str,
                        run_dir) -> tuple[Path, int, int]:
-    """Build the batch payload and write it locally (LPD-95842 stub).
-    Returns (path, n_written, n_excluded). LPD-95843 will POST this instead."""
+    """Build the batch payload and write it locally, without posting.
+    Returns (path, n_written, n_excluded)."""
     items = build_batch(df, meta, classifier)
-    eligible = (int(df["testray_case_id"].notna().sum())
-                if "testray_case_id" in df.columns else len(df))
-    out = Path(run_dir) / BATCH_FILENAME
-    out.write_text(json.dumps({"items": items}, indent=2, ensure_ascii=False),
-                   encoding="utf-8")
-    return out, len(items), max(0, eligible - len(items))
+    return write_batch_file(items, run_dir), len(items), count_excluded(df, items)
