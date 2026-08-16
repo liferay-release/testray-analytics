@@ -166,13 +166,35 @@ def _testray_oauth_token(cfg: dict) -> str:
         "client_id":     cfg["client_id"],
         "client_secret": cfg["client_secret"],
     }).encode()
-    req = urllib.request.Request(f"{base}/o/oauth2/token", data=data)
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        body = json.loads(resp.read())
-    token = body.get("access_token")
-    if not token:
-        raise SystemExit(f"OAuth2 token response had no access_token: {body}")
-    return token
+    # Retried: editing the OAuth app's scopes in DXP invalidates its tokens for
+    # a moment, and an unretried mint turns that blip into a dead run — which is
+    # expensive when it happens partway through a 30k-row fetch.
+    last = None
+    for attempt in range(3):
+        try:
+            req = urllib.request.Request(f"{base}/o/oauth2/token", data=data)
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                body = json.loads(resp.read())
+            token = body.get("access_token")
+            if not token:
+                raise SystemExit(
+                    f"OAuth2 token response had no access_token: {body}")
+            return token
+        except urllib.error.HTTPError as e:
+            last = e
+            if e.code not in (401, 403, 429) and e.code < 500:
+                break                       # a real config problem, not a blip
+            if attempt < 2:
+                time.sleep(2 * (attempt + 1))
+        except urllib.error.URLError as e:
+            last = e
+            if attempt < 2:
+                time.sleep(2 * (attempt + 1))
+    raise SystemExit(
+        f"OAuth2 token request to {base} failed after 3 attempts: {last}. "
+        f"Check testray.client_id / client_secret, and that the app's scopes "
+        f"aren't mid-edit in DXP."
+    )
 
 
 def _testray_fetch_paginated(

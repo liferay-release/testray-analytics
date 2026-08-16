@@ -178,6 +178,8 @@ def test_dropped_connection_reported_with_null_status(server):
 
 def test_unreachable_host_fails_fast_at_token_mint(server):
     dead = dict(server, base_url="http://127.0.0.1:1")   # nothing listening
-    with pytest.raises(Exception):
+    # The mint retries, then gives up with SystemExit — a BaseException, so it
+    # would slip past `pytest.raises(Exception)`.
+    with pytest.raises(SystemExit):
         tw.post_batch([_item("b_1_c")], dead)
     assert CALLS == []                            # nothing half-written
