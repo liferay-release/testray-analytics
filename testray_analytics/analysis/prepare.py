@@ -181,12 +181,20 @@ def _testray_fetch_paginated(
     progress_label: str | None = None,
 ) -> list[dict]:
     """Follow Liferay Objects pagination until lastPage. When `progress_label`
-    is set, prints one stderr line per page so long fetches don't look hung."""
+    is set, prints one stderr line per page so long fetches don't look hung.
+
+    Paging is forced into a stable `id:asc` order (callers can override via
+    `params["sort"]`). Without an explicit sort the server is free to order
+    pages inconsistently, and a large fetch then returns some rows twice while
+    skipping others entirely — silently, since the row count still looks
+    plausible. Observed live: a 15,386-row caseresult fetch yielded only 14,104
+    distinct ids."""
     base = base_url.rstrip("/")
     items: list[dict] = []
     page = 1
     while True:
         q = dict(params)
+        q.setdefault("sort", "id:asc")
         q["page"]     = page
         q["pageSize"] = page_size
         url = f"{base}{endpoint}?{urllib.parse.urlencode(q)}"
