@@ -9,6 +9,14 @@ Two bundle modes — selected by `mode:` in run.yml:
 - **by-subtask**: one entry per Testray Subtask with a `case_ids: [...]`
   array; the verdict is fanned out to each member case.
 
+This step is deliberately provenance-blind: results.json is the same shape
+whether it came from a Claude Code session (`classifier: agent:<model>`), the
+Anthropic API via classify.py (`api:<model>`), or a local generator used to
+exercise the write path without spend (`synthetic:<label>`). The classifier
+string is the only record of which, and it rides in the ERC — so runs from
+different classifiers coexist instead of overwriting each other. See the
+CLASSIFIER SWITCH note in classify.py.
+
 The writer (testray_writer.py) builds the `/o/c/triageresults` payload keyed by
 externalReferenceCode = `<buildB>_<caseId>_<classifier>` and upserts it into
 Testray over headless REST (LPD-95843). The payload is also written to the run

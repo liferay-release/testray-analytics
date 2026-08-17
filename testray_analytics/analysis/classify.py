@@ -15,6 +15,28 @@ Usage:
     After this script writes results.json, submit with:
         python3 -m apps.triage.submit <run_dir>
 
+CLASSIFIER SWITCH — Claude Code session vs Anthropic API:
+
+    There are two ways to turn a prepared bundle into results.json, and
+    submit.py cannot tell them apart. The only record of which was used is
+    the `classifier` label, so keep the prefix honest:
+
+      agent:<model>   a Claude Code session. Open runs/r_<id>/prompt.md in
+                      Claude Code, have it answer against
+                      results.schema.json, save the reply as
+                      runs/r_<id>/results.json. No API key, no spend.
+                      This is prepare.py's DEFAULT_CLASSIFIER.
+
+      api:<model>     this script. Needs ANTHROPIC_API_KEY and bills per
+                      run — see `--dry-run` for the batch plan and token
+                      estimate before committing to it.
+
+    The externalReferenceCode is <buildB>_<caseId>_<classifier>, so the two
+    paths never collide: classifying the same build pair both ways leaves
+    two rows per case, one per classifier. That is deliberate (decision #9,
+    model-version pinning) and makes them comparable rather than one
+    silently overwriting the other.
+
 Why a second path instead of folding this back into prepare.py:
     prepare.py is classifier-agnostic. Keeping the Anthropic SDK out of
     prepare lets local dev laptops skip the extra dependency install
