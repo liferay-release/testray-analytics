@@ -9,6 +9,7 @@ inclusion policy.
 import pandas as pd
 import pytest
 
+from testray_analytics.analysis import error_signature
 from testray_analytics.analysis.testray_writer import build_batch
 
 META = {
@@ -164,8 +165,11 @@ def test_mixed_batch_counts():
 # --- clusterKey (§7) --------------------------------------------------------
 
 def test_cluster_key_is_versioned_and_present():
+    """Reference the constant, not a literal — the version bumps whenever
+    normalize() changes behaviour, and a hardcoded prefix turns that into a
+    spurious test failure."""
     items = _batch([_row(error_message="NPE at Foo.java:42")])
-    assert items[0]["clusterKey"].startswith("v1:")
+    assert items[0]["clusterKey"].startswith(f"{error_signature.SIGNATURE_VERSION}:")
 
 
 def test_same_root_cause_shares_a_cluster_key():

@@ -30,9 +30,28 @@ So: strip tokens that vary run-to-run for the *same* cause, and keep everything
 that distinguishes causes — exception types, messages, quoted literals,
 selectors, identifiers.
 
+**How v2 was validated.** Against real merge decisions a human made in the
+Testray UI — the only ground truth for "are these the same cause":
+
+    tuning set   (Playwright / EE Package Tester, build 36424)
+        recall 14/14 human merge pairs · 0/55 false merges · 767 -> 271 clusters
+    held-out set (Poshi / Acceptance, build 122266, never tuned against)
+        recall 27/38 · 2/105 false merges
+
+The remaining misses are semantic, not lexical: the human merged three locales
+of the same assertion ("submeter"/"enviar"/"提交" vs pattern "(?iu)submit"),
+"caused leftover data" across different test classes, and ElementNotFound on
+different labels in one feature area. They group by *failure mode*; a character
+threshold cannot reach that without discarding selectors — and the two false
+merges show what happens when it does (the cap cut mid-locator and collided two
+different Playwright waits). So this is deliberately left at ~71% recall rather
+than tuned further: the residual belongs to the classifier, which sees the diff
+and can reason, and to a "these look related — merge?" affordance in the view.
+Tuning against the held-out set would also destroy its value as a check.
+
 **Versioning.** Any behavioural change here changes the key for the same input,
 which breaks re-clustering continuity and §11 dedup. `SIGNATURE_VERSION` is
-embedded in every key (`v1:<hash>`), so a stored key always declares which
+embedded in every key (`v<N>:<hash>`), so a stored key always declares which
 generation produced it; bump it on any behavioural change and re-key the
 retention window (open-Q #9).
 """
@@ -43,7 +62,7 @@ import re
 # Bump on ANY behavioural change to normalize() — see open-Q #9. Stored keys
 # carry this prefix, so a bump makes old and new keys visibly incomparable
 # rather than silently different.
-SIGNATURE_VERSION = "v1"
+SIGNATURE_VERSION = "v2"
 
 # How many stack frames to keep when an error is nothing but a trace. Enough to
 # tell two traces apart, few enough that a deep-frame difference in the same
@@ -92,6 +111,18 @@ _NUMBER_RE = re.compile(r"\d+")
 
 _WS_RE = re.compile(r"\s+")
 
+# Playwright names the API call that timed out — locator.isChecked vs
+# locator.check — while the failure is the same wait on the same element. A
+# human merged exactly that pair (ST-80 <- ST-84, ST-502), so the method name
+# is not part of the identity.
+_LOCATOR_METHOD_RE = re.compile(r"\blocator\.[a-z]+:")
+
+# Java package prefixes are pure boilerplate and, at ~35 chars for Poshi, they
+# push the part that matters past the cap. Stripping them is what lets the
+# XPath survive: without it every ElementNotFound collapsed into one bucket of
+# 136 failures regardless of which element was missing.
+_JAVA_PKG_RE = re.compile(r"\b(?:[a-z][a-z0-9]*\.){2,}(?=[a-z])")
+
 # Cap the signature. Some failures carry the whole build log — 2.4KB of ant
 # output — where the actual error is in the first line or two and the rest is
 # repeating chatter ("… 1 hour 12 minutes until timeout" logged once more in a
@@ -101,10 +132,24 @@ _WS_RE = re.compile(r"\s+")
 # between two identical upgrade failures.
 #
 # A head-only signature is the standard answer for log clustering: the head
-# carries the cause, the tail carries the noise. The risk is two genuinely
-# different failures that share a long preamble; at 600 chars the exception
-# type and message are always inside the window, so that stays unlikely.
-_SIGNATURE_MAX_CHARS = 600
+# carries the cause, the tail carries the noise.
+#
+# 100 was chosen by measurement, not taste. Against 14 merge decisions a human
+# made on build 36424 (and the 55 pairs of groups they kept APART), the sweep
+# was:
+#
+#   cap 600 (v1)                 recall  2/14   false merges 0   464 clusters
+#   cap 200                      recall  9/14   false merges 0   321 clusters
+#   cap 100                      recall 14/14   false merges 0   271 clusters
+#   cap  80                      recall 14/14   false merges 0   147 clusters
+#   cut at "call log:" instead   recall 14/14   false merges 6   247 clusters
+#
+# 100 is the LARGEST cap that matches every human merge — maximum granularity
+# subject to agreeing with the humans. Going to 80 merges 81 more clusters for
+# no recall gain, which is pure over-merge risk. Cutting at "call log:" scored
+# well on recall but collided six pairs of groups the human kept separate,
+# because the locator lives after that marker.
+_SIGNATURE_MAX_CHARS = 100
 
 # Matches a phrase of >=12 chars repeated back-to-back, so "ABCABCABC" -> "ABC".
 # Non-greedy so it finds the shortest repeating unit. 12 is long enough that
@@ -138,6 +183,8 @@ def normalize(text) -> str:
 
     # Case and whitespace last, so the patterns above can rely on layout.
     s = _WS_RE.sub(" ", s).strip().casefold()
+    s = _LOCATOR_METHOD_RE.sub("locator.<op>:", s)
+    s = _JAVA_PKG_RE.sub("", s)
     s = _collapse_repeats(s)
     return s[:_SIGNATURE_MAX_CHARS]
 
