@@ -538,8 +538,28 @@ was*; this answers *whether a run exists at all, and how it went*, which
 `TriageResult` cannot: a run that failed or is still going has no results yet.
 
 - **Fields:** target build FK, baseline build FK, routine FK, `analysisMode` (§8),
-  `status` (`QUEUED` / `RUNNING` / `DONE` / `FAILED`), `startedAt`, `finishedAt`,
-  `classifier`, verdict counts, `errorMessage`.
+  `triageRunStatus` (`QUEUED` / `RUNNING` / `DONE` / `FAILED`), `startedAt`,
+  `finishedAt`, `classifier`, `errorMessage`, and counts. It is not plain `status`
+  because **`status` is a reserved Objects field name** — Liferay keeps it for
+  workflow state and rejects the definition outright
+  (`ObjectFieldNameException$MustNotBeReserved`). The qualified form also matches
+  Testray's own convention (`testrayBuildTaskStatus`, `testrayBuildPromoted`).
+- **Counts are split deliberately.** Five stable aggregates as sortable `Integer`
+  columns (`totalFailures`, `totalClusters`, `totalClassified`, `totalWritten`,
+  `totalExcluded`) plus a `verdictCounts` **Clob of JSON** for the per-verdict
+  breakdown. One `Integer` per verdict was rejected: the §4 taxonomy has already
+  churned once (`AUTO_CLASSIFIED` split into `DID_NOT_RUN` + `ENV_FAILURE`), and a
+  field added after the Object exists lands in `_x`. The aggregates are the ones
+  worth filtering and sorting on and they do not move; the breakdown is display
+  data, so it costs nothing to keep it schemaless.
+- **Routine FK is not redundant with the build FK.** `routine-history` runs (§8,
+  LPD-95846) span a window rather than a build pair, so they have a routine but no
+  single target build. That is also what keeps the icon column honest: it lights up
+  only for runs that *have* a target build.
+- **Deletion types differ per FK, on purpose.** `buildToTriageRuns` and
+  `routineToTriageRuns` are `cascade` — deleting the target build or the routine
+  should take its runs with it. `baselineBuildToTriageRuns` is **`disassociate`**:
+  an old baseline aging out must not delete a newer run that merely referenced it.
 - **ERC:** the CLI's run id (the `runs/r_<id>/` bundle name), so a local bundle and
   its Testray row share one identity.
 - **Why it earns its place:** it is the icon's predicate. With it, the build-index
@@ -560,6 +580,14 @@ strategy inferred from its name (§8).
 > `bx.cpuusetime_ does not exist` and `bs.caseresulttotal_ does not exist` failures
 > in the local setup, and it stays invisible until some hand-written SQL reads the
 > wrong table. Adding a field later is not free — plan the shape up front.
+>
+> Measured 2026-08-17, and it is good news for how these files are laid out: a
+> site-initializer pass counts as "at creation" even when relationships live in
+> separate files. `o_..._triageresult` carries all 11 fields *and*
+> `r_caseresulttotriageresults_c_caseresultid` on the **base** table, with an empty
+> `_x` (1 column). So splitting definitions and relationships across files is safe;
+> what is not safe is adding to an Object that already exists in a deployed
+> instance — which now includes `TriageResult`.
 
 > **Scopes:** each new Object needs its own entry on the CX's
 > `oAuthApplicationHeadlessServer` (`c_triagerun.everything`,
@@ -567,6 +595,31 @@ strategy inferred from its name (§8).
 > `.read` / `.write` leaves are dropped silently at deploy with no build error and
 > surface as a 403 at call time, so confirm what landed by reading the token's
 > `scope` claim rather than trusting the YAML.
+
+**Deployed and verified 2026-08-17** against the local instance. Both Objects, all
+four relationships, and three new picklists (`Triage Run Statuses`,
+`Triage Baseline Strategies`, `Triage Classification Modes`) land from a redeploy of
+the existing CX — a site initializer **does** re-run `_addObjectDefinitions` for an
+already-initialized site, so iterating on these files does not need a rebuild. All
+four FK columns are on the base tables and both `_x` tables are empty;
+`/o/c/triageruns` and `/o/c/triageroutinesettings` respond. Two authoring
+constraints cost a deploy cycle each and are worth knowing before adding fields:
+`status` is reserved (above), and a `DateTime` field is rejected without an explicit
+`objectFieldSettings` entry `timeStorage` — we use `convertToUTC`, since a run
+timestamp is an absolute moment and Testray spans timezones.
+
+> Failures here are **fatal to the whole pass**, not per-file: the first bad field
+> aborted initialization and *neither* Object was created, including the valid one.
+> So a redeploy that silently changes nothing usually means an exception, not a
+> no-op — check `docker logs` for `BundleSiteInitializer` before assuming the
+> watcher missed the artifact.
+>
+> The other reason a redeploy changes nothing: **the initializer skips Objects that
+> already exist.** It creates, it does not reconcile — a renamed or added field in
+> the JSON is silently ignored, with no error and nothing written to `_x`. Harmless,
+> but it means the JSON and the live schema can drift apart without any signal. To
+> apply a change to an existing Object, delete it (Control Panel → Objects) and
+> redeploy; safe while row counts are zero, a migration once they are not.
 
 ---
 
