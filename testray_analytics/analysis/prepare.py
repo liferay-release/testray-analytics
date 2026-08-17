@@ -28,6 +28,7 @@ results.json. Then `testray-analysis submit <run_dir>` validates and writes.
 """
 
 import argparse
+import collections
 import json
 import os
 import re
@@ -46,6 +47,7 @@ import pandas as pd
 import yaml
 
 from . import prompt_helpers
+from . import error_signature
 from .config import find_config_file
 
 TRIAGE_DIR   = Path(__file__).resolve().parent
@@ -591,15 +593,75 @@ def _aggregate_target(df: pd.DataFrame, key_cols: list[str]) -> pd.DataFrame:
     return out
 
 
-def compute_test_diff(baseline: pd.DataFrame, target: pd.DataFrame) -> pd.DataFrame:
-    """Inner-join baseline and target; keep cases that PASSED in A and
-    FAILED/BLOCKED/UNTESTED in B.
+# --- §12 transition matrix --------------------------------------------------
+# Baseline status → target status, with the FAILED→FAILED case decided by the
+# error signature rather than the transition. Decision #13: surfacing only
+# PASSED→FAILED silently undercounts regressions whenever the baseline already
+# had failures — which, on a real acceptance build, is most of the time.
+
+TRANSITION_NEW          = "new"            # PASSED → FAILED/BLOCKED/UNTESTED
+TRANSITION_CHANGED      = "changed"        # FAILED → FAILED, signature differs
+TRANSITION_SAME_FAILURE = "same_failure"   # FAILED → FAILED, same signature
+TRANSITION_FIXED        = "fixed"          # FAILED → PASSED
+TRANSITION_AWARENESS    = "awareness"      # FAILED → BLOCKED
+TRANSITION_BLOCKED      = "blocked"        # BLOCKED → FAILED
+TRANSITION_TESTFIX      = "testfix"        # TESTFIX(status) → FAILED
+TRANSITION_NO_BASELINE  = "no_baseline"    # UNTESTED → FAILED
+TRANSITION_OTHER        = "other"
+
+# Which transitions are triage candidates. The rest are counted and reported
+# but never sent to the classifier.
+TRIAGE_TRANSITIONS = frozenset({
+    TRANSITION_NEW, TRANSITION_CHANGED, TRANSITION_BLOCKED, TRANSITION_TESTFIX,
+})
+
+_FAILING = ("FAILED", "BLOCKED", "UNTESTED")
+
+
+def classify_transition(status_a, status_b, error_a, error_b) -> str:
+    """Label one baseline→target pair per the §12 matrix.
+
+    `FAILED→BLOCKED` is awareness, not triage: blocked is usually infra, and
+    letting it through dilutes the BUG-hunting view. `FAILED→PASSED` is a
+    "what got fixed" signal for a future Insights view. `UNTESTED→FAILED` has
+    no baseline health signal at all, so it cannot be called new.
+    """
+    a = (status_a or "").upper()
+    b = (status_b or "").upper()
+
+    if b == "PASSED":
+        return TRANSITION_FIXED if a == "FAILED" else TRANSITION_OTHER
+    if a == "PASSED" and b in _FAILING:
+        return TRANSITION_NEW
+    if a == "FAILED":
+        if b == "FAILED":
+            return (TRANSITION_CHANGED
+                    if error_signature.signatures_differ(error_a, error_b)
+                    else TRANSITION_SAME_FAILURE)
+        if b in ("BLOCKED", "UNTESTED"):
+            return TRANSITION_AWARENESS
+    if a == "BLOCKED" and b in _FAILING:
+        return TRANSITION_BLOCKED
+    if a == "TESTFIX" and b in _FAILING:
+        return TRANSITION_TESTFIX
+    if a == "UNTESTED" and b in _FAILING:
+        return TRANSITION_NO_BASELINE
+    return TRANSITION_OTHER
+
+
+def compute_test_diff(baseline: pd.DataFrame, target: pd.DataFrame):
+    """Inner-join baseline and target and keep the §12 triage candidates —
+    new failures *and changed* ones, not only PASSED→FAILED.
+
+    Returns `(df, counts)`: the triage rows, and a Counter of every transition
+    seen including the excluded ones, so a run can report "12 new, 3 changed,
+    847 same failure, 40 fixed" instead of silently dropping the remainder.
 
     Join key: `case_id` if the target has one (db, api targets); otherwise
     `(case_name, component_name)` (csv targets). A final dropna on
     `testray_case_id` discards rows with no persistable id."""
     if baseline.empty or target.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(), collections.Counter()
 
     target_has_ids   = target["case_id"].notna().any()
     baseline_has_ids = baseline["case_id"].notna().any()
@@ -610,10 +672,14 @@ def compute_test_diff(baseline: pd.DataFrame, target: pd.DataFrame) -> pd.DataFr
     t = _aggregate_target(target,     key_cols=key_cols)
 
     merged = b.merge(t, on=key_cols, how="inner", suffixes=("_a", "_b"))
-    diff = merged[
-        (merged["status_a"] == "PASSED")
-        & merged["status_b"].isin(["FAILED", "BLOCKED", "UNTESTED"])
-    ].copy()
+
+    merged["transition"] = [
+        classify_transition(sa, sb, ea, eb)
+        for sa, sb, ea, eb in zip(merged["status_a"], merged["status_b"],
+                                  merged["errors_a"], merged["errors_b"])
+    ]
+    counts = collections.Counter(merged["transition"])
+    diff = merged[merged["transition"].isin(TRIAGE_TRANSITIONS)].copy()
 
     if both_have_ids:
         case_id_col = "case_id"
@@ -642,7 +708,12 @@ def compute_test_diff(baseline: pd.DataFrame, target: pd.DataFrame) -> pd.DataFr
         "testray_component_name": diff[comp_col],
         "status_a":               diff["status_a"],
         "status_b":               diff["status_b"],
+        "transition":             diff["transition"],
         "error_message":          diff["errors_b"],
+        # §12: for a changed failure the prompt must carry BOTH errors ("was
+        # failing with X, now Y") — the reasoning is about the delta, and the
+        # rubric's "baseline was clean" assumption does not hold for it.
+        "baseline_error_message": diff["errors_a"],
         "linked_issues":          diff["jira_issue_b"],
     })
 
@@ -672,7 +743,7 @@ def compute_test_diff(baseline: pd.DataFrame, target: pd.DataFrame) -> pd.DataFr
     # combo upstream in validate_combo_for_mode().
 
     out = out.dropna(subset=["testray_case_id"]).reset_index(drop=True)
-    return out
+    return out, counts
 
 
 # ---------------------------------------------------------------------------
@@ -1826,8 +1897,8 @@ def _finalize_bundle(
 
     diff_list_cols = [
         "testray_case_id", "test_case", "component_name", "team_name",
-        "status_a", "status_b", "known_flaky", "linked_issues",
-        "error_message", "pre_classification",
+        "status_a", "status_b", "transition", "known_flaky", "linked_issues",
+        "error_message", "baseline_error_message", "pre_classification",
     ]
     # Carries the TriageResult FK through to submit — absent only when the
     # target side had no caseresult ids, in which case verdicts write unlinked.
@@ -1954,11 +2025,16 @@ def prepare(baseline: SideSpec, target: SideSpec, classifier: str,
                          f"(source={target.source}).")
     print(f"   baseline rows: {len(baseline_df)}  target rows: {len(target_df)}")
 
-    df = compute_test_diff(baseline_df, target_df)
+    df, transitions = compute_test_diff(baseline_df, target_df)
     if df.empty:
-        raise SystemExit("test_diff returned 0 rows (no PASSED→FAILED after matching).")
-    print(f"   {len(df)} regressions — status_b: "
-          f"{df['status_b'].value_counts().to_dict()}")
+        raise SystemExit(
+            "test_diff returned 0 triage rows. Transitions seen: "
+            f"{dict(transitions) or 'none (no cases matched across the pair)'}")
+    # Report the excluded buckets too — "847 same_failure" is the number that
+    # tells you the baseline was already broken, and it used to be invisible.
+    print(f"   {len(df)} triage rows — " +
+          ", ".join(f"{n} {name}" for name, n in sorted(transitions.items(),
+                                                        key=lambda kv: -kv[1])))
 
     # api caseresults don't carry case names. Backfill test_case from the
     # Testray case object so the fragment matcher has something to anchor on

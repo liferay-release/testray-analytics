@@ -59,7 +59,7 @@ def test_diff_keeps_the_target_side_caseresult_id():
     """The verdict describes build B's failure, so B's caseResult is the FK."""
     baseline = pd.DataFrame([_side(1, 1000, "PASSED")])
     target   = pd.DataFrame([_side(1, 2000, "FAILED", "boom")])
-    out = prepare.compute_test_diff(baseline, target)
+    out, _ = prepare.compute_test_diff(baseline, target)
     assert out.loc[0, "caseresult_id"] == 2000      # not 1000
 
 
@@ -68,7 +68,7 @@ def test_caseresult_id_is_an_integer_dtype():
     FK on read-back."""
     baseline = pd.DataFrame([_side(1, 1000, "PASSED")])
     target   = pd.DataFrame([_side(1, 505505733, "FAILED", "boom")])
-    out = prepare.compute_test_diff(baseline, target)
+    out, _ = prepare.compute_test_diff(baseline, target)
     assert str(out["caseresult_id"].dtype) == "Int64"
     assert "505505733" in out.to_csv(index=False)
 
@@ -78,7 +78,7 @@ def test_diff_without_caseresult_ids_omits_the_column():
     rather than blowing up."""
     b = _side(1, None, "PASSED"); t = _side(1, None, "FAILED", "boom")
     del b["caseresult_id"]; del t["caseresult_id"]
-    out = prepare.compute_test_diff(pd.DataFrame([b]), pd.DataFrame([t]))
+    out, _ = prepare.compute_test_diff(pd.DataFrame([b]), pd.DataFrame([t]))
     assert "caseresult_id" not in out.columns
 
 
@@ -87,7 +87,7 @@ def test_diff_without_caseresult_ids_omits_the_column():
 def test_diff_output_feeds_the_triageresult_fk():
     baseline = pd.DataFrame([_side(1, 1000, "PASSED")])
     target   = pd.DataFrame([_side(1, 2000, "FAILED", "boom")])
-    df = prepare.compute_test_diff(baseline, target)
+    df, _ = prepare.compute_test_diff(baseline, target)
     df["classification"] = "BUG"
     df["confidence"] = "high"
     df["reason"] = "because"
