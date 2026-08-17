@@ -422,9 +422,32 @@ what lets the column ship to everyone.
 
 **The row data cannot carry this flag.** That list is populated by
 `testray-builds-metrics`, hand-written SQL in `TestrayStatusMetricResourceImpl` —
-Testray core, which decision #1 puts off-limits. So the column **side-fetches**:
-one query for the builds on the current page, merged client-side. One extra request
-per page render, and no core change.
+Testray core, which decision #1 puts off-limits. So the column **side-fetches** and
+merges client-side, with no core change.
+
+> The query, as shipped and verified 2026-08-17 against real rows — scoped by
+> **routine**, not by the build ids on the current page:
+>
+> ```
+> GET /o/c/triageruns?sort=startedAt:desc
+>     &filter=r_routineToTriageRuns_c_routineId eq '<routineId>'
+> ```
+>
+> This is why `TriageRun` carries a routine FK as well as a build FK: one request
+> covers every page of the build list, so paging costs nothing extra and the
+> request count does not scale with page size. The per-page form
+> (`r_buildToTriageRuns_c_buildId in ('<id>','<id>',…)`) also works and is the
+> right shape anywhere the routine is not already known. Both were verified;
+> `sort=startedAt:desc` lets the client keep the newest run per build by taking
+> the first one seen.
+>
+> **The FK values must be quoted strings**, even though the column is `bigint`.
+> Unquoted (`eq 36418`, `in (36418)`) returns `400 InvalidFilterException:
+> Incompatible types` — as does `buildToTriageRuns/id eq …`. There is also no
+> nested `/o/c/builds/{id}/triageRuns` endpoint (404), so per-row fetching is not
+> an option even as a fallback. `TriageResult` is reachable the same way via its
+> ERC prefix — `startswith(externalReferenceCode,'<buildB>_')`, which the writer
+> already documents — so no `TriageRun`→`TriageResult` relationship is needed.
 
 **CX boundary — what ships where.**
 
