@@ -32,6 +32,32 @@ testray:
   client_secret: ""
 
 triage:
+
+  # Extends prompt_helpers.DEFAULT_AUTO_CLASSIFY (merged, config wins).
+  # Derived 2026-08-17 from the measured top clusters across builds
+  # 36418/36420/36424 (2,083 failures). Effect: 36 -> 154 auto-classified
+  # (7.4%); the other 1,929 still reach the classifier, which is correct —
+  # ElementNotFound and TimeoutException dominate the corpus and are real
+  # triage work, not noise.
+  #
+  # Every pattern here must be UNAMBIGUOUSLY infrastructure. A pattern that is
+  # too broad routes a real regression into the auto bucket, where the write
+  # inclusion policy then drops it from the store entirely — a silent loss with
+  # nothing downstream to catch it. Deliberately NOT included:
+  # "Login via API failed" — it overlaps net::ERR_NAME_NOT_RESOLVED on 84 of 95
+  # rows, so it buys 11, and those 11 are logins that failed WITHOUT a network
+  # error, i.e. possibly a genuine auth regression.
+  auto_classify_patterns:
+    BUILD_FAILURE:
+      # The shipped default is "The build failed prior to running the test";
+      # the text this data actually carries is "Failed prior to running test".
+      - "[Ff]ailed prior to running (the )?test"
+      - "marked build as failure"
+    ENV_DEPENDENCY:
+      # The frontend host does not resolve in this environment — DNS, not product.
+      - "net::ERR_NAME_NOT_RESOLVED"
+    ENV_SETUP:
+      - "docker: 'docker rmi' requires at least 1 argument"
   classifier:
     api:
       # Classifier label is `api:<model>` and is model-version-pinned
