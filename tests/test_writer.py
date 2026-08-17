@@ -159,3 +159,39 @@ def test_mixed_batch_counts():
     fk = "r_caseResultToTriageResults_c_caseResultId"
     assert fk in erc[f"82964123_1_{CLASSIFIER}"]
     assert fk not in erc[f"82964123_5_{CLASSIFIER}"]
+
+
+# --- clusterKey (§7) --------------------------------------------------------
+
+def test_cluster_key_is_versioned_and_present():
+    items = _batch([_row(error_message="NPE at Foo.java:42")])
+    assert items[0]["clusterKey"].startswith("v1:")
+
+
+def test_same_root_cause_shares_a_cluster_key():
+    """Different tests, same error — one cluster. This is the whole point:
+    34 tests failing on one ElementNotFound should be triaged once."""
+    items = _batch([
+        _row(testray_case_id=1, test_case="TestA",
+             error_message="ElementNotFound: selector #foo at Bar.java:10"),
+        _row(testray_case_id=2, test_case="TestB",
+             error_message="ElementNotFound: selector #foo at Bar.java:88"),
+    ])
+    assert items[0]["clusterKey"] == items[1]["clusterKey"]
+
+
+def test_different_errors_get_different_cluster_keys():
+    items = _batch([
+        _row(testray_case_id=1, error_message="NullPointerException in Foo"),
+        _row(testray_case_id=2, error_message="TimeoutException waiting for x"),
+    ])
+    assert items[0]["clusterKey"] != items[1]["clusterKey"]
+
+
+def test_culprit_file_separates_clusters():
+    """Same error text attributed to different files is not one root cause."""
+    items = _batch([
+        _row(testray_case_id=1, error_message="assert failed", culprit_file="a/A.java"),
+        _row(testray_case_id=2, error_message="assert failed", culprit_file="b/B.java"),
+    ])
+    assert items[0]["clusterKey"] != items[1]["clusterKey"]

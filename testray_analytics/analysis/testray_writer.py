@@ -29,8 +29,9 @@ Inclusion policy (see `_include`): high-confidence FALSE_POSITIVE is excluded
 (DID_NOT_RUN, ENV_FAILURE) are excluded by default, toggleable via
 `INCLUDE_AUTO_CLASSIFIED`.
 
-`clusterKey` (§7) and `suspiciousCommits` (§9) exist on the Object but aren't
-computed yet, so they're omitted here.
+`clusterKey` (§7) is computed here rather than in prepare, because the full key
+includes `culprit_file` — an LLM output, so it is only knowable after
+classification. `suspiciousCommits` (§9) is still not computed.
 
 Note: TriageResult carries no buildId field — a build's verdicts are retrieved
 either by ERC prefix (`startswith(externalReferenceCode,'<buildB>_')`) or
@@ -46,6 +47,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from . import error_signature
 from .prepare import _testray_oauth_token
 
 BATCH_FILENAME = "triageresults_batch.json"
@@ -161,7 +163,16 @@ def build_batch(df: pd.DataFrame, meta: dict, classifier: str) -> list[dict]:
             "analysisMode":   analysis_mode,
             "gitHashA":       _clean(meta.get("git_hash_a")),
             "gitHashB":       _clean(meta.get("git_hash_b")),
-            # clusterKey (§7) + suspiciousCommits (§9): TODO, not computed yet.
+            # §7: the full key needs culprit_file, which is an LLM output — so
+            # it can only be computed here, after classification, not during
+            # prepare. Rows sharing a root cause get the same key and the view
+            # groups them; the version prefix makes a later normalize() change
+            # visibly incomparable rather than silently different (open-Q #9).
+            "clusterKey":     error_signature.cluster_key(
+                                  row.get("culprit_file"),
+                                  row.get("test_case"),
+                                  row.get("error_message")),
+            # suspiciousCommits (§9): not computed yet.
         }
         # Link to the target build's CaseResult when prepare captured its id;
         # otherwise write unlinked.
