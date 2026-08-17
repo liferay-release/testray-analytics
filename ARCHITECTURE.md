@@ -601,8 +601,15 @@ four relationships, and three new picklists (`Triage Run Statuses`,
 `Triage Baseline Strategies`, `Triage Classification Modes`) land from a redeploy of
 the existing CX — a site initializer **does** re-run `_addObjectDefinitions` for an
 already-initialized site, so iterating on these files does not need a rebuild. All
-four FK columns are on the base tables and both `_x` tables are empty;
-`/o/c/triageruns` and `/o/c/triageroutinesettings` respond. Two authoring
+four FK columns are on the base tables and both `_x` tables are empty.
+
+The write path was exercised end-to-end against `/o/c/triageruns`:
+`PUT .../by-external-reference-code/{erc}` created a row, the picklist was accepted
+in `{"key": …}` form, `startedAt` round-tripped as UTC, **all three FKs persisted —
+including both Build relationships, which is the part that could have collided** —
+a second PUT updated in place with `totalCount` unchanged (idempotent, matching
+open-Q #1), and the scratch row was deleted afterwards (0 rows remain). Two
+authoring
 constraints cost a deploy cycle each and are worth knowing before adding fields:
 `status` is reserved (above), and a `DateTime` field is rejected without an explicit
 `objectFieldSettings` entry `timeStorage` — we use `convertToUTC`, since a run
