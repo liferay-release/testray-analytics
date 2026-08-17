@@ -193,9 +193,42 @@ Surfacing our clusters as native Subtasks later is a separate, explicit integrat
   trustworthy once decent"), and a silent change invalidates every stored
   `clusterKey` relative to newly-computed ones — breaking re-clustering continuity
   **and** §11 dedup (a recurring failure gets re-ticketed because old and new keys no
-  longer match). So `clusterKey` carries a version tag (e.g. `v2:<hash>`) and we
-  preserve the raw signature inputs so keys can be recomputed on a bump; dedup/rollup
-  must be version-aware. Migration strategy on a bump = open-Q #9.
+  longer match). Resolved as open-Q #9; the three decisions are:
+
+  1. **The version tag is embedded in the key string**, not a second field:
+     `clusterKey = "v<N>:" + sha256(signature)[:16]`, e.g.
+     `v1:9c1f8a3d2e4b6071`. Key and version are one value, so they cannot drift
+     apart, `startswith(clusterKey,'v1:')` answers "is anything stale?" in a
+     single query (the field is already `indexedAsKeyword`), and no object-field
+     is added — which matters: Liferay Objects puts fields declared at object
+     creation on the base table and anything added later in the `_x` extension
+     table, so a new field is not free once an instance exists.
+  2. **Raw signature inputs are NOT copied onto `TriageResult`.** They are
+     recomputed through the `CaseResult` FK: the raw `errors` and the test name
+     live on Testray's row, `culpritFile` is already ours, and the relationship
+     is `deletionType: cascade` — so the inputs are reachable for exactly as
+     long as the verdict exists. Avoids a second copy that can disagree with
+     Testray (decision #6, Testray stays source of truth) and avoids paying
+     storage for data we already point at. If backfill throughput ever becomes
+     the bottleneck, add one snapshot field then — not before.
+  3. **A version bump backfills eagerly.** Bumping means incrementing
+     `CLUSTER_KEY_VERSION` whenever `normalize()` changes behaviour; an explicit
+     `--recompute-cluster-keys` pass then rewrites every stored key to the new
+     version. Lazy/at-read recomputation is rejected: it pushes version-awareness
+     into every consumer, which is exactly where the §11 re-ticketing bug would
+     creep back in. Volume is one row per classified failure, so an eager pass is
+     cheap. Startup warns when stored keys carry a version other than the current
+     one.
+
+- **Environment is cluster metadata, never part of the identity.** A build runs
+  the same case across several `Run`s (Tomcat/Chrome/MariaDB/JDK combinations);
+  the same error in two environments is **one** cluster, with the environments
+  recorded on its members. Folding environment into the key would multiply
+  cluster counts by the environment matrix for the common case (fails
+  everywhere), while a cluster whose members are all one environment is a strong
+  "environment-specific" signal on its own. Note `_aggregate_target` currently
+  collapses a case's runs worst-status-wins, so the failure is never missed —
+  but the environment dimension has to be carried deliberately if we want it.
 - **Where it's stored:** as a field on `TriageResult`.
 - **Where it's rendered — clustered by default.** The frontend CX groups
   `TriageResult`s by `clusterKey` (LPD-95844); **the clustered view is the default**,
@@ -599,9 +632,16 @@ cross-referenced elsewhere in the doc, so they stay stable regardless of order).
 - **#7 Provenance** — a Jira label **`testray-suggested`** applied at creation via
   `etc-jira`. Provenance lives in Jira (queryable), manual tickets lack it, and
   Testray carries **no extra field**. (Acting user already captured — per-user OAuth.)
-- **#9 `clusterKey` versioning** — version-tag the key (`v2:…`), store raw signature
-  inputs, and on a bump **backfill re-key only the ~90-day retention window** (T3's
-  retention bounds the cost; older rows age out). Dedup compares within a version.
+- **#9 `clusterKey` versioning** — version tag **embedded in the key string**
+  (`v<N>:<sha256-16>`), not a second field, so key and version cannot drift and no
+  post-initialization object-field is needed (late-added Objects fields land in
+  the `_x` extension table). Raw signature inputs are **not
+  copied** onto `TriageResult`: they are recomputed through the `CaseResult` FK,
+  which `cascade` guarantees outlives nothing. On a bump — incrementing
+  `CLUSTER_KEY_VERSION` whenever `normalize()` changes behaviour — an explicit
+  eager `--recompute-cluster-keys` pass re-keys the **~90-day retention window**
+  only (T3's retention bounds the cost; older rows age out). Dedup compares within
+  a version, and startup warns on stale-version keys. Full rationale in §7.
 - **#10 `NEEDS_REVIEW`** — no second-pass (token cost); confidence-gated rubric +
   the `POSSIBLE_BUG`/`TEST_FIX` tiers limit bloat; monitor the rate; tune after
   analyzing overrides (§4).
