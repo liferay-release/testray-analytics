@@ -324,8 +324,10 @@ than guessing; the override corrects misfires.
 Notes: routine names **often embed the official branch** (`[master]`, `(master)`) —
 not universal, not needed for the diff (hash-to-hash), but it confirms these routines
 run **on-origin**, so off-origin is strictly a heavy-dev/PR concern. `autoanalyze` is
-uniformly `false` on these three, so it is **not** a type/trigger discriminator
-(meaning TBD).
+uniformly `false` on these three, so it is **not** a type/trigger discriminator — and
+its meaning is no longer TBD: it is Testray's own *carry-forward* flag, not an
+analysis trigger (see "Why not Testray's `autoanalyze`" below). We do not read it and
+we do not set it.
 
 | Type | Baseline | Trigger | Commit locality | Tickets |
 |------|----------|---------|-----------------|---------|
@@ -362,6 +364,97 @@ Raw build-results browse stays available as a **power-user fallback** (T3
 decommissioning note: build indices are no longer the default view, but remain
 reachable) — the default is triage-with-verdicts, clustered. This design was folded
 into **LPD-95842**; the views that render it are **LPD-95844+**.
+
+### Triggering a run — `autoTriage`, manual selection, and where the report lands
+
+§8 above says *what* gets compared. This says *who starts it* and *where the answer
+shows up*. Settled 2026-08-17.
+
+**Why not Testray's `autoanalyze`.** It already exists and already means something
+else. `TestrayManagerImpl` checks it during results import and, when true, looks up
+the routine's previous `importStatus eq 'DONE'` build and carries that build's prior
+analysis forward onto matching results; `RoutineForm.tsx` renders it as a
+user-facing "Autoanalyze" toggle, so it also has live user-set data behind it.
+Overloading it with "run our classifier" would give one field two meanings and make
+our behaviour depend on a Testray setting users change for unrelated reasons —
+the exact failure §6 avoids for `Subtask`. We add **`autoTriage`** on our own object
+instead.
+
+**Two entry paths, one route.**
+
+| `autoTriage` | Trigger | Baseline |
+|---|---|---|
+| **on** | the routine type's trigger (§8: build completion, or promotion for Release) | the routine type's baseline rule (§8) |
+| **off** (default) | user picks both builds and hits Triage | whatever the user picked |
+
+The manual path deliberately mirrors Testray's existing compare-runs affordance
+(select A, select B, compare) so it needs no new interaction vocabulary: select
+baseline build, select target build, **Triage** in the left-hand panel. Both paths
+land on the same route — `triage/:baselineBuildId/:targetBuildId` — so an automatic
+run and a manual one are the same object and the same view, differing only in who
+supplied the build IDs.
+
+**The report renders in-app.** Not a hosted artifact, not a link out. The verdicts
+are already in Testray as `TriageResult` rows, so the view reads them through the
+`CaseResult` FK and groups by `clusterKey` (§7); shipping an HTML file alongside
+would be a second copy of data we already store, and would need hosting that does
+not exist locally. `report.py`'s `report.html` stays what it is today — the **local
+dev preview**, for inspecting a run without DXP. It is not the product surface.
+
+**Build-index icon.** A column in the routine's build list, between **Build Status**
+and **Execution Date** (`Routine.tsx` — between the `status` column and
+`testrayBuildDueDate`). Testray's `status` column already uses a **circle** for
+task/testflow status; a second circle in the neighbouring column would read as the
+same vocabulary, so triage state uses a **diamond**. Starting shape only — the
+mapping below is what matters, and the symbol is one string to change.
+
+| Triage state | Colour | Clickable |
+|---|---|---|
+| no run for this build | *renders nothing* — same as the unpromoted star | — |
+| generating | `$blockedColor` | no |
+| failed | `$failedColor` | yes → failure detail |
+| ready | `$passedColor` | yes → the triage view |
+
+Use the SCSS tokens, not hex, so the column tracks Testray's palette (same reason
+`report.py` copied their values rather than inventing any). The empty state is
+load-bearing: it keeps the column silent on routines that never triage, which is
+what lets the column ship to everyone.
+
+**The row data cannot carry this flag.** That list is populated by
+`testray-builds-metrics`, hand-written SQL in `TestrayStatusMetricResourceImpl` —
+Testray core, which decision #1 puts off-limits. So the column **side-fetches**:
+one query for the builds on the current page, merged client-side. One extra request
+per page render, and no core change.
+
+**CX boundary — what ships where.**
+
+| Piece | Where it lives | Deployable on its own? |
+|---|---|---|
+| `TriageResult`, `TriageRun`, `TriageRoutineSetting`; OAuth app | `liferay-testray-analytics-site-initializer` | yes |
+| Triage view, cluster render, baseline/target picker, `autoTriage` settings screen | **`liferay-testray-analytics-custom-element`** (new) | yes |
+| 'Triage' sidebar item + build-index column | `liferay-testray-custom-element` (~40 lines) | **no** |
+
+The last row is a source modification to Testray's own custom element, and that is
+forced, not chosen. Verified 2026-08-17: the app is a single
+`customElements.define(ELEMENT_ID, Testray)` with its own React root and its own
+internal router, it exposes no plugin registry or extension point, and `ListView`'s
+`columnsContext` is a **visibility map** over the static `tableProps.columns` literal
+(`columns[key] === undefined → true`) — it can hide a column but cannot add one. A
+second custom element mounts on a different DOM node and cannot reach in.
+
+What keeps this inside the additive principle: the modification contains **no triage
+logic**. It is two link-shaped additions whose render feature-detects
+`/o/c/triageruns` and draws nothing when the probe fails — so on a stock instance
+without our CX, the patch is inert. That preserves the deploy story: *don't apply the
+hook* → Testray unchanged; *apply it and deploy our CX* → the whole feature. It is
+also small enough and generic enough to offer upstream as an integration point
+rather than carry as a permanent local diff.
+
+> Rejected: making our custom element a standalone page instead, to reach literal
+> zero edits. Our site-initializer provisions its **own site**
+> (`siteName: Liferay Testray Analytics`), so that page sits in a different URL
+> space from `/web/testray` and the flow becomes leave-Testray-and-come-back.
+> Also rejected: DOM-injecting into their React tree from outside.
 
 ---
 
@@ -435,6 +528,46 @@ auto-creates its backing table and a `/o/c/triageresults` REST endpoint.
 > auto-buckets, not LLM verdicts, so they sit outside the §4 taxonomy). Keeps the
 > store lean (T3 retention) and the triage view focused on code regressions.
 
+### Companion objects — `TriageRun` and `TriageRoutineSetting`
+
+Same CX, same rules as `TriageResult`: new Objects, no edits to Testray's
+definitions, FKs on our side.
+
+**`TriageRun`** — one row per triage run. `TriageResult` answers *what the verdict
+was*; this answers *whether a run exists at all, and how it went*, which
+`TriageResult` cannot: a run that failed or is still going has no results yet.
+
+- **Fields:** target build FK, baseline build FK, routine FK, `analysisMode` (§8),
+  `status` (`QUEUED` / `RUNNING` / `DONE` / `FAILED`), `startedAt`, `finishedAt`,
+  `classifier`, verdict counts, `errorMessage`.
+- **ERC:** the CLI's run id (the `runs/r_<id>/` bundle name), so a local bundle and
+  its Testray row share one identity.
+- **Why it earns its place:** it is the icon's predicate. With it, the build-index
+  column resolves in one filtered query per page; without it we would count
+  `TriageResult` rows by ERC prefix — a query per row — and still could not
+  distinguish *generating* or *failed* from *nothing here*. It also gives the manual
+  flow its progress state and the routine its run history.
+
+**`TriageRoutineSetting`** — one row per routine, holding `autoTriage` (boolean,
+default off), `baselineStrategy`, and `classificationMode` (`per-test` /
+`by-cluster`, §7). ERC = the routine id. **An absent row means defaults**, so no
+backfill is needed and an unconfigured routine behaves as `autoTriage` off with the
+strategy inferred from its name (§8).
+
+> **Declare both objects complete at creation.** Fields and relationships present
+> when the Object is created land on the base table; anything added afterwards lands
+> in the `_x` extension table. That split is what produced the
+> `bx.cpuusetime_ does not exist` and `bs.caseresulttotal_ does not exist` failures
+> in the local setup, and it stays invisible until some hand-written SQL reads the
+> wrong table. Adding a field later is not free — plan the shape up front.
+
+> **Scopes:** each new Object needs its own entry on the CX's
+> `oAuthApplicationHeadlessServer` (`c_triagerun.everything`,
+> `c_triageroutinesetting.everything`). Only the plain `.everything` alias resolves;
+> `.read` / `.write` leaves are dropped silently at deploy with no build error and
+> surface as a 403 at call time, so confirm what landed by reading the token's
+> `scope` claim rather than trusting the YAML.
+
 ---
 
 ## 10. Build sequence (follows the tickets)
@@ -448,8 +581,14 @@ auto-creates its backing table and a `/o/c/triageresults` REST endpoint.
 3. **Headless write-sink (LPD-95843)** — replace the Postgres upsert with
    `PUT /o/c/triageresults/by-external-reference-code/{erc}` per row (open-Q
    #1); register one OAuth2 service-account app.
-4. **Frontend CX** (custom-element) — cluster view (LPD-95844) + verdicts column
-   (LPD-95848), grouping by `clusterKey`.
+4. **Frontend (LPD-95844 + LPD-95848)** — three pieces, in this order:
+   a. `TriageRun` + `TriageRoutineSetting` Objects in the existing
+      site-initializer CX (§9), declared complete at creation.
+   b. **`liferay-testray-analytics-custom-element`** (new CX) — cluster view
+      grouping by `clusterKey`, baseline/target picker, `autoTriage` settings.
+   c. The **hook** in `liferay-testray-custom-element` — 'Triage' sidebar item and
+      the build-index diamond column, feature-detected so it is inert without (b).
+   Order matters: (c) probes for (a), and is the only piece that touches Testray.
 5. **Later modes & features** — `routine-history` / `suite-vs-pr`; inline + bulk
    ticket creation (LPD-95849/96615) via extended `etc-jira`, with dedup +
    write-back to native `issues` (§11); inline fix (LPD-95850); override capture
@@ -623,7 +762,10 @@ cross-referenced elsewhere in the doc, so they stay stable regardless of order).
 - **#3 Portal checkout** — persistent checkout, `git pull` each run (§2); never a
   fresh clone (multi-GB).
 - **#4 Triggers** — routine-dependent: Stable + Acceptance on build completion;
-  Release on promotion; PR user-driven (§8).
+  Release on promotion; PR user-driven (§8). Gated per routine by our own
+  **`autoTriage`** flag (default off), *not* Testray's `autoanalyze`, which is a
+  carry-forward flag with unrelated live semantics. When off, the user selects
+  baseline and target manually — same route, same object (§8).
 - **#5 `clusterKey` normalization** — strip volatile tokens (timestamps,
   `0x…`/hashes, UUIDs, line numbers, temp paths, ports, `…ms`, build IDs), keep
   exception class + first message line + top ~3 normalized frames, lowercase, hash.
