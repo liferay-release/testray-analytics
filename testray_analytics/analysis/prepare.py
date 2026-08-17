@@ -129,9 +129,44 @@ class SideSpec:
 # Config
 # ---------------------------------------------------------------------------
 
+# Which TESTRAY_* variables overrode config.yml on the last load_config().
+# Reported by testray_target() so an override is visible in the run output
+# rather than inferred from a 401 twenty minutes later.
+_ENV_OVERRIDES: list[str] = []
+
+
 def load_config() -> dict:
+    """Read config.yml, then let TESTRAY_* environment variables override the
+    Testray connection settings (secrets can live in the shell or in Jenkins
+    credentials rather than the file — decision #5).
+
+    The override lives here, not in prepare(), so that EVERY command resolves
+    the same way. When only prepare() applied it, a stale TESTRAY_CLIENT_ID in
+    a shell pointed the read half at one instance while submit kept writing to
+    whatever config.yml said — silently, since nothing printed the target."""
+    global _ENV_OVERRIDES
     with open(find_config_file()) as f:
-        return yaml.safe_load(f)
+        cfg = yaml.safe_load(f)
+
+    tr = cfg.setdefault("testray", {})
+    _ENV_OVERRIDES = []
+    for _key, _env in (("base_url", "TESTRAY_BASE_URL"),
+                       ("client_id", "TESTRAY_CLIENT_ID"),
+                       ("client_secret", "TESTRAY_CLIENT_SECRET")):
+        if os.environ.get(_env):
+            tr[_key] = os.environ[_env]
+            _ENV_OVERRIDES.append(_env)
+    return cfg
+
+
+def testray_target(cfg: dict) -> str:
+    """One line naming the instance this command will talk to, and whether the
+    environment redirected it. Print it early — it is the difference between
+    diagnosing a mismatch in five seconds and in an evening."""
+    line = (cfg.get("testray") or {}).get("base_url", "<no base_url>")
+    if _ENV_OVERRIDES:
+        line += f"   [overridden by {', '.join(sorted(_ENV_OVERRIDES))}]"
+    return line
 
 
 # ---------------------------------------------------------------------------
@@ -1897,16 +1932,8 @@ def prepare(baseline: SideSpec, target: SideSpec, classifier: str,
     validate_combo(baseline, target)
     validate_mode(baseline, target, mode)
 
-    cfg         = load_config()
-    # Testray connection settings: environment variables OVERRIDE config.yml, so
-    # secrets can live in the shell / Jenkins credentials rather than the file
-    # (mirrors ANTHROPIC_API_KEY). Also the easy way to switch base_url per run.
-    tr = cfg.setdefault("testray", {})
-    for _key, _env in (("base_url", "TESTRAY_BASE_URL"),
-                       ("client_id", "TESTRAY_CLIENT_ID"),
-                       ("client_secret", "TESTRAY_CLIENT_SECRET")):
-        if os.environ.get(_env):
-            tr[_key] = os.environ[_env]
+    cfg         = load_config()   # applies the TESTRAY_* env overrides
+    print(f"Testray:    {testray_target(cfg)}")
     git_repo    = Path(cfg["git"]["repo_path"]).expanduser()
 
     ts      = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")

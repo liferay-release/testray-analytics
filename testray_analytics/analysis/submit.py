@@ -36,7 +36,7 @@ from pathlib import Path
 import pandas as pd
 import yaml
 
-from .prepare import load_config
+from .prepare import load_config, testray_target
 from .report import render_run
 from .testray_writer import (
     ENDPOINT, FK_FIELD, build_batch, count_excluded, post_batch,
@@ -536,7 +536,11 @@ def main() -> None:
         print("  --dry-run set → not upserting into Testray.")
         return
 
-    cfg = load_config()["testray"]
+    # Same resolution as prepare(), env overrides included — the two halves of
+    # the pipeline must never end up pointing at different instances.
+    full_cfg = load_config()
+    cfg = full_cfg["testray"]
+    print(f"  Testray: {testray_target(full_cfg)}")
     print(f"  Upserting into {cfg['base_url'].rstrip('/')}{ENDPOINT} …")
     n_ok, n_fail, failures = post_batch(items, cfg, progress=True)
     print(f"  Upserted {n_ok}/{len(items)} TriageResults"
