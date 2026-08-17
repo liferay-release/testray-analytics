@@ -199,3 +199,24 @@ def test_culprit_file_separates_clusters():
         _row(testray_case_id=2, error_message="assert failed", culprit_file="b/B.java"),
     ])
     assert items[0]["clusterKey"] != items[1]["clusterKey"]
+
+
+def test_missing_culprit_file_from_pandas_does_not_crash():
+    """A missing culprit_file arrives as NaN, not None. NaN is a float and is
+    truthy, so `value or ""` keeps it and .strip() raises — this crashed a real
+    submit. NaN must behave exactly like an absent value."""
+    import math
+    items = _batch([
+        _row(testray_case_id=1, culprit_file=float("nan"), error_message="boom"),
+        _row(testray_case_id=2, culprit_file=None, error_message="boom"),
+    ])
+    assert items[0]["clusterKey"] == items[1]["clusterKey"]
+
+
+def test_nan_error_message_is_treated_as_blank_not_the_string_nan():
+    """str(NaN) is 'nan'; letting that through would make every error-less
+    failure cluster together under a bogus signature."""
+    a = _batch([_row(testray_case_id=1, test_case="T1", error_message=float("nan"))])
+    b = _batch([_row(testray_case_id=2, test_case="T2", error_message=float("nan"))])
+    # Different tests, no error text -> the test-name fallback keeps them apart.
+    assert a[0]["clusterKey"] != b[0]["clusterKey"]

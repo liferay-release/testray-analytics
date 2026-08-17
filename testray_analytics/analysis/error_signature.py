@@ -157,13 +157,23 @@ _SIGNATURE_MAX_CHARS = 100
 _REPEAT_RE = re.compile(r"(.{12,}?)\1+")
 
 
+def _text(value) -> str:
+    """Coerce a possibly-missing field to a string, treating pandas NaN as
+    empty. NaN is a float AND truthy, so `value or ""` keeps it and
+    `str(value)` yields the literal "nan" — which would silently become a
+    signature, or crash on .strip(). Both happened on real data."""
+    if value is None:
+        return ""
+    if isinstance(value, float) and value != value:   # NaN
+        return ""
+    return str(value)
+
+
 def normalize(text) -> str:
     """Reduce error text to a signature that is stable across runs of the same
     failure. Returns "" for missing/blank input — callers must treat that as
     *unknown*, never as a match."""
-    if text is None:
-        return ""
-    s = str(text).strip()
+    s = _text(text).strip()
     if not s:
         return ""
 
@@ -257,6 +267,12 @@ def _message_part(s: str) -> str:
     return "\n".join(frames[:_TRACE_FRAMES_KEPT])
 
 
+def _light(value) -> str:
+    """Case- and whitespace-only normalization, for identifiers that must keep
+    their digits."""
+    return _WS_RE.sub(" ", _text(value)).strip().casefold()
+
+
 def signatures_differ(baseline_error, target_error) -> bool:
     """True when the failure reason genuinely changed (§12's FAILED→FAILED
     condition).
@@ -288,7 +304,12 @@ def cluster_key(culprit_file, test_name, error) -> str:
     fall back to the test identity.
     """
     normalized_error = normalize(error)
-    signature = normalized_error or f"noerror:{normalize(test_name)}"
-    material = f"{(culprit_file or '').strip().casefold()}\x00{signature}"
+    # Fallback identity when there is no error text. Deliberately NOT run
+    # through normalize(): that collapses digits as volatile, which is right
+    # for an error message and wrong for a test name — testFoo1 and testFoo2
+    # are different tests, and merging them would put unrelated failures in
+    # one cluster whenever error text is missing.
+    signature = normalized_error or f"noerror:{_light(test_name)}"
+    material = f"{_text(culprit_file).strip().casefold()}\x00{signature}"
     digest = hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
     return f"{SIGNATURE_VERSION}:{digest}"
