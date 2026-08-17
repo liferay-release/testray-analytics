@@ -15,21 +15,32 @@ Usage:
     After this script writes results.json, submit with:
         python3 -m apps.triage.submit <run_dir>
 
-CLASSIFIER SWITCH — Claude Code session vs Anthropic API:
+CLASSIFIER SWITCH — `--engine`:
 
-    There are two ways to turn a prepared bundle into results.json, and
-    submit.py cannot tell them apart. The only record of which was used is
-    the `classifier` label, so keep the prefix honest:
+    Both engines produce the same results.json, and submit.py cannot tell
+    them apart. The only record of which ran is the `classifier` label, so it
+    is derived from --engine rather than passed by hand:
 
-      agent:<model>   a Claude Code session. Open runs/r_<id>/prompt.md in
-                      Claude Code, have it answer against
-                      results.schema.json, save the reply as
-                      runs/r_<id>/results.json. No API key, no spend.
-                      This is prepare.py's DEFAULT_CLASSIFIER.
+      claude-code   DEFAULT. Shells out to `claude -p --output-format json`,
+      (agent:…)     one call per batch, using your Claude Code subscription.
+                    No API key. The CLI loads its own context on every
+                    invocation (~20-25k cached tokens on top of the batch),
+                    so few large batches cost far less than many small ones.
+                    ANTHROPIC_API_KEY is scrubbed from the child environment:
+                    the CLI would otherwise prefer it over the claude.ai
+                    login, and a stale key makes every call fail as an auth
+                    error that looks like a CLI fault.
 
-      api:<model>     this script. Needs ANTHROPIC_API_KEY and bills per
-                      run — see `--dry-run` for the batch plan and token
-                      estimate before committing to it.
+      api           The Anthropic SDK. Needs ANTHROPIC_API_KEY and bills per
+      (api:…)       token. Not available organizationally at present; kept
+                    for Jenkins/headless use and because structured outputs
+                    guarantee schema-valid replies, which the CLI path has to
+                    parse defensively instead.
+
+    Either way `--dry-run` prints the batch plan and token estimate without
+    calling anything. You can still classify by hand — open
+    runs/r_<id>/prompt.md in a session and save the reply as results.json —
+    but the CLI engine does exactly that, with validation.
 
     The externalReferenceCode is <buildB>_<caseId>_<classifier>, so the two
     paths never collide: classifying the same build pair both ways leaves
@@ -95,6 +106,8 @@ import copy
 import json
 import os
 import re
+import subprocess
+import threading
 import sys
 import time
 from dataclasses import dataclass
@@ -136,7 +149,9 @@ def _disp(p) -> str:
     except ValueError:
         return str(p)
 
-DEFAULT_CLASSIFIER = "api:claude-opus-4-8"
+# Fallback only — main() derives the label from --engine (agent:<model> for
+# claude-code, api:<model> for the SDK) so provenance always matches what ran.
+DEFAULT_CLASSIFIER = "agent:claude-opus-4-8"
 
 # ---------------------------------------------------------------------------
 # Config
@@ -482,6 +497,136 @@ def _build_user_text(
     )
 
 
+def call_claude_code(
+    system_header: str,
+    batch: list,
+    cfg: dict,
+    classifier: str,
+    run_id: str,
+    batch_number: int,
+    total_batches: int,
+    api_schema: dict,
+    mode: str = "per-test",
+    timeout: int = 1800,
+) -> tuple[list[dict], dict]:
+    """Same contract as call_api(), but routed through the Claude Code CLI
+    (`claude -p`) instead of the Anthropic SDK — subscription usage, no API
+    key, no per-token bill.
+
+    Two details that are easy to get wrong:
+
+    * ANTHROPIC_API_KEY is scrubbed from the child environment. The CLI
+      prefers it over the claude.ai login, so leaving a stale or disabled key
+      in the shell makes every call fail with an auth error while looking like
+      a CLI problem.
+    * There is no structured-output guarantee here, so the reply is parsed
+      defensively: the envelope's `result` text may arrive wrapped in a code
+      fence or with prose around it.
+    """
+    body = _build_user_text(batch, batch_number, total_batches,
+                            classifier, run_id, mode)
+    prompt = (
+        f"{system_header}\n\n{body}\n\n"
+        f"Reply with ONE JSON object matching this schema and nothing else — "
+        f"no prose, no code fence:\n{json.dumps(api_schema)}"
+    )
+
+    env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
+    cmd = ["claude", "-p", "--output-format", "json"]
+    model = cfg.get("model")
+    if model:
+        cmd += ["--model", model]
+
+    # The CLI prints nothing until it returns, and a 100k-token batch runs for
+    # minutes — silence long enough that the natural reaction is to Ctrl-C a
+    # call that was working. Tick every 30s so the wait is legible.
+    _done = threading.Event()
+
+    def _ticker():
+        started = time.monotonic()
+        while not _done.wait(30):
+            mins, secs = divmod(int(time.monotonic() - started), 60)
+            print(f"      … batch {batch_number}/{total_batches} still running "
+                  f"({mins}m{secs:02d}s)", flush=True)
+
+    threading.Thread(target=_ticker, daemon=True).start()
+
+    try:
+        proc = subprocess.run(cmd, input=prompt, capture_output=True, text=True,
+                              env=env, timeout=timeout)
+    except FileNotFoundError:
+        raise SystemExit(
+            "`claude` is not on PATH. Install the Claude Code CLI, or use "
+            "--engine api with ANTHROPIC_API_KEY set."
+        )
+    except subprocess.TimeoutExpired:
+        raise SystemExit(
+            f"claude -p timed out after {timeout}s on batch {batch_number}. "
+            f"Re-run; completed batches are kept in results.partial.jsonl."
+        )
+    finally:
+        _done.set()
+
+    envelope = None
+    for line in reversed(proc.stdout.splitlines()):
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                envelope = json.loads(line)
+                break
+            except json.JSONDecodeError:
+                continue
+    if envelope is None:
+        raise SystemExit(f"could not parse claude output:\n{proc.stdout[-800:]}")
+    if envelope.get("is_error"):
+        raise SystemExit(
+            f"claude -p failed on batch {batch_number}: "
+            f"{envelope.get('subtype')} {envelope.get('errors')}"
+        )
+
+    results = _extract_results(envelope.get("result") or "", batch_number)
+
+    u = envelope.get("usage") or {}
+    usage = {
+        "input_tokens":                u.get("input_tokens", 0),
+        "output_tokens":               u.get("output_tokens", 0),
+        "cache_creation_input_tokens": u.get("cache_creation_input_tokens", 0) or 0,
+        "cache_read_input_tokens":     u.get("cache_read_input_tokens", 0) or 0,
+        "cost_usd":                    envelope.get("total_cost_usd") or 0,
+    }
+    return results, usage
+
+
+def _extract_results(text: str, batch_number: int) -> list[dict]:
+    """Pull the results array out of a free-text reply. Handles a bare JSON
+    object, a ```json fence, or JSON with prose either side."""
+    candidate = text.strip()
+    if "```" in candidate:
+        parts = candidate.split("```")
+        for part in parts:
+            part = part.strip()
+            if part.startswith("json"):
+                part = part[4:].strip()
+            if part.startswith("{"):
+                candidate = part
+                break
+    if not candidate.startswith("{"):
+        start, end = candidate.find("{"), candidate.rfind("}")
+        if start == -1 or end == -1:
+            raise SystemExit(
+                f"batch {batch_number}: no JSON object in the reply:\n{text[:500]}")
+        candidate = candidate[start:end + 1]
+    try:
+        payload = json.loads(candidate)
+    except json.JSONDecodeError as e:
+        raise SystemExit(f"batch {batch_number}: reply was not valid JSON ({e}):"
+                         f"\n{candidate[:500]}")
+    results = payload.get("results")
+    if not isinstance(results, list):
+        raise SystemExit(f"batch {batch_number}: reply has no `results` array")
+    return results
+
+
 def call_api(
     client: anthropic.Anthropic,
     system_header: str,
@@ -575,7 +720,8 @@ def call_api(
 # Main
 # ---------------------------------------------------------------------------
 
-def classify(run_dir: Path, classifier: str, dry_run: bool) -> Path:
+def classify(run_dir: Path, classifier: str, dry_run: bool,
+             engine: str = "api") -> Path:
     prompt_md   = run_dir / "prompt.md"
     run_yml     = run_dir / "run.yml"
     schema_path = run_dir / "results.schema.json"
@@ -609,6 +755,10 @@ def classify(run_dir: Path, classifier: str, dry_run: bool) -> Path:
     print(f"Run:          {run_id}")
     print(f"Classifier:   {classifier}")
     print(f"Mode:         {mode}")
+    print(f"Engine:       " + ("claude-code — `claude -p`, Claude Code "
+                               "subscription, no API key"
+                               if engine == "claude-code"
+                               else "api — Anthropic SDK, billed per token"))
     print(f"Model:        {cfg['model']}  (effort={cfg['effort']})")
     print(f"{unit.capitalize():14s}{len(sections)}"
           + (f"  (covering {sum(len(s.case_ids) for s in sections)} member case-results)"
@@ -658,10 +808,22 @@ def classify(run_dir: Path, classifier: str, dry_run: bool) -> Path:
         print(f"\n--dry-run: wrote {len(batches)} batch preview file(s) to "
               f"{_disp(batches_dir)}/")
         print("Inspect the batch_*.md files to see what would be sent. "
-              "No API calls made.")
+              "Nothing was called and nothing was spent.")
+        if engine == "claude-code":
+            print(f"A real run makes {len(batches)} `claude -p` call(s); each "
+                  f"also carries the CLI's own ~20-25k token context.")
         return run_dir / "results.json"
 
-    client = build_client()
+    # State plainly which engine is about to spend something, and on whose
+    # meter — the two are billed completely differently.
+    # The engine is already named in the plan block above; here just set
+    # expectations for the wait, since a batch runs silently for minutes.
+    if engine == "claude-code":
+        print(f"\nRunning {len(batches)} `claude -p` call(s) — each takes "
+              f"minutes and prints nothing until it returns.")
+        client = None
+    else:
+        client = build_client()
 
     all_results: list[dict] = []
     if mode == "by-subtask":
@@ -678,6 +840,7 @@ def classify(run_dir: Path, classifier: str, dry_run: bool) -> Path:
     usage_totals = {
         "input_tokens": 0, "output_tokens": 0,
         "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
+        "cost_usd": 0,
     }
 
     for i, batch in enumerate(batches, 1):
@@ -685,8 +848,7 @@ def classify(run_dir: Path, classifier: str, dry_run: bool) -> Path:
         print(f"\n→ batch {i}/{len(batches)}: {len(batch)} {unit} "
               f"({total:,} chars, ~{total // 4:,} tokens)")
 
-        results, usage = call_api(
-            client=client,
+        common = dict(
             system_header=header,
             batch=batch,
             cfg=cfg,
@@ -697,6 +859,18 @@ def classify(run_dir: Path, classifier: str, dry_run: bool) -> Path:
             api_schema=api_schema,
             mode=mode,
         )
+        if engine == "claude-code":
+            results, usage = call_claude_code(**common)
+        else:
+            results, usage = call_api(client=client, **common)
+
+        print(f"   usage: {usage['input_tokens']:,} in / "
+              f"{usage['output_tokens']:,} out / "
+              f"{usage['cache_read_input_tokens']:,} cache-read"
+              + (f"   (Claude Code subscription"
+                 + (f", ~${usage['cost_usd']:.2f} equivalent"
+                    if usage.get('cost_usd') else "") + ")"
+                 if engine == "claude-code" else "   (Anthropic API — billed)"))
 
         if mode == "by-subtask":
             batch_subtask_ids = {s.subtask_id for s in batch if s.subtask_id is not None}
@@ -789,10 +963,16 @@ def classify(run_dir: Path, classifier: str, dry_run: bool) -> Path:
     print("\n" + "=" * 60)
     print(f"Wrote {_disp(out)}")
     print(f"Classified: {len(all_results)} / {len(sections)} failures")
+    print(f"Engine:     {'Claude Code CLI (subscription, not the Anthropic API)'
+                         if engine == 'claude-code' else 'Anthropic API (billed)'}")
+    print(f"Classifier: {classifier}")
     print(f"Tokens:     in={usage_totals['input_tokens']:,} "
           f"out={usage_totals['output_tokens']:,} "
           f"cache_created={usage_totals['cache_creation_input_tokens']:,} "
-          f"cache_read={usage_totals['cache_read_input_tokens']:,}")
+          f"cache_read={usage_totals['cache_read_input_tokens']:,}"
+          + (f"   (~${usage_totals['cost_usd']:.2f} subscription-equivalent "
+             f"across {len(batches)} call(s))"
+             if engine == "claude-code" and usage_totals["cost_usd"] else ""))
     if len(batches) > 1 and usage_totals["cache_read_input_tokens"] == 0:
         print("NOTE: cache_read_input_tokens=0 across a multi-batch run — "
               "shared header is below the model's 4096-token cacheable "
@@ -808,9 +988,16 @@ def main() -> None:
     )
     ap.add_argument("run_dir", type=Path,
                     help="Path to runs/r_<id>/")
-    ap.add_argument("--classifier", default=DEFAULT_CLASSIFIER,
-                    help=f"Classifier label written into results.json "
-                         f"(default: {DEFAULT_CLASSIFIER})")
+    ap.add_argument("--engine", choices=("claude-code", "api"),
+                    default="claude-code",
+                    help="claude-code (default): the `claude -p` CLI, using "
+                         "your Claude Code subscription, no API key. api: the "
+                         "Anthropic SDK, needs ANTHROPIC_API_KEY and bills per "
+                         "token — not available organizationally at present.")
+    ap.add_argument("--classifier", default=None,
+                    help="Classifier label written into results.json. Defaults "
+                         "to api:<model> or agent:<model> to match --engine, so "
+                         "provenance cannot drift from what actually ran.")
     ap.add_argument("--dry-run", action="store_true",
                     help="Parse + batch the bundle and print the plan, but "
                          "make no API calls.")
@@ -820,7 +1007,15 @@ def main() -> None:
     if not run_dir.is_dir():
         raise SystemExit(f"Not a directory: {run_dir}")
 
-    classify(run_dir, classifier=args.classifier, dry_run=args.dry_run)
+    # Derive the label from the engine unless the caller pinned one, so a
+    # claude-code run can never be recorded as api: (or the reverse).
+    classifier = args.classifier
+    if classifier is None:
+        model = load_api_config()["model"]
+        classifier = f"{'api' if args.engine == 'api' else 'agent'}:{model}"
+
+    classify(run_dir, classifier=classifier, dry_run=args.dry_run,
+             engine=args.engine)
 
 
 if __name__ == "__main__":

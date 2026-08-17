@@ -46,7 +46,16 @@ def main() -> None:
         from .classify import main as run
     else:
         from .submit import main as run
-    run()
+
+    try:
+        run()
+    except KeyboardInterrupt:
+        # A classify batch runs for minutes, so Ctrl-C is a normal way to stop
+        # one. Report it as a decision, not a crash — and say what survived.
+        print("\nInterrupted. Any completed batches are in "
+              "results.partial.jsonl; re-run to resume from there.",
+              file=sys.stderr)
+        raise SystemExit(130)   # 128 + SIGINT, the conventional shell code
 
 
 if __name__ == "__main__":
