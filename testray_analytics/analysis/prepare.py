@@ -617,6 +617,15 @@ TRIAGE_TRANSITIONS = frozenset({
 
 _FAILING = ("FAILED", "BLOCKED", "UNTESTED")
 
+# pre_classify buckets that mean "infrastructure", not "product regression".
+# Two different env failures are still one env problem, so a move between them
+# is not a changed failure. NO_ERROR is included: no text on either side cannot
+# evidence a change.
+_ENV_CATEGORIES = frozenset({
+    "BUILD_FAILURE", "ENV_CHROME", "ENV_DEPENDENCY", "ENV_DATE", "ENV_SETUP",
+    "NO_ERROR",
+})
+
 
 def classify_transition(status_a, status_b, error_a, error_b) -> str:
     """Label one baseline→target pair per the §12 matrix.
@@ -678,6 +687,22 @@ def compute_test_diff(baseline: pd.DataFrame, target: pd.DataFrame):
         for sa, sb, ea, eb in zip(merged["status_a"], merged["status_b"],
                                   merged["errors_a"], merged["errors_b"])
     ]
+    # Env churn is not a changed failure. Two runs can fail on the same
+    # infrastructure problem with textually different messages — a different
+    # container id, a different missing dependency — and the signature
+    # comparison alone reads that as a regression. When both sides
+    # pre-classify to the SAME env/infra bucket, the reason did not really
+    # change. (Inherited from the previous platform's
+    # `changed_failures.is_changed`, which learned this the hard way.)
+    changed_mask = merged["transition"] == TRANSITION_CHANGED
+    if changed_mask.any():
+        extra = prompt_helpers.load_triage_config().get("auto_classify_patterns") or {}
+        for idx in merged.index[changed_mask]:
+            cat_a = prompt_helpers.pre_classify(merged.at[idx, "errors_a"], extra)
+            cat_b = prompt_helpers.pre_classify(merged.at[idx, "errors_b"], extra)
+            if cat_a and cat_a == cat_b and cat_a in _ENV_CATEGORIES:
+                merged.at[idx, "transition"] = TRANSITION_SAME_FAILURE
+
     counts = collections.Counter(merged["transition"])
     diff = merged[merged["transition"].isin(TRIAGE_TRANSITIONS)].copy()
 

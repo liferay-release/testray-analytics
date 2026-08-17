@@ -168,3 +168,24 @@ def test_passed_to_failed_only_would_undercount():
     target = pd.DataFrame([_frame(1, "FAILED", "x"), _frame(2, "FAILED", "TimeoutException")])
     df, _ = compute_test_diff(baseline, target)
     assert len(df) == 2, "changed failure was dropped — undercount regression"
+
+
+def test_env_churn_is_not_a_changed_failure():
+    """Two runs failing on the same infrastructure bucket with different text
+    are one env problem, not a regression. Without this guard every flaky
+    container id churns into a fake 'changed' row."""
+    baseline = pd.DataFrame([_frame(
+        1, "FAILED", "The build failed prior to running the test on agent-7")])
+    target = pd.DataFrame([_frame(
+        1, "FAILED", "The build failed prior to running the test on agent-42")])
+    df, counts = compute_test_diff(baseline, target)
+    assert counts[TRANSITION_SAME_FAILURE] == 1
+    assert df.empty, "env churn must not reach the classifier"
+
+
+def test_real_regression_still_surfaces_alongside_env_churn():
+    """The guard must not swallow a genuine changed failure in the same run."""
+    baseline = pd.DataFrame([_frame(1, "FAILED", "NullPointerException in Foo")])
+    target = pd.DataFrame([_frame(1, "FAILED", "IllegalStateException in Foo")])
+    df, _ = compute_test_diff(baseline, target)
+    assert list(df["transition"]) == [TRANSITION_CHANGED]
