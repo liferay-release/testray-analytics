@@ -270,7 +270,10 @@ def validate_results_subtask(payload: dict, expected_case_ids: set[int],
 # (not real LLM verdicts, never diff-analyzed): the build broke / nothing ran
 # vs. an environment failure. The specific pre_classification (BUILD_FAILURE,
 # ENV_CHROME, …) is kept in `reason`.
-_DID_NOT_RUN = {"BUILD_FAILURE", "NO_ERROR"}
+# Pre-classifications that mean "this test never produced a real result", as
+# opposed to "the environment broke it". BATCH_FAILURE is a CI-batch row —
+# infrastructure, not a test — so there is nothing that DID run.
+_DID_NOT_RUN = {"BUILD_FAILURE", "NO_ERROR", "BATCH_FAILURE"}
 
 
 def _auto_label(pre_classification) -> str:

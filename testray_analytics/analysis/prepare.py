@@ -99,6 +99,23 @@ DEFAULT_MODE     = MODE_BY_CLUSTER
 # Modes that classify a group once and fan the verdict out to its members.
 GROUPED_MODES    = (MODE_BY_CLUSTER, MODE_BY_SUBTASK)
 
+# Testray components whose rows are infrastructure rather than tests. Kept in
+# the data, excluded from classification. Overridable via the triage config's
+# `excluded_components`.
+DEFAULT_EXCLUDED_COMPONENTS = ("Batch",)
+
+# A CI batch/shard row names a batch axis and shard, not a test:
+#   functional-tomcat-hypersonic20-jdk21_zulu/1/3
+#   empty-osgi-core-dir-postgresql163/0/0
+# This is the PRIMARY signal, because the shape is what makes a row
+# unattributable — there is no test, so no code can be blamed. The component
+# list is the safety net: the same shape appears under `Batch`, `OSGI` and
+# `Smoke`, so keying on the component label alone misses some.
+# Anchored and whitespace-free on purpose: Poshi names are `File#Command` and
+# Playwright names contain spaces ("… .spec.ts > does a thing"), so neither can
+# match by accident.
+_BATCH_SHARD_RE = re.compile(r"^[^\s]+/\d+/\d+$")
+
 GIT_DIFF_EXCLUDES = [
     ":!**/artifact.properties",
     ":!**/.releng/**",
@@ -404,6 +421,112 @@ def fetch_component_metadata(component_ids: list[int], cfg: dict) -> dict[int, s
     return out
 
 
+def fetch_team_metadata(team_ids: list[int], cfg: dict) -> dict[int, str]:
+    """Resolve {team_id: name} via /o/c/teams/{id}.
+
+    Deliberately mirrors fetch_component_metadata, including the 404-skip: a
+    caseresult can reference a team that no longer exists, and one dangling id
+    must not fail a whole run.
+    """
+    if not team_ids:
+        return {}
+    token = _testray_oauth_token(cfg)
+    base = cfg["base_url"].rstrip("/")
+    total = len(team_ids)
+    step = max(1, total // 10)
+    print(f"   [team metadata] fetching {total} team(s) …",
+          file=sys.stderr, flush=True)
+    out: dict[int, str] = {}
+    for i, tid in enumerate(team_ids, start=1):
+        url = f"{base}/o/c/teams/{tid}"
+
+        def _do_request(tok):
+            req = urllib.request.Request(
+                url, headers={"Authorization": f"Bearer {tok}"},
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return json.loads(resp.read())
+
+        try:
+            body = _do_request(token)
+        except urllib.error.HTTPError as e:
+            if e.code == 401:
+                token = _testray_oauth_token(cfg)
+                try:
+                    body = _do_request(token)
+                except urllib.error.HTTPError as e2:
+                    if e2.code == 404:
+                        continue
+                    raise
+            elif e.code == 404:
+                continue
+            else:
+                raise
+        name = body.get("name")
+        if name:
+            out[int(tid)] = name
+        if i % step == 0 or i == total:
+            print(f"   [team metadata] {i}/{total}", file=sys.stderr, flush=True)
+        time.sleep(0.05)
+    return out
+
+
+def _is_blank(v) -> bool:
+    """Blank means: None, NaN, empty, or the literal string 'nan'.
+
+    That last case is not paranoia — a CSV round-trip turns NaN into the
+    four-character string "nan", and without this the Component column
+    re-renders as "nan" forever after the first save.
+    """
+    if v is None:
+        return True
+    if isinstance(v, float) and pd.isna(v):
+        return True
+    t = str(v).strip()
+    return t == "" or t.lower() == "nan"
+
+
+def resolve_component_team_names(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
+    """Fill `testray_component_name` / `team_name` from the component/team FKs.
+
+    One lookup per DISTINCT id, not per row — a 17k-row build has a handful of
+    components, and per-row lookups would be thousands of sequential requests.
+
+    Never overwrites a name that is already set: a csv/tar side may carry real
+    names, and `enrich_api_caseresults` may have filled them already.
+    """
+    if df is None or df.empty:
+        return df
+
+    for id_col, name_col, fetch in (
+        ("component_id", "testray_component_name", fetch_component_metadata),
+        ("team_id",      "team_name",              fetch_team_metadata),
+    ):
+        if id_col not in df.columns:
+            continue
+        if name_col not in df.columns:
+            df[name_col] = None
+
+        blank = df[name_col].map(_is_blank)
+        ids = pd.to_numeric(df.loc[blank, id_col], errors="coerce").fillna(0)
+        # 0 is the "no link" sentinel — skip it rather than fetching /0.
+        wanted = sorted({int(x) for x in ids if int(x) != 0})
+        if not wanted:
+            continue
+        names = fetch(wanted, cfg)
+        if not names:
+            continue
+
+        # Cast to object first. prepare seeds these columns as [None]*n, which
+        # pandas types float64; assigning strings into that raises
+        # "Invalid value for dtype 'float64'" on pandas >= 2.2. This is why the
+        # bug survived unit tests that used string columns but failed live.
+        df[name_col] = df[name_col].astype(object)
+        mapped = pd.to_numeric(df[id_col], errors="coerce").fillna(0).astype("int64").map(names)
+        df.loc[blank & mapped.notna(), name_col] = mapped[blank & mapped.notna()]
+    return df
+
+
 def enrich_api_caseresults(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
     """Backfill `case_name`, `case_flaky`, and `component_name` on a pre-diff
     api-source dataframe so it can be joined against a csv/tar side on
@@ -542,6 +665,14 @@ def fetch_build_caseresults_api(build_id: int, cfg: dict) -> pd.DataFrame:
         "case_flaky":     [None] * len(items),
         "component_name": [None] * len(items),
         "team_name":      [None] * len(items),
+        # The FKs were already in the requested field list but never read out,
+        # so component/team rendered blank on every api-sourced row (§15).
+        # 0 is the "no link" sentinel the resolver filters on — not NaN, so the
+        # column stays integer and `== 0` is a safe test.
+        "component_id":   [it.get("r_componentToCaseResult_c_componentId") or 0
+                           for it in items],
+        "team_id":        [it.get("r_teamToCaseResult_c_teamId") or 0
+                           for it in items],
         "status":         [(it.get("dueStatus") or {}).get("key") for it in items],
         "errors":         [it.get("errors") for it in items],
         "jira_issue":     [None] * len(items),
@@ -838,6 +969,15 @@ def compute_test_diff(baseline: pd.DataFrame, target: pd.DataFrame):
     # else: leave subtask_id off the dataframe; subtask mode will reject the
     # combo upstream in validate_combo_for_mode().
 
+    # Same suffix cases as subtask_id above. Build B is what the report
+    # describes, so the TARGET side's FKs win — a case can be recategorised
+    # between builds, and the baseline's component would mislabel the failure.
+    for col in ("component_id", "team_id"):
+        if f"{col}_b" in diff.columns:
+            out[col] = diff[f"{col}_b"]
+        elif col in diff.columns and target_has_ids:
+            out[col] = diff[col]
+
     out = out.dropna(subset=["testray_case_id"]).reset_index(drop=True)
     return out, counts
 
@@ -972,13 +1112,46 @@ def enrich_and_pre_classify(df: pd.DataFrame) -> pd.DataFrame:
     if "team_name" not in df.columns:
         df["team_name"] = None
 
-    df["team_name"] = df["component_name"].apply(
-        prompt_helpers.team_for_component
-    ).fillna(df["team_name"])
+    # Testray's own team wins; the local component->team map is only a
+    # FALLBACK for rows Testray left blank. The previous form applied the map
+    # first and filled from Testray only where the map returned nothing, which
+    # silently replaced real Testray teams with mapped ones.
+    mapped = df["component_name"].apply(prompt_helpers.team_for_component)
+    keep = ~df["team_name"].map(_is_blank)
+    df["team_name"] = df["team_name"].astype(object).where(keep, mapped)
 
     df["pre_classification"] = df["error_message"].apply(
         lambda e: prompt_helpers.pre_classify(e, extra_pats)
     )
+
+    # CI-batch rows are infrastructure, not tests. Their `test_case` is a batch
+    # name ("functional-tomcat101-postgresql163/25/1"), so there is no test to
+    # match against the diff and no code to attribute a failure to — asking the
+    # classifier about them spends tokens to reach "cannot say". Testray labels
+    # them with the `Batch` component, so that is the signal we key on.
+    #
+    # They are NOT dropped from the data: they keep their row, are counted in
+    # the transition totals, and appear in the report. They are only excluded
+    # from classification, via the same `pre_classification` mechanism the
+    # env/infra patterns use.
+    excluded = [str(c).strip().lower()
+                for c in (cfg.get("excluded_components")
+                          or DEFAULT_EXCLUDED_COMPONENTS)]
+    is_batch = pd.Series(False, index=df.index)
+    if "test_case" in df.columns:
+        is_batch |= df["test_case"].map(
+            lambda n: (not _is_blank(n))
+            and bool(_BATCH_SHARD_RE.match(str(n).strip()))
+        )
+    if excluded and "component_name" in df.columns:
+        is_batch |= df["component_name"].map(
+            lambda c: (not _is_blank(c)) and str(c).strip().lower() in excluded
+        )
+    # Only where no more specific pattern already fired — an error-text match
+    # says something about *why*, which is worth keeping.
+    fill = is_batch & df["pre_classification"].isna()
+    if fill.any():
+        df.loc[fill, "pre_classification"] = "BATCH_FAILURE"
 
     return df
 
@@ -2205,6 +2378,17 @@ def prepare(baseline: SideSpec, target: SideSpec, classifier: str,
     # Testray case object so the fragment matcher has something to anchor on
     # (and so prompt.md doesn't say `### N. \`\`` with no test name).
     df = enrich_api_case_names(df, cfg["testray"])
+
+    # Resolve component/team from the FKs the diff carried through. Must run
+    # BEFORE enrich_and_pre_classify, which renames testray_component_name to
+    # component_name and applies the local component->team map on top.
+    df = resolve_component_team_names(df, cfg["testray"])
+    if "testray_component_name" in df.columns:
+        n_comp = int((~df["testray_component_name"].map(_is_blank)).sum())
+        n_team = int((~df["team_name"].map(_is_blank)).sum()) \
+            if "team_name" in df.columns else 0
+        print(f"   resolved component on {n_comp}/{len(df)} row(s), "
+              f"team on {n_team}/{len(df)}")
 
     print(f"→ Step 2/6 build metadata …")
     # Reuse the caseresults already fetched above — the git hash rides on each

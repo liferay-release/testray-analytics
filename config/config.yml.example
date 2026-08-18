@@ -55,6 +55,14 @@ triage:
   # "Login via API failed" — it overlaps net::ERR_NAME_NOT_RESOLVED on 84 of 95
   # rows, so it buys 11, and those 11 are logins that failed WITHOUT a network
   # error, i.e. possibly a genuine auth regression.
+  # Testray components whose rows are CI infrastructure, not tests. Their
+  # test_case is a batch name (functional-tomcat101-postgresql163/25/1), so
+  # there is no test to match against the diff and no code to attribute to.
+  # Rows are KEPT in the data and counted, but excluded from classification
+  # (pre_classification=BATCH_FAILURE). Default: ["Batch"].
+  excluded_components:
+    - Batch
+
   auto_classify_patterns:
     BUILD_FAILURE:
       # The shipped default is "The build failed prior to running the test";
