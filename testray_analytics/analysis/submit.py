@@ -39,8 +39,8 @@ import yaml
 from .prepare import load_config, testray_target
 from .report import render_run
 from .testray_writer import (
-    ENDPOINT, FK_FIELD, build_batch, count_excluded, post_batch,
-    write_batch_file,
+    ENDPOINT, FK_FIELD, build_batch, build_triage_run, count_excluded,
+    post_batch, write_batch_file, write_triage_run,
 )
 
 
@@ -563,6 +563,25 @@ def main() -> None:
               f"HTTP {f['status']} {f['error']}")
     if n_fail > 10:
         print(f"    … and {n_fail - 10} more (see above pattern)")
+    # The TriageRun row goes last, and only once the results are in, so its
+    # counts describe what actually landed rather than what was attempted.
+    # A failure here is reported but never fatal: the verdicts are already
+    # persisted, and losing the run row costs the build-index diamond and the
+    # report header, not data.
+    try:
+        run_payload = build_triage_run(
+            meta, df, classifier=payload["classifier"],
+            n_written=n_ok, n_excluded=n_excluded,
+        )
+        write_triage_run(run_payload, cfg)
+        print(f"  TriageRun {run_payload['externalReferenceCode']} upserted "
+              f"({run_payload['totalClusters']} clusters, "
+              f"{run_payload['totalWritten']} written)")
+    except Exception as e:
+        print(f"  ! TriageRun upsert failed ({e}) — the {n_ok} TriageResults "
+              f"still landed, but the build-index icon and the report header "
+              f"will have no run to read.", file=sys.stderr)
+
     if n_fail:
         raise SystemExit(1)
 

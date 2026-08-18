@@ -224,6 +224,77 @@ def _erc_path(erc: str) -> str:
     return f"{ENDPOINT}/by-external-reference-code/{urllib.parse.quote(erc, safe='')}"
 
 
+RUN_ENDPOINT = "/o/c/triageruns"
+
+
+def _run_erc_path(erc: str) -> str:
+    return (f"{RUN_ENDPOINT}/by-external-reference-code/"
+            f"{urllib.parse.quote(erc, safe='')}")
+
+
+def build_triage_run(meta: dict, df: pd.DataFrame, *, classifier: str,
+                     n_written: int, n_excluded: int,
+                     n_clusters: int | None = None) -> dict:
+    """The TriageRun row for a finished run (ARCHITECTURE.md §9).
+
+    `TriageResult` answers *what the verdict was*; this answers *whether a run
+    exists at all and how it went* — which results alone cannot, since a failed
+    or still-running run has no results. It is also what the build-index
+    diamond queries, so without it that column is blank no matter how many
+    results landed.
+
+    ERC is the run id, so a local bundle and its Testray row share one
+    identity and a re-submit updates in place rather than accumulating.
+    """
+    counts = (df["classification"].value_counts().to_dict()
+              if len(df) and "classification" in df else {})
+    if n_clusters is None:
+        # Count distinct clusterKey the same way report.py does, so the number
+        # in Testray matches the number the report shows.
+        keys = {
+            error_signature.cluster_key(r.get("culprit_file"),
+                                        r.get("test_case"),
+                                        r.get("error_message"))
+            for _, r in df.iterrows()
+        } if len(df) else set()
+        n_clusters = len(keys)
+
+    prepared = _clean(meta.get("prepared_at"))
+    payload = {
+        "externalReferenceCode": _clean(meta.get("run_id")),
+        "triageRunStatus":       {"key": "DONE"},
+        "analysisMode":          _clean(meta.get("analysis_mode")
+                                        or "build-vs-build"),
+        "classifier":            classifier,
+        "totalFailures":         int(meta.get("total_failures") or len(df)),
+        "totalClusters":         int(n_clusters),
+        "totalClassified":       int(len(df)),
+        "totalWritten":          int(n_written),
+        "totalExcluded":         int(n_excluded),
+        "verdictCounts":         json.dumps(counts, sort_keys=True),
+        # NOTE: the classification granularity (§7 — by-cluster / per-test) is
+        # a different axis from analysisMode (§8) and TriageRun has no field
+        # for it, so it exists only in the local run.yml. A run's granularity
+        # is therefore not recoverable from Testray alone — known gap.
+        "errorMessage":          None,
+        "startedAt":             prepared,
+        "finishedAt":            prepared,
+        "r_buildToTriageRuns_c_buildId":         _fk(meta.get("build_id_b")),
+        "r_baselineBuildToTriageRuns_c_buildId": _fk(meta.get("build_id_a")),
+        "r_routineToTriageRuns_c_routineId":     _fk(meta.get("routine_id")),
+    }
+    return {k: v for k, v in payload.items() if v is not None}
+
+
+def write_triage_run(payload: dict, cfg: dict, *, timeout: int = 60) -> dict:
+    """Upsert one TriageRun by ERC. Raises on failure — the caller decides
+    whether a missing run row is fatal (it is not: the results already
+    landed)."""
+    session = _Session(cfg)
+    erc = payload["externalReferenceCode"]
+    return session.request("PUT", _run_erc_path(erc), payload, timeout=timeout)
+
+
 def post_batch(items: list[dict], cfg: dict, *, max_retries: int = 2,
                timeout: int = 60, progress: bool = False):
     """Upsert each item via PUT /o/c/triageresults/by-external-reference-code/{erc}.
