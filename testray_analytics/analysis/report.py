@@ -666,7 +666,7 @@ def _build_url(meta: dict, build_id) -> str:
             f"/build/{_text(build_id)}")
 
 
-def _groups(df: pd.DataFrame) -> dict:
+def _groups(df: pd.DataFrame, ckeys: list[str]) -> dict:
     """Ordered groups per mode: {mode: [(label, [positional index, …]), …]}.
 
     Cluster mode drives the default view and is ordered severity-first, then
@@ -678,7 +678,7 @@ def _groups(df: pd.DataFrame) -> dict:
         return {mode: [] for mode, _ in _GROUP_MODES}
 
     keys = {
-        "cluster":   [_cluster_of(r) for _, r in df.iterrows()],
+        "cluster":   list(ckeys),
         "component": [_text(v) or "(no component)" for v in df.get("component_name", [])],
         "team":      [_text(v) or "(no team)" for v in df.get("team_name", [])],
         "verdict":   [_text(v) or "(unclassified)" for v in df.get("classification", [])],
@@ -756,7 +756,8 @@ def _header_row(mode: str, idx: int, label: str, members: pd.DataFrame,
     )
 
 
-def _member_rows(df: pd.DataFrame, meta: dict, cluster_no: dict[str, int]) -> str:
+def _member_rows(df: pd.DataFrame, meta: dict, cluster_no: dict[str, int],
+                 ckeys: list[str], shared: dict) -> str:
     """Every member row plus its detail row, rendered once.
 
     Rendered once and re-appended by the group-by handler rather than
@@ -768,7 +769,7 @@ def _member_rows(df: pd.DataFrame, meta: dict, cluster_no: dict[str, int]) -> st
         verdict = _text(r.get("classification"))
         css = _vclass(verdict)
         rid = f"row-{i}"
-        ckey = _cluster_of(r)
+        ckey = ckeys[i]
         cno = cluster_no.get(ckey)
 
         test = _text(r.get("test_case")) or "(unnamed)"
@@ -783,13 +784,13 @@ def _member_rows(df: pd.DataFrame, meta: dict, cluster_no: dict[str, int]) -> st
         # them. Repeating an identical paragraph on thirty rows is what made
         # the flat table unreadable; the full text is still one click away in
         # the detail panel, and on hover.
-        shared = f'<span class="same-as-cluster" title="{{}}"><a href="#grp-cluster-{cno}">&uarr; cluster {cno}</a></span>'
-        if cno is not None and _shared_in_cluster(df, ckey, "reason", reason):
-            reason_cell = shared.format(_esc(reason))
+        pointer = f'<span class="same-as-cluster" title="{{}}"><a href="#grp-cluster-{cno}">&uarr; cluster {cno}</a></span>'
+        if cno is not None and _shared_in_cluster(shared, ckey, "reason", reason):
+            reason_cell = pointer.format(_esc(reason))
         else:
             reason_cell = _esc(reason) or "—"
-        if cno is not None and culprit and _shared_in_cluster(df, ckey, "culprit_file", culprit):
-            culprit_cell = shared.format(_esc(culprit))
+        if cno is not None and culprit and _shared_in_cluster(shared, ckey, "culprit_file", culprit):
+            culprit_cell = pointer.format(_esc(culprit))
         else:
             culprit_cell = f"<code>{_esc(culprit)}</code>" if culprit else "—"
 
@@ -819,22 +820,29 @@ def _member_rows(df: pd.DataFrame, meta: dict, cluster_no: dict[str, int]) -> st
     return "\n".join(parts)
 
 
-def _shared_in_cluster(df: pd.DataFrame, ckey: str, column: str, value: str) -> bool:
+def _cluster_index(df: pd.DataFrame) -> tuple[list[str], dict]:
+    """Precompute each row's clusterKey once, plus a per-cluster value index.
+
+    Built in a single pass on purpose. The previous form recomputed the key
+    inside a per-row predicate, so `normalize()` ran roughly
+    clusters x columns x rows times — ~150,000 regex passes on a 449-row run,
+    which pinned a core for minutes. It looked fine at 170 rows, which is why
+    it shipped. Do not reintroduce a per-row `_cluster_of` call in a loop.
+    """
+    keys: list[str] = []
+    shared: dict[tuple[str, str], set] = {}
+    for _, r in df.iterrows():
+        ck = _cluster_of(r)
+        keys.append(ck)
+        for col in ("reason", "culprit_file"):
+            shared.setdefault((ck, col), set()).add(_text(r.get(col)))
+    return keys, shared
+
+
+def _shared_in_cluster(shared: dict, ckey: str, column: str, value: str) -> bool:
     """True when every member of the cluster carries this same value."""
-    cache = _shared_in_cluster._cache
-    key = (id(df), ckey, column)
-    if key not in cache:
-        vals = {
-            _text(r.get(column))
-            for _, r in df.iterrows()
-            if _cluster_of(r) == ckey
-        }
-        cache[key] = vals
-    vals = cache[key]
-    return len(vals) == 1 and value in vals
-
-
-_shared_in_cluster._cache = {}
+    vals = shared.get((ckey, column))
+    return bool(vals) and len(vals) == 1 and value in vals
 
 
 def _detail_row(r, rid: str, css: str, ckey: str, meta: dict) -> str:
@@ -971,13 +979,13 @@ def _banners(df: pd.DataFrame, meta: dict) -> str:
 def render_run(run_dir, df: pd.DataFrame, meta: dict) -> Path:
     """Write report.html into run_dir and return its path."""
     run_dir = Path(run_dir)
-    _shared_in_cluster._cache.clear()
 
     if df is None:
         df = pd.DataFrame()
     df = df.reset_index(drop=True)
 
-    groups = _groups(df)
+    ckeys, shared = _cluster_index(df)
+    groups = _groups(df, ckeys)
     cluster_groups = groups.get("cluster", [])
     cluster_no = {label: i + 1 for i, (label, _) in enumerate(cluster_groups)}
 
@@ -993,7 +1001,7 @@ def render_run(run_dir, df: pd.DataFrame, meta: dict) -> Path:
                             "rows": [f"row-{p}" for p in positions]})
         order[mode] = entries
 
-    body = (_member_rows(df, meta, cluster_no)
+    body = (_member_rows(df, meta, cluster_no, ckeys, shared)
             if len(df) else '<tr><td colspan="10">No rows.</td></tr>')
 
     a_url, b_url = _build_url(meta, meta.get("build_id_a")), _build_url(meta, meta.get("build_id_b"))

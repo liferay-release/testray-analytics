@@ -134,7 +134,9 @@ def _fail(errs: list[str]) -> None:
 
 
 def validate_results_subtask(payload: dict, expected_case_ids: set[int],
-                              all_diff_case_ids: set[int]) -> list[dict]:
+                              all_diff_case_ids: set[int],
+                              canonical_members: dict[int, list[int]] | None = None,
+                              ) -> list[dict]:
     """Validate subtask-mode results.json. One entry per subtask, each with
     a case_ids array.
 
@@ -173,12 +175,18 @@ def validate_results_subtask(payload: dict, expected_case_ids: set[int],
             errs.append(f"{prefix} must be an object")
             continue
 
-        sid = r.get("subtask_id")
+        # by-cluster identifies a group with group_id; by-subtask bundles
+        # written before group_id existed use subtask_id. The identifier is
+        # what the verdict is fanned out on, so a duplicate or a wrong type
+        # here silently mis-assigns a whole group's members.
+        id_field = "group_id" if r.get("group_id") is not None else "subtask_id"
+        sid = r.get(id_field)
         if sid is not None and not isinstance(sid, int):
-            errs.append(f"{prefix}.subtask_id must be int or null, got {type(sid).__name__}")
+            errs.append(f"{prefix}.{id_field} must be int or null, "
+                        f"got {type(sid).__name__}")
         elif isinstance(sid, int):
             if sid in seen_subtasks:
-                errs.append(f"{prefix} duplicate subtask_id={sid}")
+                errs.append(f"{prefix} duplicate {id_field}={sid}")
             else:
                 seen_subtasks.add(sid)
 
@@ -233,10 +241,20 @@ def validate_results_subtask(payload: dict, expected_case_ids: set[int],
               f"for context but will not inherit the model's verdict (auto wins; "
               f"flaky drops).", file=sys.stderr)
 
-    missing = expected_case_ids - seen_classifiable_cids
+    # Coverage must be judged against CANONICAL membership, not the case_ids
+    # the model echoed. The prompt truncates long member lists ("+90 more"),
+    # so the echo is always short for big groups — measuring against it
+    # reported 129 of 449 cases as unclassified on a run where the fan-out
+    # actually covered every one of them. That false alarm is worse than no
+    # warning: it invites deleting a good run.
+    covered = set(seen_classifiable_cids)
+    if canonical_members:
+        for gid in seen_subtasks:
+            covered.update(canonical_members.get(gid, ()))
+    missing = expected_case_ids - covered
     if missing:
         print(f"WARNING: {len(missing)} classifiable case(s) in diff_list.csv "
-              f"have no entry in any subtask's case_ids — they will default "
+              f"are not covered by any group — they will default "
               f"to NEEDS_REVIEW: "
               f"{sorted(missing)[:10]}{'...' if len(missing) > 10 else ''}",
               file=sys.stderr)
@@ -455,27 +473,11 @@ def main() -> None:
     ]["testray_case_id"].astype(int).tolist())
     all_diff = set(diff_list_df["testray_case_id"].dropna().astype(int).tolist())
 
-    if mode == MODE_BY_SUBTASK:
-        validate_results_subtask(payload, expected, all_diff)
-    else:
-        validate_results(payload, expected)
-
-    # Consistency checks against run.yml
-    if payload["run_id"] != meta["run_id"]:
-        print(f"WARNING: results.json run_id={payload['run_id']} "
-              f"does not match run.yml run_id={meta['run_id']}",
-              file=sys.stderr)
-    if payload["classifier"] != meta["classifier"]:
-        print(f"WARNING: results.json classifier={payload['classifier']} "
-              f"overrides run.yml classifier={meta['classifier']}",
-              file=sys.stderr)
-
+    # Canonical group membership, loaded BEFORE validation because both need
+    # it: validation to judge coverage honestly, and the fan-out to expand a
+    # verdict across members the prompt truncated away.
+    subtask_members: dict[int, list[int]] = {}
     if mode in GROUPED_MODES:
-        # Load canonical group membership from diff_list_subtasks.csv —
-        # the prompt's per-subtask block truncates members for readability,
-        # so the model's emitted case_ids may be incomplete. The CSV holds
-        # the full member case_ids per subtask_id.
-        subtask_members: dict[int, list[int]] = {}
         st_path = run_dir / "diff_list_subtasks.csv"
         if st_path.exists():
             st_df = pd.read_csv(st_path)
@@ -496,6 +498,24 @@ def main() -> None:
                 cids = [int(c) for c in cids_str.split("|") if c.strip().isdigit()]
                 if cids:
                     subtask_members[sid] = cids
+
+    if mode in GROUPED_MODES:
+        validate_results_subtask(payload, expected, all_diff,
+                                 canonical_members=subtask_members)
+    else:
+        validate_results(payload, expected)
+
+    # Consistency checks against run.yml
+    if payload["run_id"] != meta["run_id"]:
+        print(f"WARNING: results.json run_id={payload['run_id']} "
+              f"does not match run.yml run_id={meta['run_id']}",
+              file=sys.stderr)
+    if payload["classifier"] != meta["classifier"]:
+        print(f"WARNING: results.json classifier={payload['classifier']} "
+              f"overrides run.yml classifier={meta['classifier']}",
+              file=sys.stderr)
+
+    if mode in GROUPED_MODES:
         df = assemble_dataframe_subtask(diff_list_df, payload["results"],
                                           subtask_members=subtask_members)
     else:
