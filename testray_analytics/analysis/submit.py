@@ -36,7 +36,8 @@ from pathlib import Path
 import pandas as pd
 import yaml
 
-from .prepare import load_config, testray_target
+from .jira_settings import resolve_jira_settings
+from .prepare import commits_touching_file, load_config, testray_target
 from .report import render_run
 from .testray_writer import (
     ENDPOINT, FK_FIELD, build_batch, build_triage_run, count_excluded,
@@ -438,12 +439,54 @@ def assemble_dataframe_subtask(
 # Main
 # ---------------------------------------------------------------------------
 
+def annotate_culprit_commits(df: pd.DataFrame, full_cfg: dict,
+                             meta: dict) -> pd.DataFrame:
+    """Add `culprit_commits` — "LPD-94237 (5cbd024, a040008)" per culprit file.
+
+    The file alone says *where*; the ticket and commit say *who changed it and
+    why*, which is the difference between a lead and a chore. Silent no-op when
+    the checkout or the hashes are unavailable: this is presentation, and must
+    never fail a submit that has already persisted its verdicts.
+    """
+    if df is None or df.empty or "culprit_file" not in df.columns:
+        return df
+    hash_a, hash_b = meta.get("git_hash_a"), meta.get("git_hash_b")
+    repo = (full_cfg.get("git") or {}).get("repo_path")
+    if not (hash_a and hash_b and repo):
+        return df
+    repo = Path(str(repo)).expanduser()
+
+    annotations: dict[str, str] = {}
+    for path in {str(x).strip() for x in df["culprit_file"].dropna() if str(x).strip()}:
+        try:
+            rows = commits_touching_file(repo, hash_a, hash_b, path)
+        except Exception:
+            rows = []
+        if not rows:
+            continue
+        by_ticket: dict[str, list[str]] = {}
+        for short, ticket, _subject in rows:
+            by_ticket.setdefault(ticket or "(no ticket)", []).append(short[:7])
+        annotations[path] = " · ".join(
+            f"{t} ({', '.join(hs)})" for t, hs in by_ticket.items()
+        )
+    if annotations:
+        df["culprit_commits"] = df["culprit_file"].map(
+            lambda v: annotations.get(str(v).strip()) if pd.notna(v) else None
+        )
+    return df
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Submit a triage run bundle.")
     ap.add_argument("run_dir", type=Path, help="Path to runs/r_<id>/")
     ap.add_argument("--no-write", action="store_true",
                     help="Validate + summarize + render the report, but skip "
                          "building the Testray batch payload.")
+    ap.add_argument("--jira-parent", default=None,
+                    help="Parent ticket for the report's prefilled Jira "
+                         "drafts. Overrides run.yml `jira_parent` and "
+                         "config.yml `jira.parent`.")
     ap.add_argument("--dry-run", action="store_true",
                     help="Build and save triageresults_batch.json, but don't "
                          "upsert it into Testray.")
@@ -553,6 +596,23 @@ def main() -> None:
               f"{n_with_sid} case-rows carry subtask_id "
               f"(remaining {len(df) - n_with_sid} are unmapped/auto/missing)")
 
+    # Turn each culprit_file into something actionable: which ticket and
+    # commit in this range actually touched it. One git call per DISTINCT
+    # path — there are usually a handful, and an LLM-named path that does not
+    # resolve simply yields nothing rather than a wrong attribution.
+    # Same resolution as prepare(), env overrides included — the two halves of
+    # the pipeline must never end up pointing at different instances. Loaded
+    # here rather than at the upsert because the report needs it too.
+    full_cfg = load_config()
+    df = annotate_culprit_commits(df, full_cfg, meta)
+
+    # Resolve the Jira draft fields once and hand them to the report. Without
+    # this the buttons still render, but with no parent and no reporter — the
+    # legacy CreateIssueDetails endpoint does not auto-fill Reporter, so every
+    # draft would open with that field empty.
+    meta = dict(meta, jira=resolve_jira_settings(
+        full_cfg, meta, parent_override=getattr(args, "jira_parent", None)))
+
     report_path = render_run(run_dir, df, meta)
     print(f"Report:     {report_path}")
 
@@ -576,9 +636,6 @@ def main() -> None:
         print("  --dry-run set → not upserting into Testray.")
         return
 
-    # Same resolution as prepare(), env overrides included — the two halves of
-    # the pipeline must never end up pointing at different instances.
-    full_cfg = load_config()
     cfg = full_cfg["testray"]
     print(f"  Testray: {testray_target(full_cfg)}")
     print(f"  Upserting into {cfg['base_url'].rstrip('/')}{ENDPOINT} …")

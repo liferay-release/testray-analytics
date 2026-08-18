@@ -706,6 +706,8 @@ def fetch_build_metadata(build_id: int, cfg: dict) -> dict:
     h = body.get("gitHash")
     rid = body.get("r_routineToBuilds_c_routineId")
     return {
+        "name":       (str(body.get("name")).strip()
+                       if body.get("name") else None),
         "git_hash":   str(h).strip() if h and str(h).strip() else None,
         "routine_id": int(rid) if rid else None,
         "project_id": fetch_routine_project(int(rid), cfg) if rid else None,
@@ -860,7 +862,8 @@ def classify_transition(status_a, status_b, error_a, error_b) -> str:
     return TRANSITION_OTHER
 
 
-def compute_test_diff(baseline: pd.DataFrame, target: pd.DataFrame):
+def compute_test_diff(baseline: pd.DataFrame, target: pd.DataFrame,
+                      *, matrix_out: dict | None = None):
     """Inner-join baseline and target and keep the §12 triage candidates —
     new failures *and changed* ones, not only PASSED→FAILED.
 
@@ -904,6 +907,19 @@ def compute_test_diff(baseline: pd.DataFrame, target: pd.DataFrame):
             cat_b = prompt_helpers.pre_classify(merged.at[idx, "errors_b"], extra)
             if cat_a and cat_a == cat_b and cat_a in _ENV_CATEGORIES:
                 merged.at[idx, "transition"] = TRANSITION_SAME_FAILURE
+
+    # Full A x B status cross-tab, taken BEFORE the triage filter — this is
+    # the whole comparison (every joined case), not the 557 rows we triage.
+    # An out-parameter rather than a third return value, so every existing
+    # caller keeps unpacking two.
+    if matrix_out is not None:
+        matrix: dict[str, dict[str, int]] = {}
+        for a, b in zip(merged["status_a"].fillna("UNTESTED"),
+                        merged["status_b"].fillna("UNTESTED")):
+            matrix.setdefault(str(a), {})
+            matrix[str(a)][str(b)] = matrix[str(a)].get(str(b), 0) + 1
+        matrix_out.clear()
+        matrix_out.update(matrix)
 
     counts = collections.Counter(merged["transition"])
     diff = merged[merged["transition"].isin(TRIAGE_TRANSITIONS)].copy()
@@ -1000,7 +1016,10 @@ def resolve_side_metadata(spec: SideSpec, cfg: dict) -> dict:
             f"was supplied). Pass {spec.flag_prefix}-hash <sha> as an override."
         )
     return {
-        "build_name": spec.name or f"api:{spec.build_id}",
+        # Prefer the operator's --{side}-name, then Testray's own build name.
+        # `api:<id>` is a last resort: a title reading "api:270750 → api:270748"
+        # tells a reader nothing about which release they are looking at.
+        "build_name": spec.name or build.get("name") or f"api:{spec.build_id}",
         "git_hash":   git_hash,
         "routine_id": build["routine_id"],
         "project_id": build.get("project_id"),
@@ -1260,7 +1279,11 @@ def write_run_yml(run_dir: Path, *, run_id: str,
                   classifier: str, total_failures: int, auto_classified: int,
                   flaky_excluded: int, mode: str = DEFAULT_MODE,
                   project_id: int | None = None,
-                  testray_url: str | None = None) -> None:
+                  testray_url: str | None = None,
+                  transition_counts: dict | None = None,
+                  baseline_rows: int | None = None,
+                  target_rows: int | None = None,
+                  status_matrix: dict | None = None) -> None:
     metadata = {
         "run_id":              run_id,
         "mode":                mode,
@@ -1278,6 +1301,13 @@ def write_run_yml(run_dir: Path, *, run_id: str,
         "testray_url":         testray_url,
         "build_a_name":        build_a_name,
         "build_b_name":        build_b_name,
+        # `total_failures` is the TRIAGE set (new + changed + blocked), not
+        # every test and not every failure. The other three make that legible
+        # instead of leaving a bare 557 to be misread as "tests run".
+        "baseline_rows":       baseline_rows,
+        "target_rows":         target_rows,
+        "transition_counts":   dict(transition_counts or {}) or None,
+        "status_matrix":       dict(status_matrix or {}) or None,
         "total_failures":      total_failures,
         "auto_classified":     auto_classified,
         "flaky_excluded":      flaky_excluded,
@@ -1586,6 +1616,38 @@ def collect_tickets_in_range(git_repo: Path, hash_a: str, hash_b: str
         if m and m.group(1) not in seen:
             seen.append(m.group(1))
     return seen
+
+
+def commits_touching_file(git_repo: Path, hash_a: str, hash_b: str,
+                          path: str, limit: int = 4) -> list[tuple[str, str, str]]:
+    """Commits in `A..B` that touched `path` → [(short_hash, ticket, subject)].
+
+    This is what turns a bare `culprit_file` into something actionable: the
+    file alone says where, the ticket and commit say who changed it and why.
+    Returns [] when the path does not resolve — an LLM-named path may not
+    match the repo exactly, and a wrong guess must degrade to "no commits"
+    rather than to a wrong attribution.
+    """
+    path = (path or "").strip()
+    if not path or not (git_repo / ".git").is_dir():
+        return []
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(git_repo), "log", "--no-merges",
+             f"--max-count={limit}", "--pretty=format:%h\t%s",
+             f"{hash_a}..{hash_b}", "--", path],
+            capture_output=True, text=True, check=True, timeout=30,
+        ).stdout
+    except (subprocess.SubprocessError, FileNotFoundError):
+        return []
+    rows = []
+    for line in out.splitlines():
+        if "\t" not in line:
+            continue
+        short, subject = line.split("\t", 1)
+        m = _TICKET_RE.match(subject.strip())
+        rows.append((short, m.group(1) if m else "", subject.strip()))
+    return rows
 
 
 def write_tickets_in_range(run_dir: Path, tickets: list[str], *,
@@ -2272,6 +2334,10 @@ def _finalize_bundle(
     fetch_specs: list | None = None,
     project_id: int | None = None,
     testray_url: str | None = None,
+    transition_counts: dict | None = None,
+    baseline_rows: int | None = None,
+    target_rows: int | None = None,
+    status_matrix: dict | None = None,
 ) -> Path:
     print(f"→ Step 3/6 git diff …")
     diff_path = run_dir / "git_diff_full.diff"
@@ -2424,6 +2490,10 @@ def _finalize_bundle(
         mode=mode,
         project_id=project_id,
         testray_url=testray_url,
+        transition_counts=transition_counts,
+        baseline_rows=baseline_rows,
+        target_rows=target_rows,
+        status_matrix=status_matrix,
     )
 
     rel = _disp(run_dir)
@@ -2462,7 +2532,9 @@ def prepare(baseline: SideSpec, target: SideSpec, classifier: str,
                          f"(source={target.source}).")
     print(f"   baseline rows: {len(baseline_df)}  target rows: {len(target_df)}")
 
-    df, transitions = compute_test_diff(baseline_df, target_df)
+    status_matrix: dict = {}
+    df, transitions = compute_test_diff(baseline_df, target_df,
+                                        matrix_out=status_matrix)
     if df.empty:
         raise SystemExit(
             "test_diff returned 0 triage rows. Transitions seen: "
@@ -2517,6 +2589,10 @@ def prepare(baseline: SideSpec, target: SideSpec, classifier: str,
         build_a_name=meta_a["build_name"], build_b_name=meta_b["build_name"],
         project_id=project_id,
         testray_url=testray_ui_url(cfg["testray"]),
+        transition_counts=dict(transitions),
+        baseline_rows=len(baseline_df),
+        target_rows=len(target_df),
+        status_matrix=status_matrix,
         git_repo=git_repo,
         mode=mode,
         fetch_specs=fetch_specs,

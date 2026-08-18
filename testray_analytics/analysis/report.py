@@ -34,14 +34,20 @@ palette. That is a deliberate split, not drift.
 import collections
 import html
 import json
+import urllib.parse
 from pathlib import Path
 
 import pandas as pd
 
 from . import error_signature
+from .jira_settings import DEFAULT_LABEL, resolve_jira_settings
 
 # Severity order — index doubles as the sort rank and drives _rollup().
-_VERDICT_ORDER = ["BUG", "POSSIBLE_BUG", "TEST_FIX", "NEEDS_REVIEW",
+# Severity order, as specified: BUG, POSSIBLE_BUG, NEEDS_REVIEW, TEST_FIX,
+# FALSE_POSITIVE, DID_NOT_RUN. Index doubles as the sort rank and drives both
+# _rollup() and the default ordering, so this list IS the report's opinion
+# about what deserves attention first.
+_VERDICT_ORDER = ["BUG", "POSSIBLE_BUG", "NEEDS_REVIEW", "TEST_FIX",
                   "FALSE_POSITIVE", "ENV_FAILURE", "DID_NOT_RUN",
                   "AUTO_CLASSIFIED", "PENDING"]
 
@@ -62,6 +68,12 @@ _VERDICT_CLASS = {
 # Long build logs are attached in full to the run bundle; the report shows
 # enough to recognise the failure and says when it cut.
 _ERROR_MAX = 2000
+
+# Jira's CreateIssueDetails takes these as URL parameters, so an over-long
+# field does not truncate gracefully — it makes a URL the browser or the
+# gateway rejects, and the button silently does nothing. Cap here instead.
+_JIRA_SUMMARY_MAX = 240
+_JIRA_DESC_MAX = 8000
 
 _GROUP_MODES = [
     ("cluster",   "error signature (cluster)"),
@@ -97,6 +109,10 @@ _CSS = """
   h1 { margin: 0 0 4px; font-size: 26px; }
   h1 a.build-link { color: #0747a6; text-decoration: none; }
   h1 a.build-link:hover { text-decoration: underline; }
+  h1 .role {
+    font-size: 13px; font-weight: 400; color: var(--c-muted);
+    text-transform: uppercase; letter-spacing: .04em;
+  }
   .summary {
     color: var(--c-muted); font-size: 14px; margin-bottom: 20px;
     padding-bottom: 14px; border-bottom: 1px solid var(--c-border);
@@ -111,11 +127,62 @@ _CSS = """
     font-size: 0.92em;
   }
   /* ---- totals ---------------------------------------------------------- */
+  /* Headline: counts on the left, the A x B matrix on the right. */
+  /* Two columns: the controls you act with on the left, the numbers you read
+     on the right, with the totals tucked under the matrix. Grid rather than
+     flex on purpose — `minmax(0, 1fr)` guarantees the controls column can
+     shrink below its content width, which three attempts at flex-basis plus
+     min-width:0 could not do reliably (a flex item's automatic minimum size
+     kept forcing the matrix onto its own row). */
+  .headline {
+    display: grid;
+    /* The right track is capped: `auto` sized it to the totals pill row,
+       which is very wide, and starved the controls column. Capping it lets
+       the pills wrap under the matrix instead. */
+    grid-template-columns: minmax(0, 1fr) minmax(0, 480px);
+    gap: 18px; align-items: start; margin: 12px 0 14px;
+  }
+  .headline .controls {
+    display: flex; flex-direction: column; gap: 10px; min-width: 0;
+  }
+  .headline .controls .viewbar,
+  .headline .controls .filters { margin: 0; }
+  .headline .side {
+    display: flex; flex-direction: column; gap: 10px; min-width: 0;
+  }
+  @media (max-width: 1100px) {
+    .headline { grid-template-columns: minmax(0, 1fr); }
+  }
+  /* Full width, above the control band: the counts are the first thing read,
+     and they are the one element that benefits from the whole page width. */
   .totals {
-    display: flex; gap: 16px; flex-wrap: wrap; margin: 0 0 14px;
-    padding: 12px 14px; background: var(--c-row);
+    display: flex; flex-direction: row; flex-wrap: wrap;
+    gap: 8px 16px; align-items: baseline;
+    padding: 11px 14px; margin: 0; background: var(--c-row);
     border-radius: 4px; border: 1px solid var(--c-border);
   }
+  .matrix {
+    display: flex; flex-direction: column;
+    padding: 12px 18px 14px; background: var(--c-row);
+    border: 1px solid var(--c-border); border-radius: 4px;
+  }
+  .matrix table { margin: 0 auto; }
+  .matrix-title { font-weight: 700; font-size: 13px; margin-bottom: 6px; }
+  .matrix table { width: auto; border-collapse: collapse; font-size: 12px; }
+  .matrix th {
+    position: static; background: none; border: none; padding: 5px 20px;
+    color: var(--c-muted); font-weight: 600; text-align: center;
+    font-size: 11px; line-height: 1.3; white-space: nowrap;
+  }
+  .matrix th span { font-weight: 700; color: var(--c-fg); }
+  .matrix td {
+    padding: 9px 20px; text-align: center; font-weight: 700;
+    border: 1px solid #edf0f3; font-size: 13px; min-width: 74px;
+  }
+  .matrix td.same   { background: #f4f6f8; color: var(--c-fg); }
+  .matrix td.worse  { background: #fdecea; color: #a4302a; }
+  .matrix td.better { background: #e9f7ef; color: #1e6b45; }
+  .matrix td.zero   { background: #fbfcfd; }
   .totals .pill {
     display: inline-flex; align-items: baseline; gap: 6px; font-size: 13px;
   }
@@ -156,7 +223,7 @@ _CSS = """
   section.rationale li { margin-bottom: 5px; }
   /* ---- controls -------------------------------------------------------- */
   .viewbar {
-    display: flex; align-items: center; gap: 22px; flex-wrap: wrap;
+    display: flex; align-items: center; gap: 22px; flex-wrap: wrap; min-width: 0;
     margin: 18px 0 0; padding: 10px 14px;
     background: #f4f5f7; border: 1px solid var(--c-border);
     border-radius: 4px; font-size: 13px;
@@ -169,15 +236,25 @@ _CSS = """
     border-radius: 3px; background: #fff;
   }
   .filters {
-    display: flex; flex-direction: column; gap: 8px;
+    display: flex; flex-direction: column; gap: 8px; min-width: 0;
     margin: 18px 0 14px; padding: 10px 14px;
     background: var(--c-row); border: 1px solid var(--c-border);
     border-radius: 4px; font-size: 13px;
   }
-  .filters-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  /* min-width:0 has to be repeated down the nesting: a flex item's default
+     min-width is its min-content size, so without it the filter row keeps the
+     controls column ~1580px wide and the matrix wraps to its own line. */
+  .filters-row {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    min-width: 0;
+  }
   .filters label { font-weight: 600; }
-  .filters select { min-width: 200px; }
-  .filters input[type="search"] { min-width: 360px; flex: 1 1 auto; }
+  /* The selects must be able to shrink: five of them at a fixed 200px kept
+     the controls column above 1000px, which forced the matrix to wrap onto
+     its own row instead of sitting beside them. */
+  .filters select { min-width: 0; flex: 1 1 140px; max-width: 220px; }
+  .filters input[type="search"] { min-width: 0; flex: 1 1 220px; }
+  .filters-row > label { white-space: nowrap; }
   .filters .visible-count { color: var(--c-muted); margin-left: auto; }
   button.cluster-btn {
     font: inherit; font-size: 12.5px; padding: 4px 10px;
@@ -297,9 +374,16 @@ _CSS += """
   /* Member rows: indented, shared cells collapse to a pointer. */
   tr.case-row.in-cluster td.col-idx { padding-left: 18px; }
   .same-as-cluster { color: var(--c-muted); font-size: 12px; white-space: nowrap; }
+  /* The arrow is only meaningful while the visible group IS the cluster. */
+  table.per-test-table[data-mode="cluster"] .own-value { display: none; }
+  table.per-test-table:not([data-mode="cluster"]) .same-as-cluster { display: none; }
   .same-as-cluster a { color: #0747a6; text-decoration: none; }
   .same-as-cluster a:hover { text-decoration: underline; }
   .cluster-key { font-size: 11px; color: var(--c-muted); }
+  /* The ticket/commit that touched the culprit file — the actionable half. */
+  .culprit-commits {
+    font-size: 11.5px; color: #42526e; margin-top: 3px; line-height: 1.4;
+  }
 """
 
 # Client-side behaviour. Group-by only re-appends rows using the ordering
@@ -333,6 +417,10 @@ _JS = """
 
   function regroup(next) {
     mode = next;
+    // Drives the collapse CSS: members may only show "↑" when the visible
+    // group is the cluster itself.
+    var tbl = document.querySelector('table.per-test-table');
+    if (tbl) tbl.dataset.mode = mode;
     var groups = ORDER[mode] || [];
     document.querySelectorAll('tr.cluster-row').forEach(function (h) {
       h.hidden = true;
@@ -482,6 +570,11 @@ _JS = """
 
   // --- sort, within each cluster ----------------------------------------
   function cellKey(td) {
+    // An explicit data-sort wins over the cell's text: verdict and confidence
+    // are ordinal, and sorting them alphabetically puts DID_NOT_RUN above BUG.
+    if (td && td.dataset && td.dataset.sort !== undefined) {
+      return [0, Number(td.dataset.sort)];
+    }
     var t = (td.textContent || '').trim();
     var n = Number(t.replace(/,/g, ''));
     return Number.isFinite(n) && t !== '' ? [0, n] : [1, t.toLowerCase()];
@@ -505,8 +598,21 @@ _JS = """
       });
       th.classList.add('sorted', asc ? 'asc' : 'desc');
       ind.textContent = asc ? '\\u25B2' : '\\u25BC';
-      // Sort member rows inside their own cluster; headers keep their place.
-      (ORDER[mode] || []).forEach(function (g) {
+      // Sort the CLUSTERS by the same column first, then the members inside
+      // each. Sorting only within clusters left the cluster order fixed, so
+      // clicking Verdict appeared to do nothing to the headers.
+      var order = (ORDER[mode] || []).slice();
+      order.sort(function (ga, gb) {
+        var ha = document.getElementById(ga.h), hb = document.getElementById(gb.h);
+        if (!ha || !hb) return 0;
+        var ca = ha.children[idx], cb = hb.children[idx];
+        if (!ca || !cb) return 0;
+        // A cluster header's verdict/confidence cells carry the rollup, so
+        // sorting on them sorts by "worst member", which is the useful sense.
+        return asc ? cmp(cellKey(ca), cellKey(cb)) : cmp(cellKey(cb), cellKey(ca));
+      });
+      ORDER[mode] = order;
+      order.forEach(function (g) {
         var groups = g.rows.map(rowsOf).filter(function (x) { return x.length; });
         groups.sort(function (a, b) {
           var c1 = a[0].children[idx], c2 = b[0].children[idx];
@@ -527,11 +633,11 @@ _JS = """
   });
 
   // Rows are emitted headers-first, then all members, so the initial order
-  // must be built the same way a group-by switch builds it.
-  document.querySelectorAll('tr.cluster-row').forEach(function (h) {
-    h.classList.add('expanded');
-  });
+  // must be built the same way a group-by switch builds it. Start COLLAPSED:
+  // the cluster list is the overview, and expanding every member on load
+  // buries it under hundreds of rows.
   regroup('cluster');
+  setAll(false);
 })();
 """
 
@@ -575,6 +681,22 @@ def _rollup(verdicts) -> str:
 
 def _vclass(verdict) -> str:
     return _VERDICT_CLASS.get(_text(verdict), "auto")
+
+
+# Explicit sort ranks. Without these the table sorts these columns as TEXT,
+# so clicking "Verdict" orders DID_NOT_RUN before BUG — alphabetical, and the
+# exact opposite of useful. The rank rides on the cell as data-sort so the
+# generic sorter stays generic.
+_CONF_ORDER = {"high": 0, "medium": 1, "low": 2}
+
+
+def _verdict_rank_attr(verdict) -> str:
+    return f' data-sort="{_rank(verdict):02d}"'
+
+
+def _conf_rank_attr(confidence) -> str:
+    c = _text(confidence).lower()
+    return f' data-sort="{_CONF_ORDER.get(c, 9)}"'
 
 
 def _verdict_span(verdict) -> str:
@@ -700,7 +822,7 @@ def _groups(df: pd.DataFrame, ckeys: list[str]) -> dict:
 
 
 def _header_row(mode: str, idx: int, label: str, members: pd.DataFrame,
-                cluster_no: int | None) -> str:
+                cluster_no: int | None, meta: dict) -> str:
     """A cluster header, on the same column grid as its members."""
     verdict = _rollup(members.get("classification", []))
     css = _vclass(verdict)
@@ -712,7 +834,12 @@ def _header_row(mode: str, idx: int, label: str, members: pd.DataFrame,
 
     culprits = {c for c in (_text(x) for x in members.get("culprit_file", [])) if c}
     if len(culprits) == 1:
-        culprit_cell = f"<code>{_esc(next(iter(culprits)))}</code>"
+        only = next(iter(culprits))
+        culprit_cell = f"<code>{_esc(only)}</code>"
+        commits = {c for c in (_text(x) for x in members.get("culprit_commits", [])) if c}
+        if len(commits) == 1:
+            culprit_cell += (f'<div class="culprit-commits">'
+                             f'{_esc(next(iter(commits)))}</div>')
     elif culprits:
         culprit_cell = (f'<span class="cluster-culprit-none" title="{_esc(" · ".join(sorted(culprits)))}">'
                         f"{len(culprits)} files</span>")
@@ -742,16 +869,21 @@ def _header_row(mode: str, idx: int, label: str, members: pd.DataFrame,
         f'<td class="col-idx col-cluster-caret">{cluster_no if cluster_no else idx + 1}</td>'
         f'<td class="col-test cluster-cell"><span class="cluster-n">{n} test'
         f'{"" if n == 1 else "s"}</span><br>{title}</td>'
-        + _rollup_cell(members.get("component_name", []), "col-comp")
         + _rollup_cell(members.get("team_name", []), "col-team")
+        + _rollup_cell(members.get("component_name", []), "col-comp")
         + '<td class="col-status cluster-cell"></td>'
-        f'<td class="col-verdict cluster-cell">{_verdict_span(verdict)}</td>'
-        f'<td class="col-confidence cluster-cell"'
+        f'<td class="col-verdict cluster-cell"{_verdict_rank_attr(verdict)}>{_verdict_span(verdict)}</td>'
+        f'<td class="col-confidence cluster-cell"{_conf_rank_attr(top)}'
         + (f' title="Highest confidence in this group. Breakdown: {_esc(breakdown)}"' if breakdown else "")
         + f">{_conf_span(top)}</td>"
         f'<td class="col-culprit cluster-cell cluster-culprit">{culprit_cell}</td>'
         f'<td class="col-reasoning cluster-cell cluster-reason">{reason_cell}</td>'
-        '<td class="col-jira cluster-cell"></td>'
+        + f'<td class="col-jira cluster-cell">'
+        + _jira_link(meta, verdict=verdict,
+                     summary_text=(next(iter(reasons)) if len(reasons) == 1 else ''),
+                     rows=[members.iloc[0]] if len(members) else [],
+                     n=n)
+        + '</td>'
         "</tr>"
     )
 
@@ -784,18 +916,47 @@ def _member_rows(df: pd.DataFrame, meta: dict, cluster_no: dict[str, int],
         # them. Repeating an identical paragraph on thirty rows is what made
         # the flat table unreadable; the full text is still one click away in
         # the detail panel, and on hover.
-        pointer = f'<span class="same-as-cluster" title="{{}}"><a href="#grp-cluster-{cno}">&uarr; cluster {cno}</a></span>'
+        # Render the pointer AND the full value. Which one shows depends on the
+        # ACTIVE group-by, which changes at runtime — so it cannot be decided
+        # here. Collapsing to "↑" is only honest while the visible group IS the
+        # cluster; under group-by team/component/verdict the header says
+        # "N distinct reasons" and the arrow would point at a cluster that is
+        # not on screen.
+        def _collapsible(full_html: str, raw: str) -> str:
+            return (f'<span class="same-as-cluster" title="{_esc(raw)}">'
+                    f'<a href="#grp-cluster-{cno}">&uarr;</a></span>'
+                    f'<span class="own-value">{full_html}</span>')
         if cno is not None and _shared_in_cluster(shared, ckey, "reason", reason):
-            reason_cell = pointer.format(_esc(reason))
+            reason_cell = _collapsible(_esc(reason) or "—", reason)
         else:
             reason_cell = _esc(reason) or "—"
         if cno is not None and culprit and _shared_in_cluster(shared, ckey, "culprit_file", culprit):
-            culprit_cell = pointer.format(_esc(culprit))
+            culprit_cell = _collapsible(f"<code>{_esc(culprit)}</code>", culprit)
         else:
             culprit_cell = f"<code>{_esc(culprit)}</code>" if culprit else "—"
+            commits = _text(r.get("culprit_commits"))
+            if culprit and commits:
+                culprit_cell += f'<div class="culprit-commits">{_esc(commits)}</div>'
+
+        # A cluster with one verdict says it once, on its header. Repeating it
+        # on every member is the noise that made the flat table unreadable.
+        # When a cluster IS mixed, the per-row value is the whole point, so it
+        # stays.
+        if cno is not None and _shared_in_cluster(shared, ckey, "classification", verdict):
+            verdict_cell = _collapsible(_verdict_span(verdict), verdict)
+        else:
+            verdict_cell = _verdict_span(verdict)
+        conf = _text(r.get("confidence"))
+        if cno is not None and _shared_in_cluster(shared, ckey, "confidence", conf):
+            conf_cell = _collapsible(_conf_span(conf), conf)
+        else:
+            conf_cell = _conf_span(r.get("confidence"))
 
         issues = _text(r.get("linked_issues"))
-        jira_cell = _esc(issues) if issues else '<span class="conf">—</span>'
+        # An already-linked issue wins: the button exists to avoid filing
+        # a duplicate, so where Testray already has one we show that.
+        jira_cell = _esc(issues) if issues else _jira_link(
+            meta, verdict=verdict, summary_text=reason, rows=[r], n=1)
 
         parts.append(
             f'<tr class="case-row in-cluster" id="{rid}" data-cluster="{_esc(ckey)}" '
@@ -806,11 +967,11 @@ def _member_rows(df: pd.DataFrame, meta: dict, cluster_no: dict[str, int],
             f'data-confidence="{_esc(_text(r.get("confidence")).lower())}">'
             f'<td class="col-idx col-num">{i + 1}</td>'
             f'<td class="col-test">{test_cell}</td>'
-            f'<td class="col-comp">{_esc(_text(r.get("component_name"))) or "—"}</td>'
             f'<td class="col-team">{_esc(_text(r.get("team_name"))) or "—"}</td>'
+            f'<td class="col-comp">{_esc(_text(r.get("component_name"))) or "—"}</td>'
             f'<td class="col-status">{_status_span(r.get("status_a"), r.get("status_b"))}</td>'
-            f'<td class="col-verdict">{_verdict_span(verdict)}</td>'
-            f'<td class="col-confidence">{_conf_span(r.get("confidence"))}</td>'
+            f'<td class="col-verdict"{_verdict_rank_attr(verdict)}>{verdict_cell}</td>'
+            f'<td class="col-confidence"{_conf_rank_attr(conf)}>{conf_cell}</td>'
             f'<td class="col-culprit">{culprit_cell}</td>'
             f'<td class="col-reasoning">{reason_cell}</td>'
             f'<td class="col-jira">{jira_cell}</td>'
@@ -818,6 +979,87 @@ def _member_rows(df: pd.DataFrame, meta: dict, cluster_no: dict[str, int],
         )
         parts.append(_detail_row(r, rid, css, ckey, meta))
     return "\n".join(parts)
+
+
+
+def _jira_link(meta: dict, *, verdict: str, summary_text: str, rows: list,
+               n: int = 1) -> str:
+    """A prefilled Jira draft link. Opens a draft — nothing is filed.
+
+    Blank `parent` / `reporter` are omitted rather than sent empty: Jira reads
+    an empty value as a deliberate clear, which is worse than staying silent.
+    """
+    jira = meta.get("jira")
+    if not isinstance(jira, dict):
+        jira = resolve_jira_settings({})
+    base = str(jira.get("base_url") or "https://liferay.atlassian.net").rstrip("/")
+
+    first = rows[0] if rows else {}
+    def _g(key):
+        try:
+            return _text(first.get(key))
+        except AttributeError:
+            return ""
+
+    build_b = _text(meta.get("build_b_name")) or _text(meta.get("build_id_b"))
+    summary = f"Investigate {n} test failure{'' if n == 1 else 's'}"
+    if build_b:
+        summary += f" in {build_b}"
+    if summary_text:
+        summary += f" — {summary_text}"
+
+    parts = [f"h3. Root cause ({verdict or 'UNCLASSIFIED'}, {n} test"
+             f"{'' if n == 1 else 's'})", "", summary_text or "(no reasoning recorded)", ""]
+
+    culprit = _g("culprit_file")
+    if culprit:
+        parts += ["h3. Culprit file", "", f"{{{{{culprit}}}}}", ""]
+        commits = _g("culprit_commits")
+        if commits:
+            parts += [f"Changed by: {commits}", ""]
+
+    err = _g("error_message")
+    if err:
+        parts += ["h3. Error", "", "{code}", _truncate(err, 1200), "{code}", ""]
+
+    # Link back to Testray so the draft is traceable to the run.
+    testflow_id = _text(meta.get("testflow_id"))
+    subtask_id = _g("subtask_id")
+    base_ui = _text(meta.get("testray_url"))
+    if testflow_id and subtask_id:
+        link = f"testflow/{testflow_id}/subtasks/{subtask_id}"
+        parts += ["h3. Testray", "",
+                  (f"{base_ui}#/{link}" if base_ui else link), ""]
+    else:
+        url = _case_url(meta, first.get("caseresult_id") if hasattr(first, "get") else None)
+        if url:
+            parts += ["h3. Testray", "", url, ""]
+
+    parts += ["h3. Claude reasoning", "",
+              f"Classifier: {_text(meta.get('classifier'))}",
+              f"Run: {_text(meta.get('run_id'))}"]
+
+    description = "\n".join(parts)[:_JIRA_DESC_MAX]
+
+    params = {
+        "pid":         str(jira.get("project_id") or "11106"),
+        "issuetype":   str(jira.get("issue_type") or "10002"),
+        "summary":     summary[:_JIRA_SUMMARY_MAX],
+        "description": description,
+    }
+    if str(jira.get("label") or "").strip():
+        params["labels"] = str(jira["label"]).strip()
+    # Omit rather than send blank — see the module docstring.
+    if str(jira.get("parent") or "").strip():
+        params["parent"] = str(jira["parent"]).strip()
+    if str(jira.get("reporter_account_id") or "").strip():
+        params["reporter"] = str(jira["reporter_account_id"]).strip()
+
+    href = (f"{base}/secure/CreateIssueDetails!init.jspa?"
+            + urllib.parse.urlencode(params))
+    return (f'<a class="jira-create" href="{_esc(href)}" target="_blank" '
+            f'rel="noopener" title="Opens a prefilled Jira draft — nothing is '
+            f'filed automatically">Create ticket</a>')
 
 
 def _cluster_index(df: pd.DataFrame) -> tuple[list[str], dict]:
@@ -834,7 +1076,7 @@ def _cluster_index(df: pd.DataFrame) -> tuple[list[str], dict]:
     for _, r in df.iterrows():
         ck = _cluster_of(r)
         keys.append(ck)
-        for col in ("reason", "culprit_file"):
+        for col in ("reason", "culprit_file", "classification", "confidence"):
             shared.setdefault((ck, col), set()).add(_text(r.get(col)))
     return keys, shared
 
@@ -874,6 +1116,10 @@ def _detail_row(r, rid: str, css: str, ckey: str, meta: dict) -> str:
     culprit = _text(r.get("culprit_file"))
     add("Culprit file", f"<code>{_esc(culprit)}</code>" if culprit else "—")
 
+    commits = _text(r.get("culprit_commits"))
+    if commits:
+        add("Changed by", _esc(commits))
+
     change = _text(r.get("specific_change"))
     if change:
         add("Specific change", _esc(change))
@@ -912,7 +1158,58 @@ _HINT = """Cluster headers sit on the same columns as their member rows: the tes
   Press <kbd>Esc</kbd> in the search box to clear."""
 
 
-def _totals(df: pd.DataFrame, n_clusters: int) -> str:
+
+# Testray's own comparison order, so the matrix reads the same way it does in
+# the product.
+_STATUS_ORDER = ["PASSED", "FAILED", "BLOCKED", "TESTFIX", "UNTESTED", "DIDNOTRUN"]
+_STATUS_LABEL = {"TESTFIX": "Test Fix", "UNTESTED": "DNR", "DIDNOTRUN": "DNR"}
+
+
+def _status_label(code: str) -> str:
+    return _STATUS_LABEL.get(code, code.title())
+
+
+def _status_matrix(meta: dict) -> str:
+    """A x B status cross-tab for the whole comparison.
+
+    Deliberately covers every joined case, not just the triaged ones: the
+    headline counts describe the slice we acted on, and this describes the
+    build. Reading "1038 now passing" next to "793 failed in both" is what
+    makes a triage set of 557 legible.
+    """
+    raw = meta.get("status_matrix") or {}
+    if not raw:
+        return ""
+    rows = [r for r in _STATUS_ORDER if r in raw]
+    rows += sorted(k for k in raw if k not in _STATUS_ORDER)
+    cols_seen = {c for v in raw.values() for c in v}
+    cols = [c for c in _STATUS_ORDER if c in cols_seen]
+    cols += sorted(c for c in cols_seen if c not in _STATUS_ORDER)
+    if not rows or not cols:
+        return ""
+
+    head = "".join(f'<th>B<br><span>{_esc(_status_label(c))}</span></th>' for c in cols)
+    body = []
+    for r in rows:
+        cells = []
+        for c in cols:
+            n = raw.get(r, {}).get(c, 0)
+            # An unchanged diagonal is context, not news; a transition is news.
+            cls = "same" if r == c else ("worse" if _worse(r, c) else "better")
+            cells.append(f'<td class="{cls}">{n:,}</td>' if n else '<td class="zero"></td>')
+        body.append(f'<tr><th>A<br><span>{_esc(_status_label(r))}</span></th>'
+                    + "".join(cells) + "</tr>")
+    return ('<div class="matrix"><div class="matrix-title">Runs</div>'
+            f'<table><thead><tr><th></th>{head}</tr></thead>'
+            f'<tbody>{"".join(body)}</tbody></table></div>')
+
+
+def _worse(a: str, b: str) -> bool:
+    """Did the status get worse from A to B? PASSED is the only good state."""
+    return a == "PASSED" and b != "PASSED"
+
+
+def _totals(df: pd.DataFrame, n_clusters: int, meta: dict) -> str:
     counts = (df["classification"].value_counts().to_dict()
               if len(df) and "classification" in df else {})
     pills = []
@@ -924,8 +1221,17 @@ def _totals(df: pd.DataFrame, n_clusters: int) -> str:
             f'title="Filter to {_esc(verdict)}">{_verdict_span(verdict)}'
             f'<span class="n" data-pill-verdict="{_esc(verdict)}">{counts[verdict]}</span></a>'
         )
-    pills.append(f'<span class="pill"><strong>Total tests:</strong> '
+    # "Total tests: 557" invited the reading that the build ran 557 tests. It
+    # ran ~17.5k; 557 is the TRIAGE set. Say which, and show the denominator.
+    pills.append(f'<span class="pill" title="New, changed and blocked failures '
+                 f'— the rows this run triaged. Not the number of tests run.">'
+                 f'<strong>Failures triaged:</strong> '
                  f'<span class="n" data-pill-total="1">{len(df)}</span></span>')
+    target_rows = meta.get("target_rows")
+    if target_rows:
+        pills.append(f'<span class="pill" title="Case results in the target '
+                     f'build."><strong>Tests in build:</strong> '
+                     f'<span class="n">{int(target_rows):,}</span></span>')
     pills.append('<span class="pill" title="Distinct clusterKey values — one cluster '
                  'per normalized error signature (ARCHITECTURE §7)."><strong>'
                  f'Root-cause clusters:</strong> <span class="n" '
@@ -954,20 +1260,13 @@ def _banners(df: pd.DataFrame, meta: dict) -> str:
             "classifier never ran, not that no bugs exist.</p></section>"
         )
 
-    tc = meta.get("transition_counts") or {}
-    if tc:
-        # A run must say what it chose not to triage, or the table reads as
-        # "these were the only differences between the two builds".
-        bits = []
-        for key, phrase in (("SAME_FAILURE", "already failing, same error"),
-                            ("CHANGED_FAILURE", "already failing, different error"),
-                            ("FIXED", "now passing"),
-                            ("NO_BASELINE", "absent from the baseline")):
-            if tc.get(key):
-                bits.append(f"<li><strong>{tc[key]} {phrase}</strong></li>")
-        if bits:
-            out.append('<section class="rationale"><h2>Excluded from triage</h2><ul>'
-                       + "".join(bits) + "</ul></section>")
+    # prepare emits lowercase transition keys ("same_failure"), the §12
+    # constants are uppercase. Normalise, or this banner silently never fires
+    # on real data — which is exactly what it did until 2026-08-18.
+    # The "Excluded from triage" banner used to list same_failure / fixed /
+    # no_baseline here. The A x B status matrix in the header now carries the
+    # same facts in a denser and more complete form (1,038 fixed IS
+    # FAILED->PASSED), so the banner was pure duplication and has been dropped.
 
     notes = _text(meta.get("notes"))
     if notes:
@@ -996,7 +1295,7 @@ def render_run(run_dir, df: pd.DataFrame, meta: dict) -> Path:
             members = df.iloc[positions]
             headers.append(_header_row(
                 mode, idx, label, members,
-                cluster_no.get(label) if mode == "cluster" else None))
+                cluster_no.get(label) if mode == "cluster" else None, meta))
             entries.append({"h": f"grp-{mode}-{idx}",
                             "rows": [f"row-{p}" for p in positions]})
         order[mode] = entries
@@ -1028,16 +1327,18 @@ def render_run(run_dir, df: pd.DataFrame, meta: dict) -> Path:
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>Triage report — {_esc(a_name)} &rarr; {_esc(b_name)}</title>
+<title>Triage report — {_esc(a_name)} → {_esc(b_name)}</title>
 <style>{_CSS}</style>
 </head>
 <body>
 <main>
-  <h1>Triage report &mdash; {a_html} &rarr; {b_html}</h1>
+  <h1>Triage report &mdash; {a_html} <span class="role">baseline</span> &rarr; {b_html} <span class="role">target</span></h1>
   <p class="summary">{" &middot; ".join(summary_bits)}</p>
-  {_totals(df, len(cluster_groups))}
   {_banners(df, meta)}
 
+  <div class="headline">
+   <div class="controls">
+    {_totals(df, len(cluster_groups), meta)}
   <div class="viewbar">
     <span class="viewbar-group">
       <label class="viewbar-label" for="group-by">Group by:</label>
@@ -1066,6 +1367,11 @@ def render_run(run_dir, df: pd.DataFrame, meta: dict) -> Path:
       <span class="visible-count" id="filter-count"></span>
     </div>
   </div>
+   </div>
+   <div class="side">
+    {_status_matrix(meta)}
+   </div>
+  </div>
 
   <h2>Failures by root cause</h2>
   <p class="hint">{_HINT}</p>
@@ -1073,8 +1379,8 @@ def render_run(run_dir, df: pd.DataFrame, meta: dict) -> Path:
 <thead><tr>
 <th class="col-idx">#</th>
 <th class="col-test" title="Click a test name to open its Testray case result.">Test</th>
-<th class="col-comp">Component</th>
 <th class="col-team">Team</th>
+<th class="col-comp">Component</th>
 <th class="col-status">Status</th>
 <th class="col-verdict">Verdict</th>
 <th class="col-confidence" title="Classifier confidence: high / medium / low / auto.">Confidence</th>
