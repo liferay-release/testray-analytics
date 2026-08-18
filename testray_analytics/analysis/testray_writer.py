@@ -38,6 +38,7 @@ either by ERC prefix (`startswith(externalReferenceCode,'<buildB>_')`) or
 through the CaseResult side of the relationship.
 """
 
+import collections
 import json
 import time
 import urllib.error
@@ -363,6 +364,38 @@ def count_excluded(df: pd.DataFrame, items: list[dict]) -> int:
     eligible = (int(df["testray_case_id"].notna().sum())
                 if "testray_case_id" in df.columns else len(df))
     return max(0, eligible - len(items))
+
+
+def excluded_breakdown(df: pd.DataFrame) -> "collections.Counter":
+    """Why each excluded row was excluded, so the count is self-explanatory.
+
+    "374 excluded by write policy" invites the reading that 374 verdicts were
+    lost. They were not: each was excluded for a stated, re-derivable reason.
+    Naming the reasons inline is the difference between a number a reader has
+    to trust and one they can check.
+    """
+    reasons: collections.Counter = collections.Counter()
+    if df is None or df.empty:
+        return reasons
+    for _, row in df.iterrows():
+        if "testray_case_id" in df.columns and pd.isna(row.get("testray_case_id")):
+            continue                       # not FK-eligible; counted elsewhere
+        cls  = str(row.get("classification") or "").strip()
+        conf = str(row.get("confidence") or "").strip().lower()
+        if _include(cls, conf):
+            continue
+        if cls == "FALSE_POSITIVE" and conf == "high":
+            reasons["high-confidence FALSE_POSITIVE"] += 1
+        elif cls in _AUTO_LABELS:
+            reasons[cls] += 1
+        else:
+            reasons["other"] += 1
+    return reasons
+
+
+def format_exclusions(reasons: "collections.Counter") -> str:
+    """`289 high-confidence FALSE_POSITIVE, 85 DID_NOT_RUN` — largest first."""
+    return ", ".join(f"{n} {label}" for label, n in reasons.most_common())
 
 
 def write_triage_batch(df: pd.DataFrame, meta: dict, classifier: str,

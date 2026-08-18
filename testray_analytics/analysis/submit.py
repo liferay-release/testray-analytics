@@ -40,7 +40,8 @@ from .prepare import load_config, testray_target
 from .report import render_run
 from .testray_writer import (
     ENDPOINT, FK_FIELD, build_batch, build_triage_run, count_excluded,
-    post_batch, write_batch_file, write_triage_run,
+    excluded_breakdown, format_exclusions, post_batch, write_batch_file,
+    write_triage_run,
 )
 
 
@@ -563,7 +564,10 @@ def main() -> None:
     out_path = write_batch_file(items, run_dir)
     n_excluded = count_excluded(df, items)
     n_linked = sum(1 for it in items if FK_FIELD in it)
-    excl = f" ({n_excluded} excluded by write policy)" if n_excluded else ""
+    reasons = excluded_breakdown(df)
+    why = format_exclusions(reasons)
+    excl = (f" ({n_excluded} excluded by write policy"
+            + (f": {why}" if why else "") + ")") if n_excluded else ""
     print(f"\nTriageResult batch ({len(items)} rows{excl}) → {out_path}")
     print(f"  CaseResult FK resolved on {n_linked}/{len(items)} rows"
           f"{' — rest write unlinked' if n_linked < len(items) else ''}")
