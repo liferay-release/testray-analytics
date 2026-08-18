@@ -650,7 +650,9 @@ def _case_url(meta: dict, caseresult_id) -> str:
     cr = _text(caseresult_id)
     if not (base and project and routine and build and cr):
         return ""
-    return (f"{base.rstrip('/')}/#/project/{project}/routines/{routine}"
+    # `<base>#/…`, not `<base>/#/…` — the UI base already carries the site
+    # path (/web/liferay-testray), and that is the form Testray's own links use.
+    return (f"{base.rstrip('/')}#/project/{project}/routines/{routine}"
             f"/build/{build}/case-result/{cr}")
 
 
@@ -660,7 +662,7 @@ def _build_url(meta: dict, build_id) -> str:
     routine = _text(meta.get("routine_id"))
     if not (base and project and routine and _text(build_id)):
         return ""
-    return (f"{base.rstrip('/')}/#/project/{project}/routines/{routine}"
+    return (f"{base.rstrip('/')}#/project/{project}/routines/{routine}"
             f"/build/{_text(build_id)}")
 
 

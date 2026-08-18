@@ -70,14 +70,34 @@ DEFAULT_CLASSIFIER = "agent:claude-opus-4-8"
 SOURCE_API = "api"
 SOURCES    = (SOURCE_API,)
 
-# Triage mode — per-test (default) or by-subtask (testflow-aware grouping).
-# Subtask mode classifies once per Testray Subtask and fans the verdict out
-# to the member case-rows in fact_triage_results. Target source must be `api`
-# for subtask mode (the subtask link lives on the caseresult object — see
-# r_subtaskToCaseResults_c_subtaskId — which only the api fetch reads).
-MODE_PER_TEST   = "per-test"
-MODE_BY_SUBTASK = "by-subtask"
-MODES           = (MODE_PER_TEST, MODE_BY_SUBTASK)
+# Classification granularity (ARCHITECTURE.md §7). Orthogonal to the §8
+# *selection* mode (build-vs-build / routine-history / suite-vs-pr).
+#
+#   by-cluster  DEFAULT. Group failures by error signature (§5) BEFORE the
+#               classifier runs, classify once per signature, and fan the
+#               verdict out to every member CaseResult — the per-CaseResult
+#               grain (decision #6) is preserved. One consistent verdict per
+#               root cause, and far fewer units: measured 449 -> 169 on the
+#               2026.q1.11 -> q1.12-lts pair.
+#   per-test    One prompt section per failure. Highest fidelity and the
+#               richest training labels, but it re-answers the same question
+#               once per member of a cluster — a 102-member signature group
+#               costs 102 classifications to reach one answer. Never selected
+#               automatically; kept for the §7 A/B and as a fallback when a
+#               signature is suspected of over-grouping.
+#   by-subtask  Group by Testray Subtask instead of our signature. Requires
+#               an `api` target source (the link lives on the caseresult
+#               object, r_subtaskToCaseResults_c_subtaskId).
+#
+# Only the error signature can group pre-send: the full `clusterKey` includes
+# `culprit_file`, which is an LLM *output*, so it does not exist yet.
+MODE_PER_TEST    = "per-test"
+MODE_BY_SUBTASK  = "by-subtask"
+MODE_BY_CLUSTER  = "by-cluster"
+MODES            = (MODE_BY_CLUSTER, MODE_PER_TEST, MODE_BY_SUBTASK)
+DEFAULT_MODE     = MODE_BY_CLUSTER
+# Modes that classify a group once and fan the verdict out to its members.
+GROUPED_MODES    = (MODE_BY_CLUSTER, MODE_BY_SUBTASK)
 
 GIT_DIFF_EXCLUDES = [
     ":!**/artifact.properties",
@@ -557,7 +577,58 @@ def fetch_build_metadata(build_id: int, cfg: dict) -> dict:
     return {
         "git_hash":   str(h).strip() if h and str(h).strip() else None,
         "routine_id": int(rid) if rid else None,
+        "project_id": fetch_routine_project(int(rid), cfg) if rid else None,
     }
+
+
+def fetch_routine_project(routine_id: int, cfg: dict) -> int | None:
+    """Project id for a routine, or None.
+
+    Needed only so the report can build Testray deep-links: a case-result URL
+    is /project/{p}/routines/{r}/build/{b}/case-result/{cr}, and the project is
+    the one segment no other response carries. The relationship is named
+    `routineToProjects` (routine -> project), so the FK lives on Routine and
+    reads `r_routineToProjects_c_projectId` — not the reverse spelling.
+
+    Failure is non-fatal: without it the report renders test names as plain
+    text, which is strictly better than emitting a half-built link.
+    """
+    base = cfg["base_url"].rstrip("/")
+    url = f"{base}/o/c/routines/{routine_id}"
+
+    def _do_request(tok):
+        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {tok}"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read())
+
+    try:
+        body = _do_request(_testray_oauth_token(cfg))
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            try:
+                body = _do_request(_testray_oauth_token(cfg))
+            except urllib.error.HTTPError:
+                return None
+        else:
+            return None
+    except OSError:
+        return None
+    pid = body.get("r_routineToProjects_c_projectId")
+    return int(pid) if pid else None
+
+
+def testray_ui_url(cfg: dict) -> str | None:
+    """Base URL of the Testray *UI*, used only for report deep-links.
+
+    Kept separate from `base_url` (the REST root) and deliberately NOT derived
+    from it: the UI sits under a site friendly URL that differs per instance
+    — `/web/testray` on prod, `/web/liferay-testray` on a locally initialized
+    one — so deriving it would emit links that 404, which reads as a Testray
+    bug rather than as missing configuration. Unset means the report renders
+    test names as plain text.
+    """
+    ui = str(cfg.get("ui_url") or "").strip()
+    return ui.rstrip("/") or None
 
 
 def fetch_caseresults(spec: SideSpec, cfg: dict) -> pd.DataFrame:
@@ -792,6 +863,7 @@ def resolve_side_metadata(spec: SideSpec, cfg: dict) -> dict:
         "build_name": spec.name or f"api:{spec.build_id}",
         "git_hash":   git_hash,
         "routine_id": build["routine_id"],
+        "project_id": build.get("project_id"),
     }
 
 
@@ -971,10 +1043,17 @@ RESULTS_SCHEMA_SUBTASK = {
             "type": "array",
             "items": {
                 "type": "object",
-                "required": ["subtask_id", "case_ids", "classification",
+                "required": ["case_ids", "classification",
                              "confidence", "reason"],
+                # A result must identify its group. by-cluster emits group_id;
+                # by-subtask bundles written before group_id existed emit
+                # subtask_id, so either satisfies the schema and old bundles
+                # keep validating.
+                "anyOf": [{"required": ["group_id"]},
+                          {"required": ["subtask_id"]}],
                 "additionalProperties": False,
                 "properties": {
+                    "group_id":        {"type": ["integer", "null"]},
                     "subtask_id":      {"type": ["integer", "null"]},
                     "case_ids":        {"type": "array",
                                           "items": {"type": "integer"},
@@ -1006,7 +1085,9 @@ def write_run_yml(run_dir: Path, *, run_id: str,
                   build_a: int, build_b: int, hash_a: str, hash_b: str,
                   routine_id: int | None, build_a_name: str, build_b_name: str,
                   classifier: str, total_failures: int, auto_classified: int,
-                  flaky_excluded: int, mode: str = MODE_PER_TEST) -> None:
+                  flaky_excluded: int, mode: str = DEFAULT_MODE,
+                  project_id: int | None = None,
+                  testray_url: str | None = None) -> None:
     metadata = {
         "run_id":              run_id,
         "mode":                mode,
@@ -1018,6 +1099,10 @@ def write_run_yml(run_dir: Path, *, run_id: str,
         "git_hash_a":          hash_a,
         "git_hash_b":          hash_b,
         "routine_id":          routine_id,
+        # Recorded for the report's Testray deep-links only; nothing in the
+        # pipeline branches on either value.
+        "project_id":          project_id,
+        "testray_url":         testray_url,
         "build_a_name":        build_a_name,
         "build_b_name":        build_b_name,
         "total_failures":      total_failures,
@@ -1204,7 +1289,7 @@ Subtasks where every member already has `pre_classification` set are auto-classi
 
 ## Output
 
-Write `results.json` in this directory, validating against `results.schema.json`. **One entry per subtask** (not per case):
+Write `results.json` in this directory, validating against `results.schema.json`. **One entry per group** (not per case):
 
 ```json
 {{
@@ -1212,14 +1297,14 @@ Write `results.json` in this directory, validating against `results.schema.json`
   "classifier": "{classifier}",
   "results": [
     {{
-      "subtask_id": 469572218,
+      "group_id": 12,
       "case_ids": [65638, 65644, 65650],
       "classification": "FALSE_POSITIVE",
       "confidence": "high",
       "reason": "Classic Poshi ElementNotFoundPoshiRunnerException — selector/timing flake. No hunks touch the cookies-banner selectors involved."
     }},
     {{
-      "subtask_id": null,
+      "group_id": 47,
       "case_ids": [12345],
       "classification": "BUG",
       "confidence": "high",
@@ -1231,7 +1316,7 @@ Write `results.json` in this directory, validating against `results.schema.json`
 }}
 ```
 
-`subtask_id` may be `null` for cases the testflow didn't group (one-off failures); `case_ids` always lists every member that should inherit this verdict.
+**`group_id` is required and must match the group's heading exactly** — it is how the verdict is fanned out to every member case result. The member list shown under each heading is truncated for readability, so `case_ids` is a convenience only: the canonical membership is resolved from `group_id`. Never invent or renumber a `group_id`.
 
 Then submit:
 
@@ -1409,6 +1494,7 @@ def render_commits_section(commits: list[tuple[str, str]]) -> list[str]:
 def write_prompt(run_dir: Path, *, run_id: str, classifier: str,
                  build_a: int, build_b: int, hash_a: str, hash_b: str,
                  routine_id: int | None, build_a_name: str, build_b_name: str,
+                 project_id: int | None = None, testray_url: str | None = None,
                  df_to_classify: pd.DataFrame, df_auto: pd.DataFrame,
                  df_flaky: pd.DataFrame, hunks_path: Path,
                  full_diff_path: Path, git_repo: Path) -> None:
@@ -1545,13 +1631,20 @@ def write_prompt(run_dir: Path, *, run_id: str, classifier: str,
 # bundle artifacts (diff_list_subtasks.csv + per-subtask prompt blocks).
 # ---------------------------------------------------------------------------
 
-def compute_subtask_groups(df: pd.DataFrame) -> list[dict]:
-    """Group regression cases by `subtask_id`. Cases without a subtask link
-    (subtask_id 0 / NaN — common when the testflow didn't cluster them or
-    the build pre-dates testflow) become singleton groups so nothing is
-    silently dropped.
+def compute_subtask_groups(df: pd.DataFrame,
+                           mode: str = MODE_BY_SUBTASK) -> list[dict]:
+    """Group regression cases for a grouped mode.
+
+    `by-subtask` groups on Testray's `subtask_id`; `by-cluster` groups on our
+    own error signature (§5). Both produce the same group shape, so the prompt
+    writer, the group CSV and submit's fan-out are shared — the only thing that
+    changes is the key. Cases with no key (subtask_id 0/NaN, or a blank error
+    in cluster mode) become singleton groups so nothing is silently dropped.
 
     Returns a list of dicts, one per group:
+        group_id        — 1-based int, stable within this run; what results.json
+                          references and what submit fans out on
+        signature       — normalized error signature (cluster mode) or ""
         subtask_id      — int Testray subtask id, or None if unmapped
         case_ids        — [int, ...]
         test_cases      — [str, ...]
@@ -1568,18 +1661,40 @@ def compute_subtask_groups(df: pd.DataFrame) -> list[dict]:
         all_known_flaky — bool: every member is known_flaky
         status_b_breakdown — Counter of status_b across members
     """
-    if df.empty or "subtask_id" not in df.columns:
+    if df.empty:
+        return []
+    if mode == MODE_BY_SUBTASK and "subtask_id" not in df.columns:
         return []
 
     work = df.copy()
-    # Treat 0/NaN as "no subtask link" → assign each such case its own
-    # synthetic group key so they don't collide.
-    work["_grp_key"] = work["subtask_id"].fillna(0).astype("int64")
-    next_synth = -1
-    for idx in work.index:
-        if int(work.at[idx, "_grp_key"]) == 0:
-            work.at[idx, "_grp_key"] = next_synth
-            next_synth -= 1
+    if mode == MODE_BY_CLUSTER:
+        # Key on the normalized error signature. A blank signature means we
+        # have no error text to group on, so those stay singletons rather than
+        # collapsing into one giant "no error" cluster — that would fan a
+        # single verdict across unrelated failures, which is the exact risk §7
+        # names for this mode.
+        work["_sig"] = [error_signature.normalize(e) or ""
+                        for e in work["error_message"]]
+        sig_key: dict[str, int] = {}
+        keys, next_synth = [], -1
+        for sig in work["_sig"]:
+            if not sig:
+                keys.append(next_synth)
+                next_synth -= 1
+                continue
+            if sig not in sig_key:
+                sig_key[sig] = len(sig_key) + 1
+            keys.append(sig_key[sig])
+        work["_grp_key"] = keys
+    else:
+        # Treat 0/NaN as "no subtask link" → assign each such case its own
+        # synthetic group key so they don't collide.
+        work["_grp_key"] = work["subtask_id"].fillna(0).astype("int64")
+        next_synth = -1
+        for idx in work.index:
+            if int(work.at[idx, "_grp_key"]) == 0:
+                work.at[idx, "_grp_key"] = next_synth
+                next_synth -= 1
 
     groups: list[dict] = []
     for grp_key, sub in work.groupby("_grp_key", sort=False):
@@ -1599,6 +1714,13 @@ def compute_subtask_groups(df: pd.DataFrame) -> list[dict]:
         flaky_col = sub["known_flaky"].fillna(False).astype(bool)
 
         groups.append({
+            # Stable within the run and always positive: this is what
+            # results.json references and what submit fans out on. In subtask
+            # mode it IS the Testray subtask id (so existing bundles keep
+            # working); in cluster mode it is a 1-based index, and unkeyed
+            # singletons get their own id rather than sharing one.
+            "group_id":            int(grp_key) if grp_key > 0 else abs(int(grp_key)) + 1_000_000,
+            "signature":           (sub["_sig"].iloc[0] if "_sig" in sub.columns else ""),
             "subtask_id":          real_sid,
             "case_ids":            [int(x) for x in sub["testray_case_id"].tolist()],
             "test_cases":          [str(x) if pd.notna(x) else "" for x in sub["test_case"].tolist()],
@@ -1642,6 +1764,8 @@ def write_diff_list_subtasks(run_dir: Path, groups: list[dict]) -> None:
         else:
             bucket = "classifiable"
         rows.append({
+            "group_id":           g.get("group_id", ""),
+            "signature":          g.get("signature", ""),
             "subtask_id":         g["subtask_id"] if g["subtask_id"] is not None else "",
             "case_count":         g["size"],
             "bucket":             bucket,
@@ -1662,6 +1786,7 @@ def write_diff_list_subtasks(run_dir: Path, groups: list[dict]) -> None:
 def write_prompt_subtask(run_dir: Path, *, run_id: str, classifier: str,
                           build_a: int, build_b: int, hash_a: str, hash_b: str,
                           routine_id: int | None, build_a_name: str, build_b_name: str,
+                 project_id: int | None = None, testray_url: str | None = None,
                           groups_to_classify: list[dict],
                           groups_auto: list[dict],
                           groups_flaky: list[dict],
@@ -1707,13 +1832,23 @@ def write_prompt_subtask(run_dir: Path, *, run_id: str, classifier: str,
 
     def render_group(idx: int, g: dict, *, kind: str) -> None:
         """kind: 'classify' | 'auto' | 'flaky'."""
+        gid = g.get("group_id")
         sid = g["subtask_id"]
-        sid_label = f"subtask_id={sid}" if sid is not None else "no subtask link (singleton)"
         members_label = f"{g['size']} case(s)"
-        header = f"### {idx}. Subtask {sid_label} — {members_label}"
+        if g.get("signature"):
+            # Cluster mode: the group IS the error signature, so name it —
+            # it is the evidence for why these cases are one unit.
+            header = f"### {idx}. Group {gid} — {members_label} sharing one error signature"
+        elif sid is not None:
+            header = f"### {idx}. Group {gid} (Testray subtask_id={sid}) — {members_label}"
+        else:
+            header = f"### {idx}. Group {gid} — {members_label}, no subtask link (singleton)"
         body_lines.append(header)
 
-        meta_parts = [f"**case_ids:** {', '.join(str(c) for c in g['case_ids'][:8])}"]
+        meta_parts = [f"**group_id:** {gid}"]
+        if g.get("signature"):
+            meta_parts.append(f"**signature:** `{g['signature'][:120]}`")
+        meta_parts.append(f"**case_ids:** {', '.join(str(c) for c in g['case_ids'][:8])}")
         if g["size"] > 8:
             meta_parts[-1] += f" (+ {g['size'] - 8} more)"
         if g["components"]:
@@ -1884,8 +2019,10 @@ def _finalize_bundle(
     build_a: int, build_b: int, hash_a: str, hash_b: str,
     routine_id: int | None, build_a_name: str, build_b_name: str,
     git_repo: Path,
-    mode: str = MODE_PER_TEST,
+    mode: str = DEFAULT_MODE,
     fetch_specs: list | None = None,
+    project_id: int | None = None,
+    testray_url: str | None = None,
 ) -> Path:
     print(f"→ Step 3/6 git diff …")
     diff_path = run_dir / "git_diff_full.diff"
@@ -1935,8 +2072,8 @@ def _finalize_bundle(
 
     print(f"→ Step 6/6 prompt + schema + run.yml …")
 
-    if mode == MODE_BY_SUBTASK:
-        if "subtask_id" not in df.columns:
+    if mode in GROUPED_MODES:
+        if mode == MODE_BY_SUBTASK and "subtask_id" not in df.columns:
             raise SystemExit(
                 "Internal error: --by-subtask was requested but no subtask_id "
                 "column reached _finalize_bundle. fetch_build_caseresults_api "
@@ -1951,7 +2088,7 @@ def _finalize_bundle(
         # A subtask with a mix of classifiable + auto members lands in the
         # classifiable bucket; submit.py and assemble_dataframe_subtask
         # handle the per-member differentiation.
-        all_groups      = compute_subtask_groups(df)
+        all_groups      = compute_subtask_groups(df, mode=mode)
         groups_to_cls:  list[dict] = []
         groups_auto:    list[dict] = []
         groups_flaky:   list[dict] = []
@@ -1981,7 +2118,8 @@ def _finalize_bundle(
             full_diff_path=diff_path,
             git_repo=git_repo,
         )
-        print(f"   subtask groups: {len(groups_to_cls)} to classify "
+        label = "clusters" if mode == MODE_BY_CLUSTER else "subtask groups"
+        print(f"   {label}: {len(groups_to_cls)} to classify "
               f"(covering {sum(g['size'] for g in groups_to_cls)} cases), "
               f"{len(groups_auto)} auto-only, {len(groups_flaky)} flaky-only")
     else:
@@ -2012,6 +2150,8 @@ def _finalize_bundle(
         auto_classified=len(df_auto),
         flaky_excluded=len(df_flaky),
         mode=mode,
+        project_id=project_id,
+        testray_url=testray_url,
     )
 
     rel = _disp(run_dir)
@@ -2023,7 +2163,7 @@ def _finalize_bundle(
 
 
 def prepare(baseline: SideSpec, target: SideSpec, classifier: str,
-            mode: str = MODE_PER_TEST, out_dir: Path | None = None,
+            mode: str = DEFAULT_MODE, out_dir: Path | None = None,
             fetch_specs: list | None = None) -> Path:
     validate_combo(baseline, target)
     validate_mode(baseline, target, mode)
@@ -2082,6 +2222,8 @@ def prepare(baseline: SideSpec, target: SideSpec, classifier: str,
     print(f"   routine_id={routine_id}  "
           f"A={meta_a['git_hash'][:12]}  B={meta_b['git_hash'][:12]}")
 
+    project_id = meta_a["project_id"] or meta_b["project_id"]
+
     return _finalize_bundle(
         df=df, run_id=run_id, run_dir=run_dir,
         classifier=classifier,
@@ -2090,6 +2232,8 @@ def prepare(baseline: SideSpec, target: SideSpec, classifier: str,
         hash_a=meta_a["git_hash"], hash_b=meta_b["git_hash"],
         routine_id=routine_id,
         build_a_name=meta_a["build_name"], build_b_name=meta_b["build_name"],
+        project_id=project_id,
+        testray_url=testray_ui_url(cfg["testray"]),
         git_repo=git_repo,
         mode=mode,
         fetch_specs=fetch_specs,
@@ -2153,10 +2297,15 @@ def main() -> None:
     _add_side_args(ap, "target")
     ap.add_argument("--classifier", default=DEFAULT_CLASSIFIER,
                     help=f"Provenance label (default: {DEFAULT_CLASSIFIER})")
+    ap.add_argument("--mode", choices=MODES, default=DEFAULT_MODE,
+                    help="Classification granularity (ARCHITECTURE §7). "
+                         "by-cluster (default) groups failures by error "
+                         "signature before classifying and fans one verdict "
+                         "out to each member; per-test classifies every "
+                         "failure separately; by-subtask groups on Testray's "
+                         "Subtask instead of our signature.")
     ap.add_argument("--by-subtask", action="store_true",
-                    help="Subtask-aware mode: group regressions by Testray "
-                         "Subtask (testflow algorithm), classify once per "
-                         "group, fan out the verdict across member case-rows.")
+                    help="Deprecated alias for --mode by-subtask.")
     ap.add_argument("--out", type=Path, default=None,
                     help="Directory to write the run bundle into "
                          "(default: ./runs). On Jenkins, point this at the "
@@ -2171,7 +2320,9 @@ def main() -> None:
     fetch_specs = [_normalize_fetch_ref(e) for e in args.fetch_ref]
     baseline = _build_spec(args, "baseline")
     target   = _build_spec(args, "target")
-    mode     = MODE_BY_SUBTASK if args.by_subtask else MODE_PER_TEST
+    # --by-subtask is kept as an alias so existing invocations keep working;
+    # an explicit --mode always wins.
+    mode     = MODE_BY_SUBTASK if args.by_subtask else args.mode
     prepare(baseline, target, args.classifier, mode=mode, out_dir=args.out,
             fetch_specs=fetch_specs)
 

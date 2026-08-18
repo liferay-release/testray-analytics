@@ -28,6 +28,14 @@ testray:
   # OAuth2 client_credentials (env overrides: TESTRAY_CLIENT_ID /
   # TESTRAY_CLIENT_SECRET). Per-environment app: read scopes on
   # Build / Case / CaseResult, write scope on TriageResult. Never commit secrets.
+  # Base URL of the Testray UI. Used ONLY for deep-links in report.html —
+  # nothing in the pipeline calls it. Kept separate from base_url because the
+  # UI sits under a site friendly URL that differs per instance, so it cannot
+  # be derived. Leave unset and the report renders test names as plain text.
+  #   local:  http://localhost:8080/web/liferay-testray
+  #   prod:   https://testray.liferay.com/web/testray
+  ui_url: "http://localhost:8080/web/liferay-testray"
+
   client_id: ""
   client_secret: ""
 

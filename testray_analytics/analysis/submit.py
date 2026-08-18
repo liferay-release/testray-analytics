@@ -53,6 +53,9 @@ _CONFIDENCES     = {"high", "medium", "low"}
 
 MODE_PER_TEST   = "per-test"
 MODE_BY_SUBTASK = "by-subtask"
+MODE_BY_CLUSTER = "by-cluster"
+# Modes that classify a group once and fan the verdict out to its members.
+GROUPED_MODES   = (MODE_BY_CLUSTER, MODE_BY_SUBTASK)
 
 
 def validate_results(payload: dict, expected_case_ids: set[int]) -> list[dict]:
@@ -333,7 +336,12 @@ def assemble_dataframe_subtask(
     verdict_by_case: dict[int, dict] = {}
     subtask_by_case: dict[int, int]  = {}
     for r in results:
-        sid = r.get("subtask_id")
+        # by-cluster results identify their group with group_id; by-subtask
+        # bundles predating it use subtask_id. Accept either so one fan-out
+        # serves both grouped modes.
+        sid = r.get("group_id")
+        if not isinstance(sid, int):
+            sid = r.get("subtask_id")
         if isinstance(sid, int) and sid in subtask_members:
             cids = subtask_members[sid]
         else:
@@ -436,7 +444,7 @@ def main() -> None:
 
     # mode defaults to per-test for older bundles that don't have the field.
     mode = meta.get("mode") or MODE_PER_TEST
-    if mode not in (MODE_PER_TEST, MODE_BY_SUBTASK):
+    if mode not in (MODE_PER_TEST, MODE_BY_SUBTASK, MODE_BY_CLUSTER):
         raise SystemExit(f"Unknown mode in run.yml: {mode!r}")
 
     # Validation uses the set of case_ids the classifier was expected to handle
@@ -462,8 +470,8 @@ def main() -> None:
               f"overrides run.yml classifier={meta['classifier']}",
               file=sys.stderr)
 
-    if mode == MODE_BY_SUBTASK:
-        # Load canonical subtask membership from diff_list_subtasks.csv —
+    if mode in GROUPED_MODES:
+        # Load canonical group membership from diff_list_subtasks.csv —
         # the prompt's per-subtask block truncates members for readability,
         # so the model's emitted case_ids may be incomplete. The CSV holds
         # the full member case_ids per subtask_id.
@@ -472,8 +480,13 @@ def main() -> None:
         if st_path.exists():
             st_df = pd.read_csv(st_path)
             for _, row in st_df.iterrows():
-                sid_v = row.get("subtask_id")
-                if pd.isna(sid_v) or sid_v == "":
+                # group_id is the identifier for by-cluster and for any
+                # bundle written since it was introduced; fall back to
+                # subtask_id so older by-subtask bundles still resolve.
+                sid_v = row.get("group_id")
+                if sid_v is None or (isinstance(sid_v, float) and pd.isna(sid_v)) or sid_v == "":
+                    sid_v = row.get("subtask_id")
+                if sid_v is None or (isinstance(sid_v, float) and pd.isna(sid_v)) or sid_v == "":
                     continue
                 try:
                     sid = int(sid_v)
@@ -509,7 +522,7 @@ def main() -> None:
     if len(pbug_rows):
         print(f"POSSIBLE_BUG candidate-culprit coverage: {pbug_hits}/{len(pbug_rows)} "
               f"({100 * pbug_hits / len(pbug_rows):.0f}%) — feeds training with BUG")
-    if mode == MODE_BY_SUBTASK:
+    if mode in GROUPED_MODES:
         n_subtasks = len(payload["results"])
         n_with_sid = int(df["subtask_id"].notna().sum())
         print(f"Subtask fan-out: {n_subtasks} subtask verdicts → "

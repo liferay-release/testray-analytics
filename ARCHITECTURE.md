@@ -244,35 +244,94 @@ Surfacing our clusters as native Subtasks later is a separate, explicit integrat
   own reasoning. (A cluster-level *narrative* summary, if we ever add one, is still
   triage output, not Insights.)
 
-### Classification granularity — `per-test` vs `by-cluster` (LPD-95844)
+### Classification granularity — `by-cluster` (default) vs `per-test` (LPD-95844)
 
-Two ways to classify, selected by a `--mode {per-test, by-cluster}` toggle. This is
-LPD-95844 work, **not** 95842 — today only `per-test` exists.
+Selected by `prepare --mode {by-cluster, per-test, by-subtask}`. **`by-cluster` is
+the default as of 2026-08-18** and `per-test` is never chosen automatically. This is
+orthogonal to the §8 *selection* mode (`analysisMode`); the granularity used is
+recorded in `run.yml`'s `mode`.
 
-- **`per-test`** (current default) — one prompt section per failure → a per-failure
-  verdict + `culprit_file`. `clusterKey` groups the results *after* classification,
-  for the cluster view. Highest fidelity + richest training labels; more tokens (the
-  shared header is cached, per-failure hunks are not).
-- **`by-cluster`** — group failures by **error signature (§5) *before* the API**,
-  classify **once per signature**, and **fan the verdict out to each member
-  `CaseResult`** (so the per-CaseResult grain, decision #6, is preserved). Cheaper,
-  and yields one consistent verdict per root cause. Reuses the existing by-subtask
-  fan-out machinery, keyed on our error signature instead of Testray's `subtask_id`.
-  Risk: an error signature can **over-group** failures with different real culprits,
-  applying one verdict too broadly.
+- **`by-cluster`** — group failures by **error signature (§5) before the classifier
+  runs**, classify **once per signature**, and **fan the verdict out to every member
+  `CaseResult`** (the per-CaseResult grain, decision #6, is preserved). Shares the
+  whole grouped code path with `by-subtask`; only the key differs.
+- **`per-test`** — one prompt section per failure → a per-failure verdict +
+  `culprit_file`. Kept for the A/B below and as a fallback when a signature is
+  suspected of over-grouping.
+- **`by-subtask`** — group on Testray's `Subtask` instead of our signature. Requires
+  an `api` target source.
 
-**Timing subtlety:** `clusterKey` = `culprit_file` + error signature, and
-`culprit_file` is an *LLM output* — so the full `clusterKey` is only known **after**
-classification (it's a display grouping). Pre-send clustering can therefore only
-group by **error signature alone**, not the full `clusterKey`.
+**Two clusterings exist, keyed differently, and that is forced.** Pre-send grouping
+can only use the **error signature**; the full `clusterKey` also contains
+`culprit_file`, which is an LLM *output* and does not exist yet. Post-classification
+grouping (the report and the cluster view) uses the full `clusterKey`.
 
-**Plan:** ship `per-test` as the default; **flip the default to `by-cluster` once §5
-normalization is trusted** (same ship-safe-then-tune logic as NEEDS_REVIEW), keeping
-`per-test` as a fallback for small/ambiguous runs, and offering an A/B of the same
-build pair (cost + verdict agreement). The granularity used is recorded in
-`run.yml`'s `mode` field. Keep the two mode-axes **distinct**: the *selection* mode
-(§8 → `analysisMode`: build-vs-build / routine-history / suite-vs-pr) is orthogonal
-to this *classification granularity*.
+#### Measured on the 2026.q1.11 → q1.12-lts pair (449 classifiable failures)
+
+| | `per-test` | `by-cluster` |
+|---|---|---|
+| Units sent | 449 | **169** (2.7× fewer) |
+| Batches | 4 | 3 |
+| Prompt content | ~346k tokens | **~222k tokens** (~36% less) |
+
+**The token saving is far sublinear in the unit reduction** — 2.7× fewer units buys
+only ~36% fewer tokens. Two reasons, both structural: **118 of the 169 groups are
+singletons** (70% of groups, 26% of failures) and save nothing at all, and the
+per-failure hunk context dominates the shared header, which is the part that
+compresses. Do not size a run by unit count alone.
+
+#### Caveats
+
+1. **Over-grouping is the real risk, and it concentrates.** One verdict *and one
+   `culprit_file`* is fanned across every member. On this pair the largest group is
+   **102 failures on a single signature** — 102 `CaseResult` rows resting on one
+   judgement. If `normalize()` merged two genuinely different causes, one is
+   mislabelled and there is nothing in the output that reveals it.
+2. **`normalize()` becomes load-bearing for verdicts, not just display.** Its
+   measured behaviour (v2, against Nikki's hand-merges): tuning set 14/14 recall with
+   0/55 false merges; held-out set 27/38 recall with **2/105 false merges**. Read
+   those two error directions differently — **under-merging costs tokens, over-merging
+   costs correctness**. The ~2% false-merge rate is the number that matters here, and
+   it was measured on 105 group pairs, which is a small sample.
+3. **The display clustering degenerates.** Because every member gets the same verdict
+   and the same `culprit_file`, all members collapse to one `clusterKey` — so
+   post-classification clustering becomes 1:1 with the pre-send grouping. Under
+   `per-test`, one signature can *split* into several `clusterKey`s when the model
+   names different culprits for different members. **`by-cluster` saves tokens by
+   never asking a question whose answer could have split the group.**
+4. **Training labels weaken.** `per-test` yields one independent
+   (case, verdict, `culprit_file`) observation per failure. `by-cluster` yields one
+   label replicated across N rows — correlated, not independent. The rows still land
+   per-`CaseResult`, so nothing downstream breaks, but the supervision for the future
+   NN work is thinner than the row count suggests.
+5. **`group_id` is the fan-out contract, and the prompt truncates members.** Long
+   member lists are cut for readability, so the `case_ids` a model emits are
+   advisory; canonical membership is resolved from `group_id` against
+   `diff_list_subtasks.csv` at submit time. If a model invents or renumbers a
+   `group_id`, that group's members are silently dropped. `classify`'s own coverage
+   line reads from the CSV for the same reason — summing parsed sections undercounted
+   449 as 321.
+6. **Blank signatures stay singletons** rather than collapsing into one "no error"
+   cluster, which would be over-grouping in its worst form.
+7. **Auto-classification runs first and is unaffected.** On this pair it screened 108
+   failures into 8 groups before either mode saw them — including a 91-case
+   `BUILD_FAILURE` group. Cheap screening beats clever grouping; check
+   `triage.auto_classify_patterns` before optimising granularity.
+
+#### Gaps
+
+- **The A/B §7 asked for has not been run.** Both bundles now exist for the same
+  pair (`r_20260818T161215Z_270750_270748` per-test,
+  `r_20260818T162337Z_270750_270748` by-cluster) but neither has been classified.
+  The 102-member group is the natural test: if `per-test` gives all 102 members the
+  same verdict, the signature did not over-group and `by-cluster` is justified on
+  evidence; if it splits them, that is a `normalize()` bug caught before it fanned a
+  wrong verdict 102 times.
+- **No over-grouping signal is surfaced at runtime.** Nothing warns when a single
+  group is large enough that one wrong verdict would be costly. A size threshold that
+  flags or force-splits the largest groups is unimplemented.
+- **`normalize()` needs a third labelled set.** The held-out set has been spent on
+  evaluation, so any further tuning has no clean measurement left.
 
 ---
 

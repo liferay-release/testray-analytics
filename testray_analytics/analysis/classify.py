@@ -190,8 +190,22 @@ _FAILURES_MARKER = "## Failures to classify"
 _FAILURE_HEAD_RE = re.compile(r"^### (\d+)\. ", re.MULTILINE)
 _CASE_ID_RE      = re.compile(r"\*\*case_id:\*\*\s*(\d+)")
 
-# Subtask-mode markers
-_SUBTASK_HEAD_RE = re.compile(r"^### (\d+)\. Subtask ", re.MULTILINE)
+
+def _is_grouped(mode: str) -> bool:
+    """True for modes that classify a group once and fan the verdict out.
+
+    by-cluster and by-subtask share the whole grouped code path — the same
+    prompt shape, the same section parser, the same output contract. Only the
+    grouping key differs, and that is decided in prepare, not here.
+    """
+    return mode in ("by-cluster", "by-subtask")
+
+# Grouped-mode markers (by-cluster and by-subtask share one prompt shape).
+# by-cluster emits "### 3. Group 176 — …"; older by-subtask bundles emit
+# "### 3. Subtask subtask_id=… — …", so both spellings must parse or a
+# re-run of an existing bundle would silently find zero sections.
+_SUBTASK_HEAD_RE = re.compile(r"^### (\d+)\. (?:Group|Subtask) ", re.MULTILINE)
+_GROUP_ID_RE     = re.compile(r"^### \d+\. Group (\d+)", re.MULTILINE)
 _SUBTASK_ID_RE   = re.compile(r"subtask_id=(\d+)")
 _CASE_IDS_LINE_RE = re.compile(r"\*\*case_ids:\*\*\s*([0-9, ]+?)(?:\(\+|$|·)", re.MULTILINE)
 _MEMBER_LINE_RE  = re.compile(r"^- \[(\d+)\]", re.MULTILINE)
@@ -210,6 +224,7 @@ class FailureSection:
 class SubtaskSection:
     """One subtask block in subtask-mode prompt.md."""
     index:      int            # 1-based as shown in prompt.md
+    group_id:   int | None     # what the verdict is keyed on; None if absent
     subtask_id: int | None     # None for unmapped singletons
     case_ids:   list[int]      # all member case_ids the verdict will fan to
     text:       str            # the full section text
@@ -298,6 +313,8 @@ def parse_prompt_subtask(prompt_md: Path) -> tuple[str, list[SubtaskSection]]:
         idx = int(m.group(1))
         sid_match = _SUBTASK_ID_RE.search(chunk[:200])  # in the header line
         sid = int(sid_match.group(1)) if sid_match else None
+        gid_match = _GROUP_ID_RE.search(chunk[:200])
+        gid = int(gid_match.group(1)) if gid_match else sid
 
         # Pull case_ids: prefer the dedicated **case_ids:** line in meta;
         # fall back to the explicit `- [N]` member list (more authoritative
@@ -320,7 +337,8 @@ def parse_prompt_subtask(prompt_md: Path) -> tuple[str, list[SubtaskSection]]:
                 f"(neither **case_ids:** line nor `- [N]` member list)."
             )
         sections.append(SubtaskSection(
-            index=idx, subtask_id=sid, case_ids=combined, text=chunk,
+            index=idx, group_id=gid, subtask_id=sid,
+            case_ids=combined, text=chunk,
         ))
 
     return header, sections
@@ -474,13 +492,16 @@ def _build_user_text(
     provenance. `mode` selects the output instructions — per-test mode
     expects `testray_case_id` per entry, subtask mode expects
     `subtask_id` + `case_ids` array per entry."""
-    if mode == "by-subtask":
+    if _is_grouped(mode):
+        unit = "cluster" if mode == "by-cluster" else "Subtask"
         instructions = (
             f"\n\nPopulate run_id=\"{run_id}\" and classifier=\"{classifier}\" in "
-            f"the output. Include exactly one result per Subtask shown above. "
-            f"For each entry: set `subtask_id` to the integer from the section "
-            f"header (or null when the section header says 'no subtask link "
-            f"(singleton)'); set `case_ids` to the full list of member case_ids "
+            f"the output. Include exactly one result per {unit} shown above. "
+            f"For each entry: set `group_id` to the integer from that section's "
+            f"heading (`### N. Group <group_id>`) and its `**group_id:**` line — "
+            f"this is how the verdict is fanned out to every member case "
+            f"result, so it must match exactly and must never be invented or "
+            f"renumbered; set `case_ids` to the full list of member case_ids "
             f"shown in that section's `**case_ids:**` line and `**members:**` "
             f"list (every case_id, do not omit any). Do not invent case_ids."
         )
@@ -649,7 +670,7 @@ def call_api(
         batch, batch_number, total_batches, classifier, run_id, mode=mode,
     )
 
-    instructions = (_SYSTEM_INSTRUCTIONS_SUBTASK if mode == "by-subtask"
+    instructions = (_SYSTEM_INSTRUCTIONS_SUBTASK if _is_grouped(mode)
                     else _SYSTEM_INSTRUCTIONS)
 
     request_args = dict(
@@ -732,12 +753,12 @@ def classify(run_dir: Path, classifier: str, dry_run: bool,
     meta   = yaml.safe_load(run_yml.read_text())
     run_id = meta["run_id"]
     mode   = meta.get("mode") or "per-test"
-    if mode not in ("per-test", "by-subtask"):
+    if mode not in ("per-test", "by-subtask", "by-cluster"):
         raise SystemExit(f"Unknown mode in run.yml: {mode!r}")
     schema = json.loads(schema_path.read_text())
     api_schema = prepare_api_schema(schema)
 
-    if mode == "by-subtask":
+    if _is_grouped(mode):
         header, sections = parse_prompt_subtask(prompt_md)
     else:
         header, sections = parse_prompt(prompt_md)
@@ -751,7 +772,7 @@ def classify(run_dir: Path, classifier: str, dry_run: bool,
     cfg = load_api_config()
     batches = pack_batches(sections, cfg["max_chars_per_batch"])
 
-    unit = "subtasks" if mode == "by-subtask" else "failures"
+    unit = ("clusters" if mode == "by-cluster" else "subtasks") if _is_grouped(mode) else "failures"
     print(f"Run:          {run_id}")
     print(f"Classifier:   {classifier}")
     print(f"Mode:         {mode}")
@@ -760,16 +781,33 @@ def classify(run_dir: Path, classifier: str, dry_run: bool,
                                if engine == "claude-code"
                                else "api — Anthropic SDK, billed per token"))
     print(f"Model:        {cfg['model']}  (effort={cfg['effort']})")
+    # Coverage comes from diff_list_subtasks.csv, not from the parsed
+    # sections: the prompt truncates long member lists for readability, so
+    # summing section.case_ids undercounts badly (321 vs 449 on a run with a
+    # 102-member cluster) and reads as if failures were dropped. The canonical
+    # membership is resolved from group_id at submit time.
+    covered = None
+    if _is_grouped(mode):
+        groups_csv = run_dir / "diff_list_subtasks.csv"
+        if groups_csv.exists():
+            try:
+                import pandas as _pd
+                _g = _pd.read_csv(groups_csv)
+                _c = _g[_g["bucket"] == "classifiable"]
+                covered = int(_c["case_count"].sum())
+            except Exception:
+                covered = None
+        if covered is None:
+            covered = sum(len(s.case_ids) for s in sections)
     print(f"{unit.capitalize():14s}{len(sections)}"
-          + (f"  (covering {sum(len(s.case_ids) for s in sections)} member case-results)"
-             if mode == "by-subtask" else ""))
+          + (f"  (covering {covered} member case-results)" if covered is not None else ""))
     print(f"Batches:      {len(batches)} "
           f"(max {cfg['max_chars_per_batch']:,} chars/batch)")
 
     if dry_run:
         batches_dir = run_dir / "batches"
         batches_dir.mkdir(exist_ok=True)
-        active_instructions = (_SYSTEM_INSTRUCTIONS_SUBTASK if mode == "by-subtask"
+        active_instructions = (_SYSTEM_INSTRUCTIONS_SUBTASK if _is_grouped(mode)
                                 else _SYSTEM_INSTRUCTIONS)
         for i, b in enumerate(batches, 1):
             total = sum(len(s.text) for s in b)
@@ -778,7 +816,7 @@ def classify(run_dir: Path, classifier: str, dry_run: bool,
             user_text = _build_user_text(
                 b, i, len(batches), classifier, run_id, mode=mode,
             )
-            if mode == "by-subtask":
+            if _is_grouped(mode):
                 ids_label = (f"subtask_ids: {[s.subtask_id for s in b]}; "
                               f"member_count: {sum(len(s.case_ids) for s in b)}")
             else:
@@ -826,7 +864,7 @@ def classify(run_dir: Path, classifier: str, dry_run: bool,
         client = build_client()
 
     all_results: list[dict] = []
-    if mode == "by-subtask":
+    if _is_grouped(mode):
         # Track subtask_ids (None for unmapped singletons — track those by
         # the synthetic key of their first case_id since None is not unique)
         seen_subtask_ids: set[int] = set()
@@ -872,7 +910,7 @@ def classify(run_dir: Path, classifier: str, dry_run: bool,
                     if usage.get('cost_usd') else "") + ")"
                  if engine == "claude-code" else "   (Anthropic API — billed)"))
 
-        if mode == "by-subtask":
+        if _is_grouped(mode):
             batch_subtask_ids = {s.subtask_id for s in batch if s.subtask_id is not None}
             batch_case_ids    = {cid for s in batch for cid in s.case_ids}
             for r in results:
@@ -922,7 +960,7 @@ def classify(run_dir: Path, classifier: str, dry_run: bool,
         if i < len(batches):
             time.sleep(cfg["delay_between"])
 
-    if mode == "by-subtask":
+    if _is_grouped(mode):
         missing = expected_case_ids - seen_case_ids
         if missing:
             print(f"\nWARN: {len(missing)} member case_id(s) got no verdict from "
