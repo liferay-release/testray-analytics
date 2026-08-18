@@ -1562,6 +1562,82 @@ def fetch_commits_in_range(git_repo: Path, hash_a: str, hash_b: str) -> list[tup
     return commits
 
 
+
+_TICKET_RE = re.compile(r"^([A-Z][A-Z0-9]+-\d+)\b")
+
+
+def collect_tickets_in_range(git_repo: Path, hash_a: str, hash_b: str
+                             ) -> list[str]:
+    """Unique ticket keys across `A..B`, in first-seen (newest-first) order.
+
+    Mirrors `liferay-portal/tickets-in-release.sh`: take each commit subject's
+    leading token and dedupe. Two deliberate differences from that script:
+
+    * range is `A..B`, not `A...B`. The three-dot form is a symmetric
+      difference; we want exactly the commits whose changes the diff analysed,
+      or the ticket list would not describe the diff.
+    * the key is matched with a regex rather than `awk '{print $1}'`, so
+      subjects that do not start with a ticket (reverts, merges, "Bump …")
+      are skipped instead of contributing junk keys.
+    """
+    seen: list[str] = []
+    for _short, subject in fetch_commits_in_range(git_repo, hash_a, hash_b):
+        m = _TICKET_RE.match(subject.strip())
+        if m and m.group(1) not in seen:
+            seen.append(m.group(1))
+    return seen
+
+
+def write_tickets_in_range(run_dir: Path, tickets: list[str], *,
+                           hash_a: str, hash_b: str) -> Path:
+    """Write the ticket list plus ready-to-paste JQL.
+
+    This is the context a human needs when a wide build pair comes back mostly
+    NEEDS_REVIEW with no culprit file: the classifier could not attribute the
+    failure, but the reviewer can still see every ticket in the range.
+    """
+    keys = ",".join(tickets)
+    lines = [
+        f"# Unique tickets in {hash_a[:12]}..{hash_b[:12]}  ({len(tickets)})",
+        "",
+        *tickets,
+        "",
+        "# ---- JQL " + "-" * 60,
+        "",
+        f"key in ({keys}) and project = LPD and type = bug",
+        "",
+        "# Security vulnerabilities only",
+        "",
+        f'key in ({keys}) and project = LPD and type = bug and '
+        f'(component in ("security vulnerability","Security Vulnerability") '
+        f'OR "Cross Cutting Properties[Checkboxes]" in ("Security Vulnerability"))',
+        "",
+    ]
+    out = run_dir / "tickets_in_range.txt"
+    out.write_text("\n".join(lines), encoding="utf-8")
+    return out
+
+
+def describe_git_range(git_repo: Path, hash_a: str, hash_b: str) -> str:
+    """One line naming the checkout, its branch, and whether both ends resolve.
+
+    Worth printing because a silent mis-resolution looks identical to a real
+    empty diff: the checkout was on `master` while the pair was a 2026.q1
+    release pair, and nothing in the output said so.
+    """
+    def _git(*args) -> str:
+        try:
+            return subprocess.run(["git", "-C", str(git_repo), *args],
+                                  capture_output=True, text=True,
+                                  check=True, timeout=30).stdout.strip()
+        except (subprocess.SubprocessError, FileNotFoundError):
+            return ""
+    branch = _git("rev-parse", "--abbrev-ref", "HEAD") or "?"
+    missing = [h[:12] for h in (hash_a, hash_b)
+               if not _git("rev-parse", "--verify", "--quiet", f"{h}^{{commit}}")]
+    note = f"  !! NOT in this checkout: {', '.join(missing)}" if missing else ""
+    return f"repo {_disp(git_repo)} (branch {branch}){note}"
+
 def fetch_commits_for_file(git_repo: Path, hash_a: str, hash_b: str,
                            file_path: str) -> list[tuple[str, str]]:
     """Commits in A..B that touched `file_path`, newest-first, noise-filtered.
@@ -2199,9 +2275,32 @@ def _finalize_bundle(
 ) -> Path:
     print(f"→ Step 3/6 git diff …")
     diff_path = run_dir / "git_diff_full.diff"
+    # State the provenance before the diff runs. An empty or partial diff is
+    # indistinguishable from a real "nothing changed" unless the range and the
+    # checkout are on the record.
+    print(f"   {describe_git_range(git_repo, hash_a, hash_b)}")
+    print(f"   range {hash_a[:12]}..{hash_b[:12]}")
     diff_lines = run_git_diff(git_repo, hash_a, hash_b, diff_path,
                               fetch_specs=fetch_specs)
-    print(f"   {diff_lines} lines → {_disp(diff_path)}")
+    n_files = 0
+    try:
+        n_files = sum(1 for ln in diff_path.open(encoding="utf-8", errors="replace")
+                      if ln.startswith("diff --git"))
+    except OSError:
+        pass
+    print(f"   {diff_lines} lines, {n_files} file(s) after exclusions "
+          f"→ {_disp(diff_path)}")
+    if diff_lines == 0:
+        print("   WARNING: the diff is EMPTY. Either the two builds ran the "
+              "same commit, or the range is wrong — no hunk can be matched "
+              "and no culprit_file can be attributed.", file=sys.stderr)
+
+    tickets = collect_tickets_in_range(git_repo, hash_a, hash_b)
+    if tickets:
+        tickets_path = write_tickets_in_range(run_dir, tickets,
+                                              hash_a=hash_a, hash_b=hash_b)
+        print(f"   {len(tickets)} unique ticket(s) in range "
+              f"→ {_disp(tickets_path)}")
 
     print(f"→ Step 4/6 fragments + filtered hunks …")
     fragments = derive_test_fragments(df)
