@@ -32,6 +32,7 @@ by_subtask = pytest.mark.skip(
     reason="by-subtask renderer intentionally not built — the nested "
            "clustered renderer ships instead (ARCHITECTURE §7)")
 
+from testray_analytics.analysis import prepare
 from testray_analytics.analysis.report import _rollup, render_run
 
 META = {
@@ -97,6 +98,22 @@ def test_cluster_rollup_is_most_severe_member():
 
 
 # --- §12 transitions ------------------------------------------------------
+
+def test_changed_failure_warning_fires_on_the_transition_prepare_emits(tmp_path):
+    """The guard must match `prepare`'s vocabulary, not just the fixtures'.
+
+    Regression: the guard compared against "CHANGED_FAILURE", which
+    `prepare.compute_test_diff` never produces — it emits TRANSITION_CHANGED
+    ("changed"). The test above passed on a value real data never carries, so
+    on every real run the baseline warning silently did not render and a test
+    that was already failing was presented as a fresh regression.
+    """
+    html = _render([_row(1, 900, transition=prepare.TRANSITION_CHANGED,
+                         error_message="ElementNotFound",
+                         baseline_error_message="TimeoutException")], tmp_path)
+    assert "already failing on the baseline" in html
+    assert "Was failing with" in html and "Now failing with" in html
+
 
 def test_changed_failure_shows_both_errors_and_the_warning(tmp_path):
     html = _render([_row(1, 900, transition="CHANGED_FAILURE",

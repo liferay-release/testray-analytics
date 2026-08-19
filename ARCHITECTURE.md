@@ -508,6 +508,48 @@ merges client-side, with no core change.
 > ERC prefix — `startswith(externalReferenceCode,'<buildB>_')`, which the writer
 > already documents — so no `TriageRun`→`TriageResult` relationship is needed.
 
+> **The view's read path — one query, not N+1.** Verified 2026-08-19 against the
+> local instance. The triage table needs eleven columns, and only some of them
+> live on `TriageResult`: status-in-B, the error text and the component/team FKs
+> are on the joined `CaseResult`, and the test *name* is one hop further out on
+> `Case`. Three facts make that one request:
+>
+> * `nestedFields=caseResultToTriageResults` expands the `CaseResult` inline.
+> * **`nestedFieldsDepth=2` reaches through it to `Case`**, which is the only
+>   place the test name exists. Only `case` and `creator` expand at depth 2 —
+>   `component` and `team` do **not**, so those two are still resolved by id.
+> * `fields=<projection>` trims the row to what the view reads (402 KiB → 135
+>   KiB on a 183-row run). It does **not** reach inside an expansion, so the
+>   expansion is what the payload costs: 1.1 MB and ~0.4s for that same run.
+>
+> Two traps. The expanded object lands under a **different key depending on the
+> query** — `caseResultToTriageResults` with a `fields=` projection,
+> `r_caseResultToTriageResults_c_caseResult` without one — so read whichever is
+> present rather than coupling the reader to the projection. And every number
+> arrives as a **string**: `id`, `baselineSignatureCount` and every `…Id` field
+> serialise as text, so an unguarded `row.count > 5` compares strings.
+>
+> **A session-authenticated read without `x-csrf-token` lies about why it
+> failed.** From the browser, `/o/c/builds/270748` returns **404** and
+> `/o/c/builds` returns `totalCount: 0` when the header is missing — both of
+> which read as "this object is not readable by this user", and neither is true.
+> Send `x-csrf-token: Liferay.authToken` (the CX fetcher always does) and the
+> same two requests return the build and the full collection. Testray's own
+> `/o/testray-rest/v1.0/...` app behaves the same way, returning 403. Do not
+> conclude anything about permissions from a bare `fetch`.
+>
+> **`id` follows the same quoting rule as the relationship FKs.** `id eq 282268`
+> fails with `Incompatible types`; `id in ('282268')` works. There is no `eq`
+> form that accepts an unquoted primary key, so even single-id lookups go
+> through `in`. Batch those filters — a ~550-row run would push one `in (…)`
+> clause past the container's header limit and fail as an opaque 400.
+>
+> Net: the view loads in **6 requests** — run, results (the expanded query),
+> routine (for the project id the deep-links need, which `TriageRun` does not
+> store), teams-by-id, components-by-id, and builds-by-id for the two build
+> names in the title. `TriageRun` stores neither build name; it does not need
+> to, because `/o/c/builds` is readable with the CSRF header above.
+
 **CX boundary — what ships where.**
 
 | Piece | Where it lives | Deployable on its own? |
@@ -952,6 +994,42 @@ because the naive version was tried and was wrong.
 8. **Say what a number is out of.** "Total tests: 557" read as tests run; the
    build ran 17,537. The header states tests-in-build, failures-triaged and
    clusters, and the A×B status matrix carries the rest.
+9. **Say what the table is missing.** The two renderers do not see the same rows.
+   `report.py` renders the dataframe — every triaged failure — while the CX
+   renders what was *written*, and the write policy skips high-confidence
+   `FALSE_POSITIVE` and pre-classified rows. On the reference run that is 183 of
+   557. A table of 183 with no denominator reads as "this build had 183
+   failures", wrong by a factor of three, so the CX shows `Shown`,
+   `Failures triaged` and `Not written` side by side and marks clusters
+   `117 of 177 triaged`.
+
+**Status: both renderers obey all nine rules as of 2026-08-19.** The CX port
+landed the four it previously did not — collapsed-by-default, group-reordering
+sort, mode-dependent collapse and the denominators above. Two notes for whoever
+touches either next:
+
+* Rule 5 is *cheaper* in the CX than in the artifact. `report.py` must emit both
+  the `↑` pointer and the full value and let `table[data-mode]` CSS choose,
+  because its group-by changes after render. In the CX the mode is React state,
+  so the choice is made directly at render. Verified: 733 pointers under
+  group-by-cluster, 0 under group-by-team.
+* Rule 4 has a corollary the artifact learned first and the CX now copies: **an
+  active filter overrides the collapse.** Searching a fully collapsed report
+  must reveal its hits, or the search returns nothing and reads as "no matches".
+
+### The `transition` vocabulary — one string, two spellings
+
+`prepare` emits lowercase tokens (`TRANSITION_CHANGED == "changed"`); the §12
+fixtures use `CHANGED_FAILURE`. Both reach the renderers, and matching only one
+is not a cosmetic bug: `report.py`'s changed-failure guard compared against
+`"CHANGED_FAILURE"`, a value `compute_test_diff` never produces, so the
+"already failing on the baseline" warning **never rendered on real data** — the
+single omission this section calls the most misleading thing the report could
+make. It passed its test because the test supplied the uppercase form.
+
+Fixed 2026-08-19 in both renderers by accepting either spelling, with a
+regression test that asserts the guard fires on the value `prepare` actually
+emits. When comparing a transition, normalise; never compare to a literal.
 
 ### Override capture (LPD-95851)
 

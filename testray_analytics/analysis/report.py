@@ -41,6 +41,7 @@ import pandas as pd
 
 from . import error_signature
 from .jira_settings import DEFAULT_LABEL, resolve_jira_settings
+from .prepare import TRANSITION_CHANGED
 
 # Severity order — index doubles as the sort rank and drives _rollup().
 # Severity order, as specified: BUG, POSSIBLE_BUG, NEEDS_REVIEW, TEST_FIX,
@@ -103,7 +104,7 @@ _GROUP_MODES = [
 _CSS = """
   :root {
     --c-bug: #c0392b;
-    --c-pbug: #e67e22;
+    --c-pbug: #e74c3c;
     --c-needs: #d68910;
     --c-testfix: #2471a3;
     --c-fp: #5d6d7e;
@@ -1120,6 +1121,19 @@ def _shared_in_cluster(shared: dict, ckey: str, column: str, value: str) -> bool
     return bool(vals) and len(vals) == 1 and value in vals
 
 
+# Two vocabularies reach this guard. `prepare` emits lowercase tokens
+# (TRANSITION_CHANGED == "changed"); the §12 fixtures use CHANGED_FAILURE.
+# Accept both. Matching only the uppercase form is what shipped, and because
+# prepare never produces it the baseline warning below never rendered on real
+# data — the one omission this report's own comment calls the most misleading
+# thing it could do.
+_CHANGED_TRANSITIONS = {TRANSITION_CHANGED, "changed_failure"}
+
+
+def _is_changed_failure(transition) -> bool:
+    return _text(transition).strip().lower() in _CHANGED_TRANSITIONS
+
+
 def _detail_row(r, rid: str, css: str, ckey: str, meta: dict) -> str:
     """The per-row detail panel: everything the table had to truncate."""
     items = []
@@ -1135,7 +1149,7 @@ def _detail_row(r, rid: str, css: str, ckey: str, meta: dict) -> str:
 
     baseline_err = _text(r.get("baseline_error_message"))
     error = _truncate(r.get("error_message"))
-    if baseline_err and transition == "CHANGED_FAILURE":
+    if baseline_err and _is_changed_failure(transition):
         # A changed failure was already failing on the baseline. Presenting it
         # as a fresh regression is the single most misleading thing this report
         # could do, so both errors are shown and labelled.
