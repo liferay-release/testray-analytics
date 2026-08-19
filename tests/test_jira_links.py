@@ -6,7 +6,10 @@ Three fields cannot be inferred at render time and were missing:
   - `reporter` — an Atlassian accountId; the legacy CreateIssueDetails endpoint
                  does NOT auto-fill Reporter, so without it every draft opens
                  with an empty Reporter field
-  - `labels`   — so triage drafts are filterable in Jira
+  - `labels`   — so triage drafts are filterable in Jira. NOTE (2026-08-18):
+                 the label no longer defaults. Like parent and reporter it is
+                 per-run, and an always-on default would tag every draft from
+                 every release identically.
 
 Precedence: --jira-parent > run.yml `jira_parent` > config.yml `jira.parent`.
 """
@@ -52,7 +55,8 @@ def test_parent_and_reporter_come_from_config():
     s = resolve_jira_settings(cfg)
     assert s["parent"] == "LPD-100696"
     assert s["reporter_account_id"] == ACCOUNT
-    assert s["label"] == DEFAULT_LABEL
+    # No default: an unset label is omitted from the link entirely.
+    assert s["label"] == ""
 
 
 def test_run_yml_overrides_config_parent():
@@ -91,6 +95,12 @@ def test_explicit_account_id_skips_the_api_call(monkeypatch):
 def test_missing_config_yields_empty_fields():
     s = resolve_jira_settings({})
     assert s["parent"] == "" and s["reporter_account_id"] == ""
+    assert s["label"] == ""
+
+
+def test_explicit_label_is_carried():
+    """DEFAULT_LABEL is the suggested value, not an automatic one."""
+    s = resolve_jira_settings({"jira": {"label": DEFAULT_LABEL}})
     assert s["label"] == DEFAULT_LABEL
 
 
@@ -118,11 +128,16 @@ def test_link_carries_parent_reporter_and_label(tmp_path):
 
 def test_blank_fields_are_omitted_not_sent_empty(tmp_path):
     """Sending parent= or reporter= empty would read as a deliberate clear."""
-    meta = dict(META, jira={"parent": "", "reporter_account_id": ""})
+    meta = dict(META, jira={"parent": "", "reporter_account_id": "", "label": ""})
     p = _jira_params(tmp_path, meta)
     assert "parent" not in p
     assert "reporter" not in p
-    assert "labels" in p          # label always has a default
+    assert "labels" not in p      # per-run, like the other two
+
+
+def test_label_is_sent_when_supplied(tmp_path):
+    meta = dict(META, jira={"label": DEFAULT_LABEL})
+    assert _jira_params(tmp_path, meta)["labels"] == [DEFAULT_LABEL]
 
 
 def test_no_jira_block_still_renders_a_usable_link(tmp_path):
