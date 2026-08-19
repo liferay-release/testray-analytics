@@ -653,9 +653,31 @@ def main() -> None:
     # persisted, and losing the run row costs the build-index diamond and the
     # report header, not data.
     try:
+        # Per-verdict cluster counts, computed the same way the report's
+        # headline does — one clusterKey per root cause, ranked by its worst
+        # member — so the CX can lead with the same number instead of a row
+        # count that reads several times larger.
+        cluster_verdicts: dict[str, int] = {}
+        if len(df):
+            from . import error_signature as _es
+            worst: dict[str, str] = {}
+            order = ["BUG", "POSSIBLE_BUG", "NEEDS_REVIEW", "TEST_FIX",
+                     "FALSE_POSITIVE", "ENV_FAILURE", "DID_NOT_RUN"]
+            rank = {v: i for i, v in enumerate(order)}
+            for _, r in df.iterrows():
+                key = _es.cluster_key(r.get("culprit_file"), r.get("test_case"),
+                                      r.get("error_message"))
+                v = str(r.get("classification") or "")
+                if key not in worst or rank.get(v, 99) < rank.get(worst[key], 99):
+                    worst[key] = v
+            for v in worst.values():
+                if v:
+                    cluster_verdicts[v] = cluster_verdicts.get(v, 0) + 1
+
         run_payload = build_triage_run(
             meta, df, classifier=payload["classifier"],
             n_written=n_ok, n_excluded=n_excluded,
+            cluster_verdicts=cluster_verdicts,
         )
         write_triage_run(run_payload, cfg)
         print(f"  TriageRun {run_payload['externalReferenceCode']} upserted "

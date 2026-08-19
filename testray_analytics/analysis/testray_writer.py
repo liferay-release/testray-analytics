@@ -83,6 +83,17 @@ def _clean(val):
     return s or None
 
 
+def _int_or_none(val):
+    """Integer or None. pandas hands back numpy types and NaN; Liferay wants a
+    plain int, and a NaN would serialise to null-ish nonsense."""
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return None
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return None
+
+
 def _picklist(val):
     """Wrap a picklist value as Testray expects it, or None to omit the field."""
     v = _clean(val)
@@ -173,7 +184,18 @@ def build_batch(df: pd.DataFrame, meta: dict, classifier: str) -> list[dict]:
                                   row.get("culprit_file"),
                                   row.get("test_case"),
                                   row.get("error_message")),
-            # suspiciousCommits (§9): not computed yet.
+            # The ticket + commit that touched the culprit file, attached by
+            # submit's annotate_culprit_commits(). The file says WHERE, this
+            # says who changed it and why — the difference between a lead and a
+            # chore. This is what `suspiciousCommits` was reserved for in §9.
+            "suspiciousCommits": _clean(row.get("culprit_commits")),
+            # Fields the CX cannot derive from Testray on its own. Without them
+            # the in-product view can render a verdict but not the evidence
+            # around it: how novel the failure is, whether it is a fresh
+            # regression or a changed one, and what the baseline did.
+            "baselineSignatureCount": _int_or_none(row.get("baseline_signature_count")),
+            "transition":             _clean(row.get("transition")),
+            "statusA":                _clean(row.get("status_a")),
         }
         # Link to the target build's CaseResult when prepare captured its id;
         # otherwise write unlinked.
@@ -235,7 +257,8 @@ def _run_erc_path(erc: str) -> str:
 
 def build_triage_run(meta: dict, df: pd.DataFrame, *, classifier: str,
                      n_written: int, n_excluded: int,
-                     n_clusters: int | None = None) -> dict:
+                     n_clusters: int | None = None,
+                     cluster_verdicts: dict | None = None) -> dict:
     """The TriageRun row for a finished run (ARCHITECTURE.md §9).
 
     `TriageResult` answers *what the verdict was*; this answers *whether a run
@@ -272,7 +295,26 @@ def build_triage_run(meta: dict, df: pd.DataFrame, *, classifier: str,
         "totalClassified":       int(len(df)),
         "totalWritten":          int(n_written),
         "totalExcluded":         int(n_excluded),
+        # Row counts. Kept for continuity, but they are NOT the headline unit:
+        # see verdictClusterCounts below.
         "verdictCounts":         json.dumps(counts, sort_keys=True),
+        # Per-verdict CLUSTER counts. "6 possible bugs" was three defects each
+        # counted twice; a consumer given only row counts cannot recover the
+        # cluster figure, so the report's headline could not be reproduced in
+        # the CX. Stored so both renderers can lead with the same number.
+        "verdictClusterCounts":  (json.dumps(cluster_verdicts, sort_keys=True)
+                                  if cluster_verdicts else None),
+        # Run-level context the CX has no other way to reach: how many tests the
+        # build actually ran (so 557 is not misread as the whole build), the
+        # excluded transition buckets, and the A x B status matrix.
+        "targetRows":            _int_or_none(meta.get("target_rows")),
+        "baselineRows":          _int_or_none(meta.get("baseline_rows")),
+        "transitionCounts":      (json.dumps(meta.get("transition_counts"),
+                                            sort_keys=True)
+                                  if meta.get("transition_counts") else None),
+        "statusMatrix":          (json.dumps(meta.get("status_matrix"),
+                                            sort_keys=True)
+                                  if meta.get("status_matrix") else None),
         # NOTE: the classification granularity (§7 — by-cluster / per-test) is
         # a different axis from analysisMode (§8) and TriageRun has no field
         # for it, so it exists only in the local run.yml. A run's granularity
