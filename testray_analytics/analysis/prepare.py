@@ -271,6 +271,21 @@ def _testray_oauth_token(cfg: dict) -> str:
     )
 
 
+def fetch_paginated(endpoint: str, params: dict, token: str, base_url: str,
+                    **kwargs) -> list[dict]:
+    """Public alias for the paginator. USE THIS from scripts and notebooks.
+
+    It forces `sort=id:asc`, and that is not optional: without an explicit sort
+    the server pages inconsistently and silently returns some rows twice while
+    skipping others. A hand-rolled pull of two builds returned 17,497 rows
+    containing only 11,496 distinct ids and produced a confident, wrong
+    conclusion. Row counts look right while the contents are wrong, which is
+    the worst failure shape available — so the helper is exported rather than
+    left for each new consumer to rediscover.
+    """
+    return _testray_fetch_paginated(endpoint, params, token, base_url, **kwargs)
+
+
 def _testray_fetch_paginated(
     endpoint: str, params: dict, token: str, base_url: str,
     page_size: int = 500, sleep_between: float = 0.3,
@@ -860,6 +875,49 @@ def classify_transition(status_a, status_b, error_a, error_b) -> str:
     if a == "UNTESTED" and b in _FAILING:
         return TRANSITION_NO_BASELINE
     return TRANSITION_OTHER
+
+
+def baseline_signature_prevalence(baseline: pd.DataFrame) -> dict[str, int]:
+    """How often each normalized error signature already occurs among the
+    BASELINE build's own failures.
+
+    The pipeline judges a case on its own status pair and never asks whether
+    the error it now shows is one the baseline was already producing dozens of
+    times on other tests. That question is what separates a new failure mode
+    from standing suite noise, and — unlike the transition label — it works
+    identically on `new` and `changed` rows.
+
+    Counts every non-passing baseline row, not just the ones that joined: a
+    signature's prevalence is a property of the build, not of the triage set.
+    """
+    if baseline is None or baseline.empty or "errors" not in baseline.columns:
+        return {}
+    status = baseline.get("status")
+    counts: dict[str, int] = {}
+    for i, err in enumerate(baseline["errors"]):
+        if status is not None:
+            st = str(status.iloc[i] or "").upper()
+            if st in ("PASSED", ""):
+                continue
+        sig = error_signature.normalize(err)
+        if sig:
+            counts[sig] = counts.get(sig, 0) + 1
+    return counts
+
+
+def attach_baseline_prevalence(df: pd.DataFrame, prevalence: dict[str, int]
+                               ) -> pd.DataFrame:
+    """Add `baseline_signature_count` — 0 means the baseline never produced
+    this error, which is the strongest single signal that it is genuinely new.
+    """
+    if df is None or df.empty:
+        return df
+    df = df.copy()
+    df["baseline_signature_count"] = [
+        prevalence.get(error_signature.normalize(e), 0)
+        for e in df.get("error_message", [""] * len(df))
+    ]
+    return df
 
 
 def compute_test_diff(baseline: pd.DataFrame, target: pd.DataFrame,
@@ -2406,6 +2464,8 @@ def _finalize_bundle(
         diff_list_cols.append("caseresult_id")
     if "subtask_id" in df.columns:
         diff_list_cols.append("subtask_id")
+    if "baseline_signature_count" in df.columns:
+        diff_list_cols.append("baseline_signature_count")
     df[diff_list_cols].to_csv(run_dir / "diff_list.csv", index=False)
 
     print(f"→ Step 6/6 prompt + schema + run.yml …")
@@ -2549,6 +2609,18 @@ def prepare(baseline: SideSpec, target: SideSpec, classifier: str,
     # Testray case object so the fragment matcher has something to anchor on
     # (and so prompt.md doesn't say `### N. \`\`` with no test name).
     df = enrich_api_case_names(df, cfg["testray"])
+
+    # How often each failure's error signature already occurred in the BASELINE
+    # build. 0 = the baseline never produced this error. Reuses the case
+    # results already fetched above, so this costs no extra I/O.
+    prevalence = baseline_signature_prevalence(baseline_df)
+    df = attach_baseline_prevalence(df, prevalence)
+    if prevalence:
+        novel = int((df["baseline_signature_count"] == 0).sum())
+        chronic = int((df["baseline_signature_count"] >= 5).sum())
+        print(f"   baseline signatures: {len(prevalence)} distinct across its own "
+              f"failures — {novel}/{len(df)} triage rows are novel, "
+              f"{chronic} already chronic (5+ occurrences)")
 
     # Resolve component/team from the FKs the diff carried through. Must run
     # BEFORE enrich_and_pre_classify, which renames testray_component_name to

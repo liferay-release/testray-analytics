@@ -48,8 +48,25 @@ from .jira_settings import DEFAULT_LABEL, resolve_jira_settings
 # _rollup() and the default ordering, so this list IS the report's opinion
 # about what deserves attention first.
 _VERDICT_ORDER = ["BUG", "POSSIBLE_BUG", "NEEDS_REVIEW", "TEST_FIX",
+                  "NOT_ATTRIBUTABLE",
                   "FALSE_POSITIVE", "ENV_FAILURE", "DID_NOT_RUN",
                   "AUTO_CLASSIFIED", "PENDING"]
+
+# NOT_ATTRIBUTABLE is a DISPLAY label, never a stored verdict. A low-confidence
+# NEEDS_REVIEW is the classifier saying "I could not attribute this", not "a
+# human must review 153 failures" — and reporting the latter to a dev team
+# misrepresents what was actually said. The stored classification stays
+# NEEDS_REVIEW, so nothing in §4, the picklist, the writer or the rubric moves.
+_UNATTRIBUTED_FROM = "NEEDS_REVIEW"
+_UNATTRIBUTED_AT = {"low", ""}
+
+
+def display_verdict(classification, confidence) -> str:
+    """The label to SHOW for a row. See _UNATTRIBUTED_FROM above."""
+    cls = _text(classification)
+    if cls == _UNATTRIBUTED_FROM and _text(confidence).lower() in _UNATTRIBUTED_AT:
+        return "NOT_ATTRIBUTABLE"
+    return cls
 
 # CSS class per verdict. Several non-actionable buckets share `auto` because
 # they are all "the pipeline decided this without reasoning about it".
@@ -58,6 +75,7 @@ _VERDICT_CLASS = {
     "POSSIBLE_BUG": "pbug",
     "TEST_FIX": "testfix",
     "NEEDS_REVIEW": "needs",
+    "NOT_ATTRIBUTABLE": "unattr",
     "FALSE_POSITIVE": "fp",
     "ENV_FAILURE": "auto",
     "DID_NOT_RUN": "auto",
@@ -187,6 +205,9 @@ _CSS = """
     display: inline-flex; align-items: baseline; gap: 6px; font-size: 13px;
   }
   .totals .pill .n { font-weight: 700; font-size: 16px; }
+  /* The fan-out: how many case rows the clusters cover. Secondary on purpose
+     — clusters are the unit of work, cases are the blast radius. */
+  .totals .pill .fanout { color: var(--c-muted); font-size: 11.5px; }
   .totals a.pill { text-decoration: none; color: inherit; cursor: pointer; }
   .totals a.pill:hover { text-decoration: underline; }
   .verdict {
@@ -196,6 +217,8 @@ _CSS = """
   .verdict.bug { background: var(--c-bug); }
   .verdict.pbug { background: var(--c-pbug); }
   .verdict.needs { background: var(--c-needs); }
+  /* Deliberately muted: it is the absence of a finding, not a finding. */
+  .verdict.unattr { background: #8895a4; }
   .verdict.testfix { background: var(--c-testfix); }
   .verdict.fp { background: var(--c-fp); }
   .verdict.auto { background: var(--c-auto); }
@@ -300,6 +323,11 @@ _CSS += """
      mid-word — overrides the global overflow-wrap:anywhere. */
   td.col-status { word-break: normal; overflow-wrap: normal; }
   td.col-status .status > span { white-space: nowrap; }
+  th.col-baseline, td.col-baseline { width: 78px; text-align: center; }
+  td.col-baseline { font-weight: 700; font-size: 12px; }
+  td.col-baseline.novel   { color: var(--c-bug); }
+  td.col-baseline.rare    { color: #b9770e; }
+  td.col-baseline.chronic { color: var(--c-muted); font-weight: 400; }
   th.col-verdict { width: 130px; }
   th.col-confidence, td.col-confidence { width: 90px; text-align: center; }
   th.col-culprit, td.col-culprit { min-width: 220px; }
@@ -803,9 +831,9 @@ def _groups(df: pd.DataFrame, ckeys: list[str]) -> dict:
         "cluster":   list(ckeys),
         "component": [_text(v) or "(no component)" for v in df.get("component_name", [])],
         "team":      [_text(v) or "(no team)" for v in df.get("team_name", [])],
-        "verdict":   [_text(v) or "(unclassified)" for v in df.get("classification", [])],
+        "verdict":   [_text(v) or "(unclassified)" for v in df.get("display_verdict", [])],
     }
-    verdicts = list(df.get("classification", []))
+    verdicts = list(df.get("display_verdict", []))
 
     out = {}
     for mode, _label in _GROUP_MODES:
@@ -824,7 +852,7 @@ def _groups(df: pd.DataFrame, ckeys: list[str]) -> dict:
 def _header_row(mode: str, idx: int, label: str, members: pd.DataFrame,
                 cluster_no: int | None, meta: dict) -> str:
     """A cluster header, on the same column grid as its members."""
-    verdict = _rollup(members.get("classification", []))
+    verdict = _rollup(members.get("display_verdict", []))
     css = _vclass(verdict)
 
     confs = [c for c in (_text(x).lower() for x in members.get("confidence", [])) if c]
@@ -872,7 +900,10 @@ def _header_row(mode: str, idx: int, label: str, members: pd.DataFrame,
         + _rollup_cell(members.get("team_name", []), "col-team")
         + _rollup_cell(members.get("component_name", []), "col-comp")
         + '<td class="col-status cluster-cell"></td>'
-        f'<td class="col-verdict cluster-cell"{_verdict_rank_attr(verdict)}>{_verdict_span(verdict)}</td>'
+        + _novelty_cell(
+            min((c for c in members.get("baseline_signature_count", [])
+                 if pd.notna(c)), default=None))
+        + f'<td class="col-verdict cluster-cell"{_verdict_rank_attr(verdict)}>{_verdict_span(verdict)}</td>'
         f'<td class="col-confidence cluster-cell"{_conf_rank_attr(top)}'
         + (f' title="Highest confidence in this group. Breakdown: {_esc(breakdown)}"' if breakdown else "")
         + f">{_conf_span(top)}</td>"
@@ -898,7 +929,7 @@ def _member_rows(df: pd.DataFrame, meta: dict, cluster_no: dict[str, int],
     """
     parts = []
     for i, (_, r) in enumerate(df.iterrows()):
-        verdict = _text(r.get("classification"))
+        verdict = _text(r.get("display_verdict")) or _text(r.get("classification"))
         css = _vclass(verdict)
         rid = f"row-{i}"
         ckey = ckeys[i]
@@ -942,7 +973,7 @@ def _member_rows(df: pd.DataFrame, meta: dict, cluster_no: dict[str, int],
         # on every member is the noise that made the flat table unreadable.
         # When a cluster IS mixed, the per-row value is the whole point, so it
         # stays.
-        if cno is not None and _shared_in_cluster(shared, ckey, "classification", verdict):
+        if cno is not None and _shared_in_cluster(shared, ckey, "display_verdict", verdict):
             verdict_cell = _collapsible(_verdict_span(verdict), verdict)
         else:
             verdict_cell = _verdict_span(verdict)
@@ -970,6 +1001,8 @@ def _member_rows(df: pd.DataFrame, meta: dict, cluster_no: dict[str, int],
             f'<td class="col-team">{_esc(_text(r.get("team_name"))) or "—"}</td>'
             f'<td class="col-comp">{_esc(_text(r.get("component_name"))) or "—"}</td>'
             f'<td class="col-status">{_status_span(r.get("status_a"), r.get("status_b"))}</td>'
+            + _novelty_cell(r.get("baseline_signature_count"))
+            + 
             f'<td class="col-verdict"{_verdict_rank_attr(verdict)}>{verdict_cell}</td>'
             f'<td class="col-confidence"{_conf_rank_attr(conf)}>{conf_cell}</td>'
             f'<td class="col-culprit">{culprit_cell}</td>'
@@ -1076,7 +1109,7 @@ def _cluster_index(df: pd.DataFrame) -> tuple[list[str], dict]:
     for _, r in df.iterrows():
         ck = _cluster_of(r)
         keys.append(ck)
-        for col in ("reason", "culprit_file", "classification", "confidence"):
+        for col in ("reason", "culprit_file", "display_verdict", "confidence"):
             shared.setdefault((ck, col), set()).add(_text(r.get(col)))
     return keys, shared
 
@@ -1140,7 +1173,7 @@ def _detail_row(r, rid: str, css: str, ckey: str, meta: dict) -> str:
             add(label, f"<code>{_esc(v)}</code>")
 
     return (f'<tr class="case-detail {css}" id="detail-{rid}" hidden>'
-            f'<td colspan="10"><div class="case-detail-inner"><dl>'
+            f'<td colspan="11"><div class="case-detail-inner"><dl>'
             + "".join(items)
             + "</dl></div></td></tr>")
 
@@ -1209,17 +1242,74 @@ def _worse(a: str, b: str) -> bool:
     return a == "PASSED" and b != "PASSED"
 
 
-def _totals(df: pd.DataFrame, n_clusters: int, meta: dict) -> str:
-    counts = (df["classification"].value_counts().to_dict()
-              if len(df) and "classification" in df else {})
+
+# R2: signature novelty. Confidence cannot rank this data — the run split
+# 140 low / 13 medium / 0 high — so a reader falls back to the transition
+# label, which invites a cut that looks obvious and destroys real defects.
+# Novelty is uniform across `new` and `changed`, and it is the honest key.
+_NOVELTY = [(0, 0, "novel", "Never seen in the baseline"),
+            (1, 4, "rare", "Rare in the baseline (1-4)"),
+            (5, 10 ** 9, "chronic", "Already chronic in the baseline (5+)")]
+
+
+def _novelty_bucket(count) -> tuple[str, str]:
+    try:
+        n = int(count)
+    except (TypeError, ValueError):
+        return "", ""
+    for lo, hi, key, label in _NOVELTY:
+        if lo <= n <= hi:
+            return key, label
+    return "", ""
+
+
+def _novelty_cell(count) -> str:
+    key, label = _novelty_bucket(count)
+    if not key:
+        return '<td class="col-baseline"></td>'
+    n = int(count)
+    return (f'<td class="col-baseline {key}" data-sort="{n:07d}" '
+            f'title="{_esc(label)}">{n}</td>')
+
+
+def _totals(df: pd.DataFrame, n_clusters: int, meta: dict,
+            cluster_groups: list | None = None) -> str:
+    """Headline counts, led by CLUSTERS with case rows as fan-out.
+
+    The tool has already clustered, so the case count is the wrong headline
+    unit: "6 possible bugs" was three defects each counted twice, and "153 need
+    review" was 100 clusters, one of which held 23 cases. Leading with rows
+    makes a tractable morning read like a crisis. Clusters are the unit a human
+    actually works through; the fan-out says how much of the suite each one
+    covers.
+    """
+    rows = (df["display_verdict"].value_counts().to_dict()
+            if len(df) and "display_verdict" in df else {})
+
+    # A cluster's verdict is its worst member's — the same rollup the cluster
+    # header shows, so the pill and the table cannot disagree.
+    clusters: dict[str, int] = {}
+    for _label, positions in (cluster_groups or []):
+        v = _rollup(df.iloc[positions].get("display_verdict", []))
+        if v:
+            clusters[v] = clusters.get(v, 0) + 1
+
     pills = []
     for verdict in _VERDICT_ORDER:
-        if verdict not in counts:
+        if verdict not in rows and verdict not in clusters:
             continue
+        n_cl = clusters.get(verdict, 0)
+        n_rows = rows.get(verdict, 0)
+        # Only show the fan-out when it actually differs — "3 (3 tests)" is
+        # noise, "3 (6 tests)" is the point.
+        fan = (f'<span class="fanout">{n_rows} tests</span>'
+               if n_rows and n_rows != n_cl else "")
         pills.append(
             f'<a class="pill" href="#" data-pill-for="{_esc(verdict)}" '
-            f'title="Filter to {_esc(verdict)}">{_verdict_span(verdict)}'
-            f'<span class="n" data-pill-verdict="{_esc(verdict)}">{counts[verdict]}</span></a>'
+            f'title="{n_cl} cluster(s), {n_rows} case row(s) — click to filter">'
+            f'{_verdict_span(verdict)}'
+            f'<span class="n" data-pill-verdict="{_esc(verdict)}">{n_cl or n_rows}</span>'
+            f'{fan}</a>'
         )
     # "Total tests: 557" invited the reading that the build ran 557 tests. It
     # ran ~17.5k; 557 is the TRIAGE set. Say which, and show the denominator.
@@ -1249,7 +1339,7 @@ def _select(el_id: str, label: str, values) -> str:
 def _banners(df: pd.DataFrame, meta: dict) -> str:
     out = []
 
-    verdicts = {_text(v) for v in df.get("classification", [])} if len(df) else set()
+    verdicts = {_text(v) for v in df.get("display_verdict", [])} if len(df) else set()
     if len(df) and verdicts <= {"", "PENDING"}:
         # Absence of BUG is not evidence of no bug. Say so loudly rather than
         # letting an unclassified run read as a clean one.
@@ -1283,6 +1373,15 @@ def render_run(run_dir, df: pd.DataFrame, meta: dict) -> Path:
         df = pd.DataFrame()
     df = df.reset_index(drop=True)
 
+    # One derived column so the pills, the filter, the cluster rollups, the
+    # sort rank and the row cells cannot disagree about what a row is called.
+    if len(df):
+        df = df.copy()
+        df["display_verdict"] = [
+            display_verdict(c, f)
+            for c, f in zip(df.get("classification", [""] * len(df)),
+                            df.get("confidence", [""] * len(df)))
+        ]
     ckeys, shared = _cluster_index(df)
     groups = _groups(df, ckeys)
     cluster_groups = groups.get("cluster", [])
@@ -1301,7 +1400,7 @@ def render_run(run_dir, df: pd.DataFrame, meta: dict) -> Path:
         order[mode] = entries
 
     body = (_member_rows(df, meta, cluster_no, ckeys, shared)
-            if len(df) else '<tr><td colspan="10">No rows.</td></tr>')
+            if len(df) else '<tr><td colspan="11">No rows.</td></tr>')
 
     a_url, b_url = _build_url(meta, meta.get("build_id_a")), _build_url(meta, meta.get("build_id_b"))
     a_name = _text(meta.get("build_a_name")) or _text(meta.get("build_id_a")) or "baseline"
@@ -1338,7 +1437,7 @@ def render_run(run_dir, df: pd.DataFrame, meta: dict) -> Path:
 
   <div class="headline">
    <div class="controls">
-    {_totals(df, len(cluster_groups), meta)}
+    {_totals(df, len(cluster_groups), meta, cluster_groups)}
   <div class="viewbar">
     <span class="viewbar-group">
       <label class="viewbar-label" for="group-by">Group by:</label>
@@ -1353,7 +1452,7 @@ def render_run(run_dir, df: pd.DataFrame, meta: dict) -> Path:
     <div class="filters-row">
       {_select("team-filter", "Team", df.get("team_name", []))}
       {_select("component-filter", "Component", df.get("component_name", []))}
-      {_select("verdict-filter", "Verdict", df.get("classification", []))}
+      {_select("verdict-filter", "Verdict", df.get("display_verdict", []))}
       {_select("confidence-filter", "Confidence",
                [_text(c).lower() for c in df.get("confidence", [])])}
       {_select("transition-filter", "Transition", df.get("transition", []))}
@@ -1382,6 +1481,7 @@ def render_run(run_dir, df: pd.DataFrame, meta: dict) -> Path:
 <th class="col-team">Team</th>
 <th class="col-comp">Component</th>
 <th class="col-status">Status</th>
+<th class="col-baseline" title="How many times this error signature already occurred among the BASELINE build\'s own failures. 0 = genuinely new failure mode.">Baseline</th>
 <th class="col-verdict">Verdict</th>
 <th class="col-confidence" title="Classifier confidence: high / medium / low / auto.">Confidence</th>
 <th class="col-culprit">Culprit file</th>

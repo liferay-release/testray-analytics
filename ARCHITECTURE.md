@@ -857,6 +857,102 @@ Two script consequences:
   failing with X, now Y") — the reasoning is about the delta — and the rubric gets a
   note that the "baseline was clean" assumption does not hold for these rows.
 
+### Baseline signature prevalence — the strongest cheap filter
+
+Added 2026-08-18. Every triage row carries **`baseline_signature_count`**: how
+many times its normalized error signature already occurred among the *baseline
+build's own failures*. Computed in `prepare` by
+`baseline_signature_prevalence()` over the case results already fetched, so it
+costs no extra I/O, and persisted to `diff_list.csv`.
+
+The pipeline previously judged a case purely on its own status pair and never
+asked whether the error it now shows is one the baseline was already producing
+dozens of times on other tests. That question is what separates a new failure
+mode from standing suite noise.
+
+**Measured on the 2026.q1.11 → q1.12-lts pair (349 classifiable rows):**
+
+| baseline occurrences | rows | disposition |
+|---|---|---|
+| 0 — never seen | 130 | review |
+| 1–4 — rare | 33 | deprioritise |
+| 5+ — already chronic | **186** | drop |
+
+53% of the classify workload was failing in a way the baseline already produced
+at least five times; the worst signature occurred **819** times. It also sharpens
+the top of the report: of three `POSSIBLE_BUG` clusters on that run, two were
+novel and one had six prior baseline occurrences — a materially weaker
+regression candidate, and nothing in the report could say so before.
+
+Unlike the transition label, this signal behaves **identically on `new` and
+`changed` rows**, which is what makes it safe to rank and filter on.
+
+**Not yet used to exclude rows pre-classification.** Doing so would cut the
+classify workload roughly in half, on the same mechanism as the CI-batch
+exclusion (§7), but it is a bigger judgement — a chronic signature can still
+hide a new cause — so today it only informs ranking.
+
+### Never filter on the transition label
+
+`changed` (FAILED → FAILED, signature differs) looks like the obvious thing to
+drop: a test already failing in the baseline cannot be a regression from this
+range. **That reasoning is wrong and it destroys real defects.** A test can be
+broken for one reason before and a *different* reason after; the second reason
+is this range's regression wearing a pre-existing failure as camouflage. On the
+q1.12 run, dropping all 48 `changed` rows produced a 37% undercount, and 27 of
+them were failing in a way the baseline never managed.
+
+Concretely: `AutoTranslationAzure#CanTranslateWCFieldIndependently` failed in
+both builds — a wording nit in q1.11, the feature not translating at all in
+q1.12. Same transition label, entirely different severity.
+
+Transition earns its place **on** the report — a `changed` row is unreadable
+without its baseline error printed beside its target error — but it must never
+sort the list and must never remove rows from it. Rank on
+`baseline_signature_count` instead. This is decision #13 restated: surfacing
+only PASSED→FAILED silently undercounts whenever the baseline already had
+failures, which on a real acceptance build is most of the time.
+
+### View contract — rules both renderers must obey
+
+`report.py` and the CX view (`liferay-testray-analytics-custom-element`) render
+the same data and have already drifted apart once. These are the decisions that
+are **not** obvious from reading either implementation, and each one exists
+because the naive version was tried and was wrong.
+
+1. **Lead with clusters; cases are fan-out.** The tool has already clustered, so
+   the case count is the wrong headline unit. "6 possible bugs" was three
+   defects each counted twice; "153 need review" was 100 clusters, one holding
+   23 cases. `3 defects, 11 to review` is a tractable morning; `6 bugs, 153 to
+   review` reads like a crisis and gets the report ignored.
+2. **`NOT_ATTRIBUTABLE` is a display label, never a stored verdict.** A
+   `NEEDS_REVIEW` at `low` confidence is the classifier saying "I could not
+   attribute this", not "a human must review this". Rendering it as a review
+   queue misrepresents what was said. The stored classification stays
+   `NEEDS_REVIEW`, so §4, the picklist, the writer and the rubric are untouched.
+3. **Severity order is** BUG → POSSIBLE_BUG → NEEDS_REVIEW → TEST_FIX →
+   NOT_ATTRIBUTABLE → FALSE_POSITIVE → ENV_FAILURE → DID_NOT_RUN. Verdict and
+   confidence are **ordinal**: they must sort by rank, not alphabetically, or
+   `DID_NOT_RUN` sorts above `BUG`. `report.py` does this with a `data-sort`
+   attribute the generic sorter prefers over cell text.
+4. **Collapsed by default.** The cluster list is the overview; expanding every
+   member on load buries it under hundreds of rows.
+5. **Collapsing a repeated cell is MODE-dependent, not row-dependent.** A member
+   may show "↑" instead of its reasoning only while the visible group *is* its
+   cluster. Under group-by team/component/verdict the header reports "N distinct
+   reasons" and the arrow would point at a cluster that is not on screen. The
+   obvious implementation — decide at render time — is the broken one; the cell
+   must carry both forms and let the active mode choose.
+6. **Sorting reorders clusters, not just members within them.** Sorting only
+   within clusters leaves the cluster order fixed, so clicking a header appears
+   to do nothing.
+7. **A culprit file alone is not actionable.** Show the ticket and commit that
+   touched it (`submit` attaches `culprit_commits`); the file says *where*, the
+   ticket says *who changed it and why*.
+8. **Say what a number is out of.** "Total tests: 557" read as tests run; the
+   build ran 17,537. The header states tests-in-build, failures-triaged and
+   clusters, and the A×B status matrix carries the rest.
+
 ### Override capture (LPD-95851)
 
 Users validate/correct the AI verdict. The old static `report.html` had no way to do
