@@ -395,6 +395,43 @@ we do not set it.
 | **Release / EE Pkg** (e.g. 82964) | last **promoted** build | promotion | usually origin, **sometimes off-origin** (release temp/mitigation fixes) → fetch source | yes |
 | **Heavy-dev / PR** | reference build | user-driven | fork/temp → **off-origin common** → fetch source | yes |
 
+**A build pair is only comparable if the two ran the same case set.** The diff
+joins on case id, so suite re-selection between two builds silently shrinks it
+to the intersection — the run still succeeds and still reports verdicts, just
+about far fewer tests than the build ran. Measured across 2024 Q1's four builds:
+q1.28 and q1.29 share 5,301 case ids (100%), Q1.30 and its retest share 3,274
+(100%), and **any pair spanning those two groups shares 54 (1.6%)**. So pick
+within a generation: consecutive builds of one routine usually share their whole
+case set, and a build and its retest always do. Note that a build against its
+own retest is a *flakiness* comparison, not a regression one — same code on both
+sides. §12 rule 10 is what makes a bad pair visible in the report instead of
+silently producing a tiny, confident-looking verdict list.
+
+**PR builds: the fetch source is derived from the build name.** A pull-request
+build's commit lives on a fork, so origin does not have it and `git diff` fails
+with "NOT in this checkout" — the off-origin case below, and the first thing a
+real queued PR run hit. Nothing on the `Build` object references the pull
+request: `description` carries only a Jenkins report link and
+`Portal Branch/SHA`, and there is no GitHub field anywhere. The **name** is the
+only source, and it is structured:
+
+    [master] ci:test:object - shuyangzhou > shuyangzhou - PR#12591 - 2026-08-19[11:47:41]
+    [branch]  job          - sender      > receiver    - PR#<n>    - timestamp
+
+`prepare.pr_fetch_spec()` parses that and fetches `pull/<n>/head` from
+`git@github.com:<receiver>/liferay-portal.git`. **The receiver, not the sender** —
+`pull/<n>/head` is a ref on the repo the PR was opened *against*. Every PR build
+observed so far has sender == receiver, so that distinction is untested by the
+data and is pinned by a test instead. The repo is always `liferay-portal`; the
+owner is the only variable, and `git.pr_remote_template` overrides the whole
+remote.
+
+This is derived rather than asked for so a UI-triggered PR run needs no extra
+input, but an explicit `--fetch-ref` always wins — it is a deliberate override.
+The fetch is `--no-tags` and creates no branch and no checkout: the commit only
+has to be reachable for `git diff`, and the working tree the user is sitting in
+must not move.
+
 **Off-origin handling follows from the type.** Origin-only routines run fully
 automated (no fetch source needed). The types that *can* be off-origin (Release edge
 cases, Heavy-dev/PR) are exactly the ones where a fetch source is supplied — by a
@@ -453,6 +490,118 @@ land on the same route — `triage/:baselineBuildId/:targetBuildId` — so an au
 run and a manual one are the same object and the same view, differing only in who
 supplied the build IDs.
 
+**The Triage index is the landing page.** The sidebar item links to the view
+with no build id, which used to render "No build selected" — a dead end, since
+the only other way in was the build-list diamond, and the only way to reach a
+report directly was to already know a build id. With no parameters the view now
+lists every run instead: project and routine selects, then one row per triaged
+build carrying the verdict columns.
+
+Those columns mirror the build list's Passed/Failed/Blocked metrics, and like
+the report they are **cluster** counts with row counts as fan-out — same reason,
+and the reason the counts had to move to display labels (§12). The whole page is
+one paginated `/o/c/triageruns` query plus three id-batched name lookups: every
+number on it is already stored on the run row, so there is deliberately no
+per-run fetch of `TriageResult`. That would be an N+1 growing with every run ever
+recorded, to recompute figures we already have.
+
+The report carries a **breadcrumb**, not a single back link: `Triage / <routine>
+/ <build>`. There are two ways in — the index and the build-list diamond — and
+one "back" cannot serve both. Deriving it from a `from=` parameter breaks the
+moment someone shares or bookmarks the URL.
+
+**Selection happens in the build list's right-click menu.** Settled 2026-08-20,
+replacing an earlier dropdown-based picker on the index page. `useBuildActions`
+already offers **Select Build A** / **Select Build B** for autofill and
+compare-runs, so triage adds **Select Triage Baseline** / **Select Triage
+Target** to the same menu with the same toast. It is the same kind of decision,
+so it should not need a second interaction to learn — and it puts the choice on
+the build list, where the builds actually are.
+
+The pair then drives the Triage column: the chosen baseline shows a `BASELINE`
+chip, the chosen target shows **Run Triage**, and clicking that queues the run.
+Three distinct states, because a chosen baseline has nothing to act on and a
+chosen target with no baseline is an incomplete pair — offering the button on
+either would queue a run against an undefined baseline.
+
+The selection lives in **its own localStorage-backed store**
+(`useTriageSelection`), not in `TestrayContext`. Autofill and compare-runs live
+in that context because they *are* Testray features; triage is ours, so keeping
+it out preserves the "no triage logic in Testray core" boundary above. It is
+persisted rather than in-memory because the two halves are separate interactions
+— pick a baseline, page, maybe reload, pick a target — and an in-memory pair
+empties under any of that.
+
+**The queue contract.** *Run Triage* writes one `TriageRun` and nothing more:
+`triageRunStatus: QUEUED`, `analysisMode`, and the three FKs (target build,
+baseline build, routine). Everything else on the row — counts, clusters, the
+status matrix — is filled in by the pipeline. So the row is a *request*, not a
+result. Its ERC is derived from the pair (`queued-<baseline>-<target>`) rather
+than random, so double-clicking upserts the same row instead of queueing the
+work twice.
+
+What consumes it: **`testray-analysis watch`** (`runner.py`), added 2026-08-20.
+It polls for QUEUED rows, claims one by setting it RUNNING, and runs
+**`scripts/triage_pipeline.sh`** — which is the single definition of the
+pipeline sequence. Jenkins runs that same script, a human can run it by hand,
+and the runner runs it; none of them re-implement the order of steps or where
+the logs land.
+
+The script is modelled on liferay-docker's release scripts (`lc_time_run`):
+every step's output goes to its own numbered file,
+`logs/log_<ts>_step_<n>_<name>.txt`, and the console gets one line per step with
+its timing. Interleaved stdout from three long-running Python processes is not
+legible in a Jenkins console; this is. On failure it prints the failing step's
+last 20 lines *and* the log path, so an operator does not have to go fetch a
+file to see the cause. Exit codes: 0 ok, 1 usage, 2 a step failed.
+
+It echoes `BUNDLE=<absolute path>` on stdout after prepare. That is a deliberate
+contract, not a side effect: the runner reads it to learn what it just built,
+which is why prepare's own "Run bundle ready" line does not need scraping out of
+a log file.
+
+    testray-analysis watch                # prepare only, then hand over
+    testray-analysis watch --classify     # prepare -> classify -> submit
+    testray-analysis watch --once         # drain what is queued now, then exit
+
+**`--classify` is opt-in, and that is the point.** Classification is the step
+that costs minutes and real model usage, and a click in a browser is a very
+small gesture to attach that to silently. Without the flag the runner does the
+slow-but-free part — REST reads, the git diff, hunk filtering — and prints the
+two commands that finish the job.
+
+State transitions, which exist so the build-list diamond never lies:
+
+| From | Event | To |
+|---|---|---|
+| QUEUED | runner claims it | RUNNING |
+| RUNNING | pipeline succeeds | *row deleted* — `submit` wrote the real one |
+| RUNNING | pipeline throws | FAILED + `errorMessage` |
+| QUEUED | user clicks Abort | ABORTED |
+
+The queued row is **deleted** on success rather than completed, because `submit`
+writes its own row keyed by the *bundle* id. Leaving both would give one build
+two runs, with the column free to show either.
+
+**Abort applies to QUEUED only.** Once the runner has claimed a row it owns that
+row's state, so offering abort on RUNNING would promise a cancellation nothing
+can deliver. An aborted run is set to ABORTED rather than deleted — someone
+asked and someone changed their mind, and a deleted row is indistinguishable
+from never having clicked. It renders as a **grey** diamond, deliberately
+outside the traffic-light set: a withdrawn request is not a failure to
+investigate.
+
+> **An unknown picklist key fails the write; an unknown *field* is silently
+> dropped.** These are opposite behaviours and it matters which one you are
+> relying on. Writing a field the Object does not have returns 200 and drops it,
+> which is what lets the writer run ahead of the schema (§9). Writing
+> `triageRunStatus: {key: "ABORTED"}` before that entry exists returns
+> `400 ... "Object field name \"triageRunStatus\" is not mapped to a valid list
+> type entry"`. So a new run state needs the picklist entry *first* — added to
+> `triage-run-statuses.list-type-entries.json` for fresh installs, and by hand
+> on a live instance, because `headless-admin-list-type` returns an empty
+> collection for both the service account and the session.
+
 **The report renders in-app.** Not a hosted artifact, not a link out. The verdicts
 are already in Testray as `TriageResult` rows, so the view reads them through the
 `CaseResult` FK and groups by `clusterKey` (§7); shipping an HTML file alongside
@@ -470,7 +619,7 @@ mapping below is what matters, and the symbol is one string to change.
 | Triage state | Colour | Clickable |
 |---|---|---|
 | no run for this build | *renders nothing* — same as the unpromoted star | — |
-| generating | `$blockedColor` | no |
+| in progress | `$blockedColor` | no |
 | failed | `$failedColor` | yes → failure detail |
 | ready | `$passedColor` | yes → the triage view |
 
@@ -528,6 +677,17 @@ merges client-side, with no core change.
 > present rather than coupling the reader to the projection. And every number
 > arrives as a **string**: `id`, `baselineSignatureCount` and every `…Id` field
 > serialise as text, so an unguarded `row.count > 5` compares strings.
+>
+> **Testray persists its entire SWR cache across reloads.**
+> `SWRCacheProvider` serialises every cache entry to storage on `beforeunload`
+> and restores it on boot, so a write made from our side is invisible not just
+> until the next revalidation but *through an F5* — the restored cache serves
+> the pre-write answer. This cost real debugging time: after *Run Triage*, the
+> column went blank instead of amber and stayed blank after a reload, which
+> looks exactly like a write that silently failed. The row was there the whole
+> time. Anything that creates or changes a `TriageRun` must
+> `mutate(triageRunsKey(routineId))`; the key is exported from `useTriageRuns`
+> for that reason.
 >
 > **A session-authenticated read without `x-csrf-token` lies about why it
 > failed.** From the browser, `/o/c/builds/270748` returns **404** and
@@ -689,7 +849,7 @@ was*; this answers *whether a run exists at all, and how it went*, which
 - **Why it earns its place:** it is the icon's predicate. With it, the build-index
   column resolves in one filtered query per page; without it we would count
   `TriageResult` rows by ERC prefix — a query per row — and still could not
-  distinguish *generating* or *failed* from *nothing here*. It also gives the manual
+  distinguish *in progress* or *failed* from *nothing here*. It also gives the manual
   flow its progress state and the routine its run history.
 
 **`TriageRoutineSetting`** — one row per routine, holding `autoTriage` (boolean,
@@ -1003,9 +1163,19 @@ because the naive version was tried and was wrong.
    `Failures triaged` and `Not written` side by side and marks clusters
    `117 of 177 triaged`.
 
-**Status: both renderers obey all nine rules as of 2026-08-19.** The CX port
+10. **Say how much of the build the comparison could see.** The diff is an
+   INNER join on case id, so a case that ran on only one side is invisible to
+   it. When two builds' suites were re-selected between them the join can be
+   almost empty, and a short verdict list then reads as a healthy build. Both
+   renderers show `Compared: <n> (<pct>)` beside `Tests in build`, and below 50%
+   they say so outright. Found the hard way: a q1.29 → Q1.30 pair shared **54 of
+   3,579** case results (1.5%) and reported 5 clusters as though that were the
+   whole build.
+
+**Status: both renderers obey all ten rules as of 2026-08-20.** The CX port
 landed the four it previously did not — collapsed-by-default, group-reordering
-sort, mode-dependent collapse and the denominators above. Two notes for whoever
+sort, mode-dependent collapse and the denominators above. Rule 10 arrived later,
+from a run that exposed it. Two notes for whoever
 touches either next:
 
 * Rule 5 is *cheaper* in the CX than in the artifact. `report.py` must emit both
@@ -1016,6 +1186,38 @@ touches either next:
 * Rule 4 has a corollary the artifact learned first and the CX now copies: **an
   active filter overrides the collapse.** Searching a fully collapsed report
   must reveal its hits, or the search returns nothing and reads as "no matches".
+
+### The verdict vocabulary lives in one place
+
+`verdicts.py` is the single definition of the severity order, the
+`NOT_ATTRIBUTABLE` relabel rule, the cluster rollup and the flattened-key
+canonicalisation. `report.py` imports it; `submit.py` and `testray_writer.py`
+import it; the custom element's `util/verdict.ts` mirrors it by hand. Change one
+and change the mirror.
+
+This exists because three consumers restated the rule and two of them drifted.
+`TriageRun.verdictCounts` / `verdictClusterCounts` were counted from the raw
+`classification`, while the report displayed `display_verdict`. The Testray
+index reads those blobs straight onto a column, so it would have reported **100
+`NEEDS_REVIEW` clusters for a run whose report showed 11** — the other 89 being
+`NOT_ATTRIBUTABLE`. Both numbers were "right"; they just answered different
+questions, and no reader could tell which. Fixed 2026-08-20: both blobs now
+store display labels, verified against run `r_20260818T200045Z` where the
+recomputed counts reproduce the rendered report exactly across all five
+verdicts (3/6 POSSIBLE_BUG, 11/13 NEEDS_REVIEW, 9/19 TEST_FIX, 89/140
+NOT_ATTRIBUTABLE, 5/5 FALSE_POSITIVE).
+
+Two consequences worth knowing:
+
+* **The blobs are schemaless on purpose**, so adding `NOT_ATTRIBUTABLE` as a key
+  needed no Object change — but an existing `TriageRun` row keeps its old counts
+  until `submit` is re-run for that bundle. Re-running `submit` is cheap: it
+  writes from the bundle's existing `results.json` and calls no model.
+* **Verdicts read back *out of* Testray arrive flattened** (`NEEDSREVIEW`, not
+  `NEEDS_REVIEW`) because Liferay strips underscores from picklist keys. Anything
+  reading them must canonicalise first or the relabel rule silently never
+  matches — which is exactly how a verification pass produced zeroes for every
+  verdict while the totals looked correct.
 
 ### The `transition` vocabulary — one string, two spellings
 

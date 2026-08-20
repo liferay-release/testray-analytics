@@ -189,3 +189,56 @@ def test_real_regression_still_surfaces_alongside_env_churn():
     target = pd.DataFrame([_frame(1, "FAILED", "IllegalStateException in Foo")])
     df, _ = compute_test_diff(baseline, target)
     assert list(df["transition"]) == [TRANSITION_CHANGED]
+
+
+# --- PR builds: deriving the fetch ref from the build name ----------------
+
+def test_pr_build_name_yields_the_receivers_fork_and_pr_head():
+    """A PR build's commit is on a fork, so origin cannot see it.
+
+    Nothing on the Build object references the pull request — `description`
+    carries only a Jenkins link and the portal SHA — so the name is the only
+    source. The head ref lives on the repo the PR was opened *against* (the
+    receiver), not the sender's.
+    """
+    from testray_analytics.analysis.prepare import pr_fetch_spec
+
+    spec = pr_fetch_spec(
+        '[master] ci:test:object - shuyangzhou > shuyangzhou '
+        '- PR#12591 - 2026-08-19[11:47:41]')
+
+    assert spec == ('git@github.com:shuyangzhou/liferay-portal.git',
+                    'pull/12591/head')
+
+
+def test_sender_and_receiver_are_not_interchangeable():
+    """Guards the side that matters. Every PR build seen so far had
+    sender == receiver, so a swap would have passed unnoticed."""
+    from testray_analytics.analysis.prepare import pr_fetch_spec
+
+    remote, ref = pr_fetch_spec('[master] job - alice > liferay - PR#42 - x')
+
+    assert 'liferay/liferay-portal' in remote, remote
+    assert 'alice' not in remote, remote
+    assert ref == 'pull/42/head'
+
+
+def test_non_pr_build_names_derive_nothing():
+    """Release and Stable builds are on origin; inventing a fork fetch for them
+    would make every ordinary run hit the network for no reason."""
+    from testray_analytics.analysis.prepare import pr_fetch_spec
+
+    for name in ('2026.q1.12-lts',
+                 'EE Package Tester - 2024.q1.29 - 9 - 2026-07-21[09:25:31]',
+                 '', None):
+        assert pr_fetch_spec(name) is None, name
+
+
+def test_pr_remote_template_is_configurable():
+    from testray_analytics.analysis.prepare import pr_fetch_spec
+
+    remote, _ = pr_fetch_spec(
+        '[master] j - a > bob - PR#7 - x',
+        {'git': {'pr_remote_template': 'https://example.test/{owner}/lp.git'}})
+
+    assert remote == 'https://example.test/bob/lp.git'

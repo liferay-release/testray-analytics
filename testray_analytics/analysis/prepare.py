@@ -1105,7 +1105,13 @@ def run_git_diff(git_repo: Path, hash_a: str, hash_b: str, out_path: Path,
     #    mitigation branch on a fork). --fetch-ref <remote-or-url> <ref>.
     for src, ref in (fetch_specs or []):
         print(f"Fetching {ref} from {src} …", file=sys.stderr)
-        subprocess.run(["git", "-C", str(git_dir), "fetch", "--quiet", src, ref],
+        # --no-tags: a fork's tag namespace is its own, and fetching a PR head
+        # from one otherwise drags every tag it has into the local repo. We only
+        # ever need the commit to be reachable for `git diff`, which is also why
+        # this fetches no local branch and never checks anything out — the
+        # working tree the user is sitting in must not move.
+        subprocess.run(["git", "-C", str(git_dir), "fetch", "--quiet",
+                        "--no-tags", src, ref],
                        check=False)
 
     # 2. Anything still missing → try origin (gets any official branch).
@@ -2605,6 +2611,19 @@ def prepare(baseline: SideSpec, target: SideSpec, classifier: str,
           ", ".join(f"{n} {name}" for name, n in sorted(transitions.items(),
                                                         key=lambda kv: -kv[1])))
 
+    # The join is an inner join on case id, so the transition total IS how many
+    # cases were comparable. When that is a small share of the target build the
+    # two builds ran different test sets, and every verdict below describes that
+    # sliver rather than the build. Say it here as well as in the report: a run
+    # triggered from the UI is read in this log first.
+    joined = sum(transitions.values())
+    if joined and len(target_df) and joined < len(target_df) * 0.5:
+        print(f"   WARNING: only {joined} of {len(target_df)} target case "
+              f"results ({100.0 * joined / len(target_df):.1f}%) ran on BOTH "
+              f"builds. The suite was probably re-selected between them; "
+              f"verdicts will cover only that overlap, not the build.",
+              file=sys.stderr)
+
     # api caseresults don't carry case names. Backfill test_case from the
     # Testray case object so the fragment matcher has something to anchor on
     # (and so prompt.md doesn't say `### N. \`\`` with no test name).
@@ -2650,6 +2669,21 @@ def prepare(baseline: SideSpec, target: SideSpec, classifier: str,
           f"A={meta_a['git_hash'][:12]}  B={meta_b['git_hash'][:12]}")
 
     project_id = meta_a["project_id"] or meta_b["project_id"]
+
+    # A PR build's commit is on a fork, so origin will not have it. Derive the
+    # fetch from the build name rather than making the caller supply it — but
+    # only when they have not, since an explicit --fetch-ref is a deliberate
+    # override and must win.
+    if not fetch_specs:
+        derived = [
+            spec for spec in (pr_fetch_spec(meta_a.get("name"), cfg),
+                              pr_fetch_spec(meta_b.get("name"), cfg))
+            if spec
+        ]
+        # dict.fromkeys: both sides of a PR-vs-PR pair can name the same ref.
+        fetch_specs = list(dict.fromkeys(derived))
+        for src, ref in fetch_specs:
+            print(f"   pull request detected — will fetch {ref} from {src}")
 
     return _finalize_bundle(
         df=df, run_id=run_id, run_dir=run_dir,
@@ -2697,6 +2731,42 @@ def _build_spec(args: argparse.Namespace, role: str) -> SideSpec:
         hash=hash_,
         name=name,
     )
+
+
+# Testray names a pull-request build
+#   [master] ci:test:object - shuyangzhou > shuyangzhou - PR#12591 - 2026-08-19[…]
+# i.e. `[branch] job - <sender> > <receiver> - PR#<number> - <timestamp>`.
+# Verified against every PR build in the mirror. Nothing else on the Build object
+# references the pull request at all — `description` carries only a Jenkins
+# report link and the portal branch/SHA — so the name is the sole source.
+_PR_BUILD_RE = re.compile(
+    r"-\s*(?P<sender>\S+)\s*>\s*(?P<receiver>\S+)\s*-\s*PR#(?P<number>\d+)\b"
+)
+
+# The PR head lives on the repo the pull request was opened *against*, which is
+# the receiver — `pull/<n>/head` is a ref on the target repo, not the sender's.
+# The repo is always liferay-portal; only the owner varies.
+PR_REMOTE_TEMPLATE = "git@github.com:{owner}/liferay-portal.git"
+
+
+def pr_fetch_spec(build_name, cfg: dict | None = None) -> tuple[str, str] | None:
+    """`(remote, ref)` to fetch a PR build's commit, or None if not a PR build.
+
+    A PR build's commit is on a fork, so it is not on origin and `git diff`
+    cannot see it — the run fails with "NOT in this checkout". This is the same
+    fetch a human would do by hand (`git fetch <fork> pull/<n>/head`), derived
+    from the build name so a UI-triggered PR run needs no extra input.
+
+    Override the remote via `git.pr_remote_template` in config.yml, which takes
+    `{owner}`; the default assumes GitHub over SSH.
+    """
+    match = _PR_BUILD_RE.search(str(build_name or ""))
+    if not match:
+        return None
+    template = str(((cfg or {}).get("git") or {}).get("pr_remote_template")
+                   or PR_REMOTE_TEMPLATE)
+    return (template.format(owner=match.group("receiver")),
+            f"pull/{match.group('number')}/head")
 
 
 def _normalize_fetch_ref(entry: list) -> tuple[str, str]:
