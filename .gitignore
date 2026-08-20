@@ -15,3 +15,6 @@ config/config.yml
 # Run bundles + outputs
 runs/
 *.log
+
+# Per-step logs from scripts/triage_pipeline.sh
+logs/

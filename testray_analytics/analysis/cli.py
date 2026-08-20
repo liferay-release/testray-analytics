@@ -12,15 +12,16 @@ Each subcommand delegates to that module's own argparse `main()`, so
 
 import sys
 
-_SUBCOMMANDS = ("prepare", "classify", "submit")
+_SUBCOMMANDS = ("prepare", "classify", "submit", "watch")
 
 
 def _usage() -> None:
     print(
-        "usage: testray-analysis <prepare|classify|submit> [args]\n"
+        "usage: testray-analysis <prepare|classify|submit|watch> [args]\n"
         "  prepare   read builds over REST, compute the diff, write a run bundle\n"
         "  classify  send the bundle to the Anthropic API\n"
         "  submit    validate results and hand verdicts to the Testray writer\n"
+        "  watch     claim QUEUED runs from the UI and run the pipeline\n"
         "\nRun `testray-analysis <subcommand> --help` for subcommand flags."
     )
 
@@ -44,6 +45,8 @@ def main() -> None:
         from .prepare import main as run
     elif sub == "classify":
         from .classify import main as run
+    elif sub == "watch":
+        from .runner import main as run
     else:
         from .submit import main as run
 
