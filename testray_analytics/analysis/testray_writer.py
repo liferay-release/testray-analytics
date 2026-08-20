@@ -48,7 +48,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from . import error_signature
+from . import error_signature, verdicts
 from .prepare import _testray_oauth_token
 
 BATCH_FILENAME = "triageresults_batch.json"
@@ -270,8 +270,13 @@ def build_triage_run(meta: dict, df: pd.DataFrame, *, classifier: str,
     ERC is the run id, so a local bundle and its Testray row share one
     identity and a re-submit updates in place rather than accumulating.
     """
-    counts = (df["classification"].value_counts().to_dict()
-              if len(df) and "classification" in df else {})
+    # Display verdicts, matching verdictClusterCounts below and the report's
+    # pills. Counting raw `classification` here is what let the stored numbers
+    # disagree with the rendered ones.
+    counts: dict[str, int] = {}
+    for v in verdicts.display_series(df):
+        if v:
+            counts[v] = counts.get(v, 0) + 1
     if n_clusters is None:
         # Count distinct clusterKey the same way report.py does, so the number
         # in Testray matches the number the report shows.

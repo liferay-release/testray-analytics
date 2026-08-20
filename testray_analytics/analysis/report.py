@@ -39,7 +39,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from . import error_signature
+from . import error_signature, verdicts
 from .jira_settings import DEFAULT_LABEL, resolve_jira_settings
 from .prepare import TRANSITION_CHANGED
 
@@ -48,26 +48,13 @@ from .prepare import TRANSITION_CHANGED
 # FALSE_POSITIVE, DID_NOT_RUN. Index doubles as the sort rank and drives both
 # _rollup() and the default ordering, so this list IS the report's opinion
 # about what deserves attention first.
-_VERDICT_ORDER = ["BUG", "POSSIBLE_BUG", "NEEDS_REVIEW", "TEST_FIX",
-                  "NOT_ATTRIBUTABLE",
-                  "FALSE_POSITIVE", "ENV_FAILURE", "DID_NOT_RUN",
-                  "AUTO_CLASSIFIED", "PENDING"]
-
-# NOT_ATTRIBUTABLE is a DISPLAY label, never a stored verdict. A low-confidence
-# NEEDS_REVIEW is the classifier saying "I could not attribute this", not "a
-# human must review 153 failures" — and reporting the latter to a dev team
-# misrepresents what was actually said. The stored classification stays
-# NEEDS_REVIEW, so nothing in §4, the picklist, the writer or the rubric moves.
-_UNATTRIBUTED_FROM = "NEEDS_REVIEW"
-_UNATTRIBUTED_AT = {"low", ""}
-
-
-def display_verdict(classification, confidence) -> str:
-    """The label to SHOW for a row. See _UNATTRIBUTED_FROM above."""
-    cls = _text(classification)
-    if cls == _UNATTRIBUTED_FROM and _text(confidence).lower() in _UNATTRIBUTED_AT:
-        return "NOT_ATTRIBUTABLE"
-    return cls
+# The vocabulary lives in `verdicts.py` so the writer stores the same labels
+# this renders. These names stay as aliases: they are used throughout the file
+# and imported by the tests.
+_VERDICT_ORDER = verdicts.VERDICT_ORDER
+_UNATTRIBUTED_FROM = verdicts.UNATTRIBUTED_FROM
+_UNATTRIBUTED_AT = verdicts.UNATTRIBUTED_AT
+display_verdict = verdicts.display_verdict
 
 # CSS class per verdict. Several non-actionable buckets share `auto` because
 # they are all "the pipeline decided this without reasoning about it".
@@ -209,6 +196,8 @@ _CSS = """
   /* The fan-out: how many case rows the clusters cover. Secondary on purpose
      — clusters are the unit of work, cases are the blast radius. */
   .totals .pill .fanout { color: var(--c-muted); font-size: 11.5px; }
+  /* Coverage below the threshold: the reader must not skim past it. */
+  .totals .pill.warn { background: #fff8e6; border-color: #e0b74a; }
   .totals a.pill { text-decoration: none; color: inherit; cursor: pointer; }
   .totals a.pill:hover { text-decoration: underline; }
   .verdict {
@@ -243,6 +232,12 @@ _CSS = """
     border-radius: 4px; font-size: 13.5px;
   }
   section.rationale h2 { margin: 0 0 8px; font-size: 15px; border: none; padding: 0; }
+  /* A caveat about the data itself, not a finding in it — tinted so it is not
+     skimmed past as commentary. */
+  section.rationale.warn {
+    background: #fff8e6; border-color: #e0b74a;
+  }
+  section.rationale.warn h2 { color: #7a5a00; }
   section.rationale ul, section.rationale ol { margin: 6px 0 0; padding-left: 22px; }
   section.rationale li { margin-bottom: 5px; }
   /* ---- controls -------------------------------------------------------- */
@@ -685,27 +680,8 @@ def _text(v) -> str:
     return str(v).strip()
 
 
-def _rank(verdict) -> int:
-    v = _text(verdict)
-    return _VERDICT_ORDER.index(v) if v in _VERDICT_ORDER else len(_VERDICT_ORDER)
-
-
-def _rollup(verdicts) -> str:
-    """The most severe verdict in a group — what a cluster header shows.
-
-    A cluster is only as safe as its worst member: one BUG among thirty
-    FALSE_POSITIVEs is still a BUG, and rolling up to the majority would hide
-    exactly the row worth acting on. Returns "" when nothing is classified.
-    """
-    best, best_rank = "", len(_VERDICT_ORDER)
-    for v in verdicts:
-        t = _text(v)
-        if not t:
-            continue
-        r = _rank(t)
-        if r < best_rank:
-            best, best_rank = t, r
-    return best
+_rank = verdicts.rank
+_rollup = verdicts.rollup
 
 
 def _vclass(verdict) -> str:
@@ -1336,6 +1312,24 @@ def _totals(df: pd.DataFrame, n_clusters: int, meta: dict,
         pills.append(f'<span class="pill" title="Case results in the target '
                      f'build."><strong>Tests in build:</strong> '
                      f'<span class="n">{int(target_rows):,}</span></span>')
+    # How much of that build the comparison could actually see. Always shown:
+    # "Tests in build: 3,579" beside a 54-row matrix read as a full comparison,
+    # which is the same class of error as the old bare "Total tests: 557".
+    compared, target_int = _join_coverage(meta)
+    if compared:
+        low = target_int and compared < target_int * _LOW_COVERAGE
+        # One decimal under 10%, none above: the banner quotes one decimal, and
+        # rounding this to a whole percent made the two disagree (1.5% vs 2%)
+        # about the same number.
+        pct = (100.0 * compared / target_int) if target_int else 0.0
+        share = (f" ({pct:.1f}%)" if 0 < pct < 10
+                 else (f" ({pct:.0f}%)" if target_int else ""))
+        pills.append(
+            f'<span class="pill{" warn" if low else ""}" title="Case results '
+            f'that ran on BOTH builds. The diff is an inner join on case id, '
+            f'so anything outside this is invisible to it.">'
+            f'<strong>Compared:</strong> <span class="n">{compared:,}</span>'
+            f'<span class="fanout">{share}</span></span>')
     pills.append('<span class="pill" title="Distinct clusterKey values — one cluster '
                  'per normalized error signature (ARCHITECTURE §7)."><strong>'
                  f'Root-cause clusters:</strong> <span class="n" '
@@ -1348,6 +1342,29 @@ def _select(el_id: str, label: str, values) -> str:
                    for v in sorted({_text(x) for x in values if _text(x)}))
     return (f'<label for="{el_id}">{_esc(label)}:</label>'
             f'<select id="{el_id}"><option value="">All</option>{opts}</select>')
+
+
+# Below this share of the target build, the comparison covers so little that
+# its verdicts describe a different test suite than the one that ran. 50% is a
+# judgement call, but the failure it guards against is not subtle: the case that
+# prompted it covered 1.6%.
+_LOW_COVERAGE = 0.5
+
+
+def _join_coverage(meta: dict) -> tuple[int, int]:
+    """(cases compared, case results in the target build).
+
+    The diff is an INNER join on case id, so a case that ran on only one side is
+    invisible to it. The matrix is built from that join, so summing it gives the
+    number actually compared — no extra field needed.
+    """
+    matrix = meta.get("status_matrix") or {}
+    compared = sum(int(n) for row in matrix.values() for n in row.values())
+    try:
+        target = int(meta.get("target_rows") or 0)
+    except (TypeError, ValueError):
+        target = 0
+    return compared, target
 
 
 def _banners(df: pd.DataFrame, meta: dict) -> str:
@@ -1372,6 +1389,24 @@ def _banners(df: pd.DataFrame, meta: dict) -> str:
     # same facts in a denser and more complete form (1,038 fixed IS
     # FAILED->PASSED), so the banner was pure duplication and has been dropped.
 
+    compared, target_rows = _join_coverage(meta)
+    if compared and target_rows and compared < target_rows * _LOW_COVERAGE:
+        pct = 100.0 * compared / target_rows
+        out.append(
+            '<section class="rationale warn"><h2>This comparison covers only '
+            f'{pct:.1f}% of the build</h2>'
+            f"<p>The diff is an inner join on case id: only <strong>"
+            f"{compared:,}</strong> of the target build's <strong>"
+            f"{target_rows:,}</strong> case results ran on <em>both</em> "
+            f"builds, so everything else is invisible to it. A verdict list "
+            f"this short does not mean the build is healthy &mdash; it means "
+            f"the two builds ran different test sets.</p>"
+            "<p>Most often the suite was re-selected between them. Pick a pair "
+            "from the same suite generation &mdash; consecutive builds of one "
+            "routine usually share their whole case set, and a build and its "
+            "retest always do.</p></section>"
+        )
+
     notes = _text(meta.get("notes"))
     if notes:
         out.append('<section class="rationale"><h2>Run notes</h2><p>'
@@ -1391,11 +1426,7 @@ def render_run(run_dir, df: pd.DataFrame, meta: dict) -> Path:
     # sort rank and the row cells cannot disagree about what a row is called.
     if len(df):
         df = df.copy()
-        df["display_verdict"] = [
-            display_verdict(c, f)
-            for c, f in zip(df.get("classification", [""] * len(df)),
-                            df.get("confidence", [""] * len(df)))
-        ]
+        df["display_verdict"] = verdicts.display_series(df)
     ckeys, shared = _cluster_index(df)
     groups = _groups(df, ckeys)
     cluster_groups = groups.get("cluster", [])

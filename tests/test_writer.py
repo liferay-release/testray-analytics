@@ -220,3 +220,56 @@ def test_nan_error_message_is_treated_as_blank_not_the_string_nan():
     b = _batch([_row(testray_case_id=2, test_case="T2", error_message=float("nan"))])
     # Different tests, no error text -> the test-name fallback keeps them apart.
     assert a[0]["clusterKey"] != b[0]["clusterKey"]
+
+
+# --- TriageRun verdict counts (index/report agreement) ---------------------
+
+def _run(rows, **kw):
+    from testray_analytics.analysis.testray_writer import build_triage_run
+    return build_triage_run(
+        {**META, "run_id": "r_test"}, pd.DataFrame(rows),
+        classifier=CLASSIFIER, n_written=len(rows), n_excluded=0, **kw)
+
+
+def test_verdict_counts_use_the_display_label_not_the_raw_classification():
+    """The Testray index renders these counts straight onto a column.
+
+    Regression: they were counted from `classification`, so a run whose report
+    showed 1 NEEDS_REVIEW + 2 NOT_ATTRIBUTABLE was stored as 3 NEEDS_REVIEW,
+    and the index disagreed with the report you clicked into. The relabel rule
+    lives in `verdicts.display_verdict` and both sides must use it.
+    """
+    import json
+
+    payload = _run([
+        _row(testray_case_id=1, classification="NEEDS_REVIEW", confidence="high"),
+        _row(testray_case_id=2, classification="NEEDS_REVIEW", confidence="low"),
+        _row(testray_case_id=3, classification="NEEDS_REVIEW", confidence=""),
+        _row(testray_case_id=4, classification="BUG", confidence="high"),
+    ])
+    counts = json.loads(payload["verdictCounts"])
+
+    assert counts.get("NEEDS_REVIEW") == 1, counts
+    assert counts.get("NOT_ATTRIBUTABLE") == 2, counts
+    assert counts.get("BUG") == 1, counts
+    # The raw label must not leak an inflated figure alongside the split.
+    assert sum(counts.values()) == 4, counts
+
+
+def test_verdict_counts_reproduce_a_real_runs_rendered_totals():
+    """Guards the confidence thresholds against a silent widening.
+
+    These four rows stand in for the shape of run r_20260818T200045Z: every
+    NEEDS_REVIEW carried `low` or `medium`, and only the `low` ones are the
+    classifier declining to attribute. A change that swept `medium` into
+    NOT_ATTRIBUTABLE would quietly reclassify most of a release's failures.
+    """
+    import json
+
+    payload = _run([
+        _row(testray_case_id=1, classification="NEEDS_REVIEW", confidence="medium"),
+        _row(testray_case_id=2, classification="NEEDS_REVIEW", confidence="low"),
+    ])
+    counts = json.loads(payload["verdictCounts"])
+
+    assert counts == {"NEEDS_REVIEW": 1, "NOT_ATTRIBUTABLE": 1}

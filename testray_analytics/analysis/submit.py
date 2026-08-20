@@ -36,6 +36,7 @@ from pathlib import Path
 import pandas as pd
 import yaml
 
+from . import verdicts
 from .jira_settings import resolve_jira_settings
 from .prepare import commits_touching_file, load_config, testray_target
 from .report import render_run
@@ -657,18 +658,21 @@ def main() -> None:
         # headline does — one clusterKey per root cause, ranked by its worst
         # member — so the CX can lead with the same number instead of a row
         # count that reads several times larger.
+        # DISPLAY verdicts, not raw classifications. The Testray index reads
+        # these counts straight onto a column, so storing the raw label made it
+        # report 100 NEEDS_REVIEW clusters for a run whose report showed 11 —
+        # the rest being NOT_ATTRIBUTABLE. Severity order and the relabel rule
+        # both come from `verdicts` so the two can no longer drift.
         cluster_verdicts: dict[str, int] = {}
         if len(df):
             from . import error_signature as _es
+            display = verdicts.display_series(df)
             worst: dict[str, str] = {}
-            order = ["BUG", "POSSIBLE_BUG", "NEEDS_REVIEW", "TEST_FIX",
-                     "FALSE_POSITIVE", "ENV_FAILURE", "DID_NOT_RUN"]
-            rank = {v: i for i, v in enumerate(order)}
-            for _, r in df.iterrows():
+            for i, (_, r) in enumerate(df.iterrows()):
                 key = _es.cluster_key(r.get("culprit_file"), r.get("test_case"),
                                       r.get("error_message"))
-                v = str(r.get("classification") or "")
-                if key not in worst or rank.get(v, 99) < rank.get(worst[key], 99):
+                v = display[i]
+                if key not in worst or verdicts.rank(v) < verdicts.rank(worst[key]):
                     worst[key] = v
             for v in worst.values():
                 if v:
