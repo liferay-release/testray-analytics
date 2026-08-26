@@ -286,11 +286,19 @@ _DID_NOT_RUN = {"BUILD_FAILURE", "NO_ERROR", "BATCH_FAILURE"}
 # are all untouched.
 _NO_BASELINE = "NO_BASELINE"
 
+# PRE_EXISTING is a third case: the test ran and genuinely failed, it just was
+# not failing because of THIS diff — it had not passed for several builds
+# before it. FALSE_POSITIVE is the existing verdict for "real failure, not
+# caused by the change", so this needs no new entry either.
+_PRE_EXISTING = "PRE_EXISTING"
+
 
 def _auto_label(pre_classification) -> str:
     pc = str(pre_classification or "").strip().upper()
     if pc == _NO_BASELINE:
         return "NEEDS_REVIEW"
+    if pc == _PRE_EXISTING:
+        return "FALSE_POSITIVE"
     return "DID_NOT_RUN" if pc in _DID_NOT_RUN else "ENV_FAILURE"
 
 
@@ -300,12 +308,21 @@ def _auto_reason(row) -> str:
     `pre_classification=X` is enough for an env or infra row, where the label
     IS the explanation. A no-baseline row needs more: NEEDS_REVIEW with no
     reason reads as the classifier giving up, when in fact nothing was asked
-    of it.
+    of it. And for a pre-existing failure the streak IS the evidence, so it
+    belongs in the reason a human reads rather than only in a CSV column.
     """
     pc = str(row.get("pre_classification") or "").strip().upper()
     if pc == _NO_BASELINE:
         return ("no baseline result for this case — often a new test; "
                 "nothing to compare a signature against, so a human decides")
+    if pc == _PRE_EXISTING:
+        streak = row.get("history_fail_streak")
+        depth  = row.get("history_depth")
+        if pd.notna(streak):
+            return (f"pre-existing: no PASS in the last {int(streak)} "
+                    f"consecutive result(s)"
+                    + (f" of {int(depth)} read" if pd.notna(depth) else "")
+                    + " — failing before this diff")
     return f"pre_classification={row.get('pre_classification')}"
 
 

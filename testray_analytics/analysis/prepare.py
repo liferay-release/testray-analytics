@@ -29,6 +29,7 @@ results.json. Then `testray-analysis submit <run_dir>` validates and writes.
 
 import argparse
 import collections
+import concurrent.futures
 import http.client
 import json
 import os
@@ -959,6 +960,127 @@ def attach_baseline_prevalence(df: pd.DataFrame, prevalence: dict[str, int]
         prevalence.get(error_signature.normalize(e), 0)
         for e in df.get("error_message", [""] * len(df))
     ]
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Per-case history — "has this test been failing for a while?"
+# ---------------------------------------------------------------------------
+
+# OFF by default (depth 0). Tried on prod routine 107946124 on 2026-08-24 and
+# reverted the same day: it correctly caught chronically-broken tests, but the
+# run it produced was harder to work through than the one without it, so the
+# default is opt-in until that is understood. `--history-depth 10` turns it on.
+# Note the collapse of TEST_FIX in that run was NOT this feature — the case
+# that regressed had history_fail_streak=0 and was never touched by the filter.
+HISTORY_DEPTH_DEFAULT   = 0
+HISTORY_STREAK_DEFAULT  = 5
+HISTORY_WORKERS_DEFAULT = 8
+
+# The pre_classification a chronic row gets. Not a new verdict: submit maps it
+# onto FALSE_POSITIVE, so the verdict vocabulary, the Testray picklist and
+# util/verdict.ts are all untouched.
+PRE_EXISTING = "PRE_EXISTING"
+
+
+def fetch_case_history(case_ids, cfg: dict, *,
+                       depth: int = HISTORY_DEPTH_DEFAULT,
+                       workers: int = HISTORY_WORKERS_DEFAULT,
+                       exclude_caseresult_ids: set | None = None,
+                       ) -> dict[int, list[dict]]:
+    """Recent case results per case, most recent first, excluding this run's own.
+
+    One request per case (`sort=id:desc`, pageSize=depth+1). Measured at ~0.6s
+    each against prod, so this is threaded — the only concurrent fetch in the
+    module. Failures are swallowed per case: history is corroborating evidence,
+    and losing it must degrade a verdict, never abort a run.
+
+    Deliberately NOT filtered to the target's routine. The same case runs in
+    several routines, and restricting to one is what makes a chronically broken
+    test look new: the case this was built for had only 3 results in its own
+    routine but had failed in 20 consecutive builds across two.
+    """
+    ids = [int(c) for c in dict.fromkeys(case_ids) if pd.notna(c)]
+    if not ids:
+        return {}
+    exclude = exclude_caseresult_ids or set()
+    token = _testray_oauth_token(cfg)
+    base = cfg["base_url"].rstrip("/")
+
+    def _one(cid: int) -> tuple[int, list[dict]]:
+        q = urllib.parse.urlencode({
+            "filter":   f"r_caseToCaseResult_c_caseId eq '{cid}'",
+            "sort":     "id:desc",
+            "page":     1,
+            "pageSize": depth + 1,
+            "fields":   "id,dueStatus,errors",
+        })
+        req = urllib.request.Request(
+            f"{base}/o/c/caseresults?{q}",
+            headers={"Authorization": f"Bearer {token}",
+                     "Accept": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                items = json.loads(resp.read()).get("items", [])
+        except Exception:
+            return cid, []
+        out = [{"status": (it.get("dueStatus") or {}).get("key") or "",
+                "errors": it.get("errors") or ""}
+               for it in items if it.get("id") not in exclude]
+        return cid, out[:depth]
+
+    history: dict[int, list[dict]] = {}
+    print(f"   [history] {len(ids)} case(s), last {depth}, {workers} workers …",
+          file=sys.stderr, flush=True)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        for cid, rows in pool.map(_one, ids):
+            history[cid] = rows
+    return history
+
+
+def _nonpass_streak(rows: list[dict]) -> int:
+    """Consecutive most-recent results that did not PASS.
+
+    Not a signature-matched streak. A chronically broken test rarely fails
+    identically every time — the case this was built for reported "2 Failed
+    tests" for twenty builds and "3 Failed tests" on the twenty-first, which
+    resets a signature streak to zero while the test never once passed. The
+    question is "when did this last pass", and that is what a reader means by
+    "it has been failing for a while".
+    """
+    n = 0
+    for r in rows:
+        if str(r.get("status") or "").upper() == "PASSED":
+            break
+        n += 1
+    return n
+
+
+def attach_history(df: pd.DataFrame, history: dict[int, list[dict]], *,
+                   streak_threshold: int = HISTORY_STREAK_DEFAULT,
+                   ) -> pd.DataFrame:
+    """Add `history_depth` / `history_fail_streak` and pre-classify chronics.
+
+    A row whose test has not passed in `streak_threshold` consecutive prior
+    builds is not a regression this diff introduced, whatever the baseline
+    build happened to record. It gets `pre_classification=PRE_EXISTING`, which
+    keeps it in the report with its streak on the record but takes it out of
+    the classify prompt — so it costs no model spend and cannot land in
+    NEEDS_REVIEW. Rows already pre-classified (env/infra) keep their label.
+    """
+    if df is None or df.empty or not history:
+        return df
+    df = df.copy()
+    rows = [history.get(int(c), []) if pd.notna(c) else []
+            for c in df.get("testray_case_id", [])]
+    df["history_depth"]       = [len(r) for r in rows]
+    df["history_fail_streak"] = [_nonpass_streak(r) for r in rows]
+
+    if "pre_classification" not in df.columns:
+        df["pre_classification"] = None
+    chronic = ((df["history_fail_streak"] >= streak_threshold)
+               & df["pre_classification"].isna())
+    df.loc[chronic, "pre_classification"] = PRE_EXISTING
     return df
 
 
@@ -2503,6 +2625,9 @@ def _finalize_bundle(
     target_rows: int | None = None,
     status_matrix: dict | None = None,
     coverage: dict | None = None,
+    testray_cfg: dict | None = None,
+    history_depth: int = HISTORY_DEPTH_DEFAULT,
+    history_streak: int = HISTORY_STREAK_DEFAULT,
 ) -> Path:
     print(f"→ Step 3/6 git diff …")
     diff_path = run_dir / "git_diff_full.diff"
@@ -2552,6 +2677,28 @@ def _finalize_bundle(
     print(f"→ Step 5/6 enrich + pre-classify …")
     df = enrich_and_pre_classify(df)
     df = df.drop_duplicates(subset="testray_case_id", keep="first").reset_index(drop=True)
+
+    # Per-case history. The baseline is ONE build: when it did not run a test,
+    # or ran it on a bad day, a test broken for months reads as a regression.
+    # History is the only thing that can say "this has not passed in N builds".
+    if history_depth and testray_cfg:
+        before = int(df["pre_classification"].notna().sum())
+        hist = fetch_case_history(
+            df["testray_case_id"], testray_cfg,
+            depth=history_depth,
+            exclude_caseresult_ids=set(
+                int(c) for c in df.get("caseresult_id", []) if pd.notna(c)),
+        )
+        df = attach_history(df, hist, streak_threshold=history_streak)
+        n_chronic = int((df["pre_classification"] == PRE_EXISTING).sum())
+        got = sum(1 for v in hist.values() if v)
+        print(f"   history: {got}/{len(hist)} case(s) resolved — "
+              f"{n_chronic} have not passed in {history_streak}+ consecutive "
+              f"builds → {PRE_EXISTING} (excluded from classification)")
+        if got < len(hist):
+            print(f"   WARNING: history unavailable for {len(hist) - got} case(s); "
+                  f"they stay in the classify set.", file=sys.stderr)
+
     df_flaky    = df[df["known_flaky"].fillna(False)].copy()
     df_nonflaky = df[~df["known_flaky"].fillna(False)].copy()
     df_auto     = df_nonflaky[df_nonflaky["pre_classification"].notna()].copy()
@@ -2573,6 +2720,9 @@ def _finalize_bundle(
         diff_list_cols.append("subtask_id")
     if "baseline_signature_count" in df.columns:
         diff_list_cols.append("baseline_signature_count")
+    for col in ("history_depth", "history_fail_streak"):
+        if col in df.columns:
+            diff_list_cols.append(col)
     df[diff_list_cols].to_csv(run_dir / "diff_list.csv", index=False)
 
     print(f"→ Step 6/6 prompt + schema + run.yml …")
@@ -2674,7 +2824,9 @@ def _finalize_bundle(
 
 def prepare(baseline: SideSpec, target: SideSpec, classifier: str,
             mode: str = DEFAULT_MODE, out_dir: Path | None = None,
-            fetch_specs: list | None = None) -> Path:
+            fetch_specs: list | None = None,
+            history_depth: int = HISTORY_DEPTH_DEFAULT,
+            history_streak: int = HISTORY_STREAK_DEFAULT) -> Path:
     validate_combo(baseline, target)
     validate_mode(baseline, target, mode)
 
@@ -2815,6 +2967,9 @@ def prepare(baseline: SideSpec, target: SideSpec, classifier: str,
         target_rows=len(target_df),
         status_matrix=status_matrix,
         coverage=coverage,
+        testray_cfg=cfg["testray"],
+        history_depth=history_depth,
+        history_streak=history_streak,
         git_repo=git_repo,
         mode=mode,
         fetch_specs=fetch_specs,
@@ -2927,6 +3082,15 @@ def main() -> None:
                     help="Directory to write the run bundle into "
                          "(default: ./runs). On Jenkins, point this at the "
                          "workspace/artifacts dir.")
+    ap.add_argument("--history-depth", type=int, default=HISTORY_DEPTH_DEFAULT,
+                    help="How many prior case results to read per test when "
+                         "deciding whether a failure is pre-existing. 0 "
+                         "disables the history fetch entirely "
+                         f"(default {HISTORY_DEPTH_DEFAULT}).")
+    ap.add_argument("--history-streak", type=int, default=HISTORY_STREAK_DEFAULT,
+                    help="Consecutive builds without a PASS before a failure "
+                         "is treated as pre-existing rather than new "
+                         f"(default {HISTORY_STREAK_DEFAULT}).")
     ap.add_argument("--fetch-ref", nargs="+", action="append", default=[],
                     help="Fetch a build commit not on origin (e.g. a temp "
                          "mitigation branch on a fork). Two forms: "
@@ -2941,6 +3105,7 @@ def main() -> None:
     # an explicit --mode always wins.
     mode     = MODE_BY_SUBTASK if args.by_subtask else args.mode
     prepare(baseline, target, args.classifier, mode=mode, out_dir=args.out,
+            history_depth=args.history_depth, history_streak=args.history_streak,
             fetch_specs=fetch_specs)
 
 
