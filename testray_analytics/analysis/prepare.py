@@ -2334,8 +2334,10 @@ def compute_subtask_groups(df: pd.DataFrame,
             # How often this group's error signature already occurred among
             # the BASELINE's own failures. min() across members: if ANY member
             # is new, the group is new. Diagnostic only — it rides in
-            # diff_list_subtasks.csv and the report, and is deliberately kept
-            # OUT of the prompt: feeding it to the classifier (with a NOVEL /
+            # diff_list_subtasks.csv and is written to TriageResult, but is
+            # rendered by neither report (the Baseline column was dropped from
+            # both on 2026-08-26). It is deliberately kept OUT of the prompt
+            # too: feeding it to the classifier (with a NOVEL /
             # rare / CHRONIC rubric) is the prime suspect for the 2026-08-24
             # run where TEST_FIX collapsed 639 rows -> 0. The rubric was
             # reverted 2026-08-26 without ever being committed, so git has no

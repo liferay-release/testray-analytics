@@ -319,11 +319,6 @@ _CSS += """
      mid-word — overrides the global overflow-wrap:anywhere. */
   td.col-status { word-break: normal; overflow-wrap: normal; }
   td.col-status .status > span { white-space: nowrap; }
-  th.col-baseline, td.col-baseline { width: 78px; text-align: center; }
-  td.col-baseline { font-weight: 700; font-size: 12px; }
-  td.col-baseline.novel   { color: var(--c-bug); }
-  td.col-baseline.rare    { color: #b9770e; }
-  td.col-baseline.chronic { color: var(--c-muted); font-weight: 400; }
   th.col-verdict { width: 130px; }
   th.col-confidence, td.col-confidence { width: 90px; text-align: center; }
   th.col-culprit, td.col-culprit { min-width: 220px; }
@@ -877,9 +872,6 @@ def _header_row(mode: str, idx: int, label: str, members: pd.DataFrame,
         + _rollup_cell(members.get("team_name", []), "col-team")
         + _rollup_cell(members.get("component_name", []), "col-comp")
         + '<td class="col-status cluster-cell"></td>'
-        + _novelty_cell(
-            min((c for c in members.get("baseline_signature_count", [])
-                 if pd.notna(c)), default=None))
         + f'<td class="col-verdict cluster-cell"{_verdict_rank_attr(verdict)}>{_verdict_span(verdict)}</td>'
         f'<td class="col-confidence cluster-cell"{_conf_rank_attr(top)}'
         + (f' title="Highest confidence in this group. Breakdown: {_esc(breakdown)}"' if breakdown else "")
@@ -978,8 +970,6 @@ def _member_rows(df: pd.DataFrame, meta: dict, cluster_no: dict[str, int],
             f'<td class="col-team">{_esc(_text(r.get("team_name"))) or "—"}</td>'
             f'<td class="col-comp">{_esc(_text(r.get("component_name"))) or "—"}</td>'
             f'<td class="col-status">{_status_span(r.get("status_a"), r.get("status_b"))}</td>'
-            + _novelty_cell(r.get("baseline_signature_count"))
-            + 
             f'<td class="col-verdict"{_verdict_rank_attr(verdict)}>{verdict_cell}</td>'
             f'<td class="col-confidence"{_conf_rank_attr(conf)}>{conf_cell}</td>'
             f'<td class="col-culprit">{culprit_cell}</td>'
@@ -1231,35 +1221,6 @@ def _worse(a: str, b: str) -> bool:
     """Did the status get worse from A to B? PASSED is the only good state."""
     return a == "PASSED" and b != "PASSED"
 
-
-
-# R2: signature novelty. Confidence cannot rank this data — the run split
-# 140 low / 13 medium / 0 high — so a reader falls back to the transition
-# label, which invites a cut that looks obvious and destroys real defects.
-# Novelty is uniform across `new` and `changed`, and it is the honest key.
-_NOVELTY = [(0, 0, "novel", "Never seen in the baseline"),
-            (1, 4, "rare", "Rare in the baseline (1-4)"),
-            (5, 10 ** 9, "chronic", "Already chronic in the baseline (5+)")]
-
-
-def _novelty_bucket(count) -> tuple[str, str]:
-    try:
-        n = int(count)
-    except (TypeError, ValueError):
-        return "", ""
-    for lo, hi, key, label in _NOVELTY:
-        if lo <= n <= hi:
-            return key, label
-    return "", ""
-
-
-def _novelty_cell(count) -> str:
-    key, label = _novelty_bucket(count)
-    if not key:
-        return '<td class="col-baseline"></td>'
-    n = int(count)
-    return (f'<td class="col-baseline {key}" data-sort="{n:07d}" '
-            f'title="{_esc(label)}">{n}</td>')
 
 
 def _totals(df: pd.DataFrame, n_clusters: int, meta: dict,
@@ -1538,7 +1499,6 @@ def render_run(run_dir, df: pd.DataFrame, meta: dict) -> Path:
 <th class="col-team">Team</th>
 <th class="col-comp">Component</th>
 <th class="col-status">Status</th>
-<th class="col-baseline" title="How many times this error signature already occurred among the BASELINE build\'s own failures. 0 = genuinely new failure mode.">Baseline</th>
 <th class="col-verdict">Verdict</th>
 <th class="col-confidence" title="Classifier confidence: high / medium / low / auto.">Confidence</th>
 <th class="col-culprit">Culprit file</th>
