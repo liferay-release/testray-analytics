@@ -2331,6 +2331,19 @@ def compute_subtask_groups(df: pd.DataFrame,
             "any_known_flaky":     bool(flaky_col.any()),
             "all_known_flaky":     bool(flaky_col.all()),
             "status_b_breakdown":  Counter(sub["status_b"].fillna("FAILED").tolist()),
+            # How often this group's error signature already occurred among
+            # the BASELINE's own failures. min() across members: if ANY member
+            # is new, the group is new. Diagnostic only — it rides in
+            # diff_list_subtasks.csv and the report, and is deliberately kept
+            # OUT of the prompt: feeding it to the classifier (with a NOVEL /
+            # rare / CHRONIC rubric) is the prime suspect for the 2026-08-24
+            # run where TEST_FIX collapsed 639 rows -> 0. The rubric was
+            # reverted 2026-08-26 without ever being committed, so git has no
+            # copy of it; re-testing it means writing it again, deliberately.
+            "baseline_signature_count": (
+                int(sub["baseline_signature_count"].min())
+                if "baseline_signature_count" in sub.columns
+                and sub["baseline_signature_count"].notna().any() else None),
         })
 
     # Sort: classifiable groups (not all-flaky, not all-auto) first by size desc;
@@ -2376,6 +2389,8 @@ def write_diff_list_subtasks(run_dir: Path, groups: list[dict]) -> None:
             "all_pre_classified": g["all_pre_classified"],
             "pre_classifications": "|".join(sorted(g["pre_classifications"])),
             "status_b_breakdown": "|".join(f"{k}={v}" for k, v in g["status_b_breakdown"].items()),
+            "baseline_signature_count": (g.get("baseline_signature_count")
+                                         if g.get("baseline_signature_count") is not None else ""),
         })
     pd.DataFrame(rows).to_csv(run_dir / "diff_list_subtasks.csv", index=False)
 
