@@ -29,6 +29,7 @@ results.json. Then `testray-analysis submit <run_dir>` validates and writes.
 
 import argparse
 import collections
+import http.client
 import json
 import os
 import re
@@ -286,6 +287,10 @@ def fetch_paginated(endpoint: str, params: dict, token: str, base_url: str,
     return _testray_fetch_paginated(endpoint, params, token, base_url, **kwargs)
 
 
+# How many times a page fetch is attempted before giving up (1 try + retries).
+_FETCH_RETRIES = 4
+
+
 def _testray_fetch_paginated(
     endpoint: str, params: dict, token: str, base_url: str,
     page_size: int = 500, sleep_between: float = 0.3,
@@ -312,13 +317,31 @@ def _testray_fetch_paginated(
         req = urllib.request.Request(
             url, headers={"Authorization": f"Bearer {token}"},
         )
-        try:
-            with urllib.request.urlopen(req, timeout=60) as resp:
-                data = json.loads(resp.read())
-        except urllib.error.HTTPError as e:
-            if e.code == 401:
-                raise SystemExit("Testray API 401 — token expired. Re-run.")
-            raise
+        # Retry transient network faults. A 40k-row build is ~84 sequential
+        # pages over several minutes, and prod drops a connection often enough
+        # that one RemoteDisconnected used to throw away the whole fetch. Only
+        # connection-level faults are retried: an HTTPError is an answer from
+        # the server and retrying it just asks the same bad question again.
+        data = None
+        for attempt in range(_FETCH_RETRIES):
+            try:
+                with urllib.request.urlopen(req, timeout=60) as resp:
+                    data = json.loads(resp.read())
+                break
+            except urllib.error.HTTPError as e:
+                if e.code == 401:
+                    raise SystemExit("Testray API 401 — token expired. Re-run.")
+                raise
+            except (urllib.error.URLError, http.client.HTTPException,
+                    ConnectionError, TimeoutError) as e:
+                if attempt == _FETCH_RETRIES - 1:
+                    raise
+                wait = 2 ** attempt
+                print(f"   [retry] page {page}: {type(e).__name__}, "
+                      f"retrying in {wait}s "
+                      f"({attempt + 1}/{_FETCH_RETRIES - 1})",
+                      file=sys.stderr, flush=True)
+                time.sleep(wait)
         items.extend(data.get("items", []))
         last_page = data.get("lastPage", 1)
         if progress_label:
