@@ -278,10 +278,35 @@ def validate_results_subtask(payload: dict, expected_case_ids: set[int],
 # infrastructure, not a test — so there is nothing that DID run.
 _DID_NOT_RUN = {"BUILD_FAILURE", "NO_ERROR", "BATCH_FAILURE"}
 
+# NO_BASELINE is neither: the test ran and genuinely failed, there is simply no
+# baseline result to compare it against — most often because the test is NEW.
+# A new test that fails is the most interesting row in the run, not the least,
+# so prepare keeps it in triage and it surfaces here as NEEDS_REVIEW. That is
+# an existing verdict, so verdicts.py, the Testray picklist and util/verdict.ts
+# are all untouched.
+_NO_BASELINE = "NO_BASELINE"
+
 
 def _auto_label(pre_classification) -> str:
     pc = str(pre_classification or "").strip().upper()
+    if pc == _NO_BASELINE:
+        return "NEEDS_REVIEW"
     return "DID_NOT_RUN" if pc in _DID_NOT_RUN else "ENV_FAILURE"
+
+
+def _auto_reason(row) -> str:
+    """Why an auto-classified row got its label.
+
+    `pre_classification=X` is enough for an env or infra row, where the label
+    IS the explanation. A no-baseline row needs more: NEEDS_REVIEW with no
+    reason reads as the classifier giving up, when in fact nothing was asked
+    of it.
+    """
+    pc = str(row.get("pre_classification") or "").strip().upper()
+    if pc == _NO_BASELINE:
+        return ("no baseline result for this case — often a new test; "
+                "nothing to compare a signature against, so a human decides")
+    return f"pre_classification={row.get('pre_classification')}"
 
 
 def assemble_dataframe(diff_list: pd.DataFrame, results: list[dict]) -> pd.DataFrame:
@@ -303,7 +328,7 @@ def assemble_dataframe(diff_list: pd.DataFrame, results: list[dict]) -> pd.DataF
                 "confidence":      None,
                 "culprit_file":    None,
                 "specific_change": None,
-                "reason":          f"pre_classification={row['pre_classification']}",
+                "reason":          _auto_reason(row),
                 "match_strategy":  "auto",
             })
         r = results_by_id.get(cid)
@@ -386,7 +411,7 @@ def assemble_dataframe_subtask(
                 "confidence":      None,
                 "culprit_file":    None,
                 "specific_change": None,
-                "reason":          f"pre_classification={row['pre_classification']}",
+                "reason":          _auto_reason(row),
                 "match_strategy":  "auto",
             })
         r = verdict_by_case.get(cid)

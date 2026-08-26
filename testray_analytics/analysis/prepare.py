@@ -853,8 +853,17 @@ TRANSITION_OTHER        = "other"
 
 # Which transitions are triage candidates. The rest are counted and reported
 # but never sent to the classifier.
+#
+# `no_baseline` is included deliberately. The baseline having no result does
+# not mean there is nothing to look at — the commonest reason a test has no
+# baseline is that it is NEW, and a brand-new test that fails is exactly the
+# thing triage exists to catch. Dropping it hid those failures completely.
+# They carry no baseline signal to compare against, so they are not sent to
+# the classifier either; enrich_and_pre_classify pre-classifies them and
+# submit._auto_label surfaces them as NEEDS_REVIEW for a human.
 TRIAGE_TRANSITIONS = frozenset({
     TRANSITION_NEW, TRANSITION_CHANGED, TRANSITION_BLOCKED, TRANSITION_TESTFIX,
+    TRANSITION_NO_BASELINE,
 })
 
 _FAILING = ("FAILED", "BLOCKED", "UNTESTED")
@@ -867,6 +876,16 @@ _ENV_CATEGORIES = frozenset({
     "BUILD_FAILURE", "ENV_CHROME", "ENV_DEPENDENCY", "ENV_DATE", "ENV_SETUP",
     "NO_ERROR",
 })
+
+# Pre-classifications meaning "this side produced no result at all", as opposed
+# to "the environment broke the test". Mirrors submit._DID_NOT_RUN; kept here
+# because compute_test_diff must not import from submit.
+_BASELINE_RAN_NOTHING = frozenset({"BUILD_FAILURE", "NO_ERROR", "BATCH_FAILURE"})
+
+# The pre_classification such a row gets. Not a new verdict: submit maps it
+# onto NEEDS_REVIEW, so the verdict vocabulary, the Testray picklist and
+# util/verdict.ts are all untouched.
+NO_BASELINE_PRE = "NO_BASELINE"
 
 
 def classify_transition(status_a, status_b, error_a, error_b) -> str:
@@ -1020,6 +1039,16 @@ def compute_test_diff(baseline: pd.DataFrame, target: pd.DataFrame,
             cat_b = prompt_helpers.pre_classify(merged.at[idx, "errors_b"], extra)
             if cat_a and cat_a == cat_b and cat_a in _ENV_CATEGORIES:
                 merged.at[idx, "transition"] = TRANSITION_SAME_FAILURE
+            elif cat_a in _BASELINE_RAN_NOTHING and cat_b not in _BASELINE_RAN_NOTHING:
+                # The baseline row says the test never ran ("was not executed",
+                # "build failed prior to running"). Its error text is a harness
+                # notice, not a failure, so comparing signatures against it is
+                # meaningless — every real target failure looks "changed", and
+                # a test that has been broken for twenty builds is triaged as a
+                # regression against the one build that failed to run it. The
+                # honest reading is the one we already have a name for: this
+                # pair carries no baseline health signal.
+                merged.at[idx, "transition"] = TRANSITION_NO_BASELINE
 
     # Full A x B status cross-tab, taken BEFORE the triage filter — this is
     # the whole comparison (every joined case), not the 557 rows we triage.
@@ -1290,6 +1319,18 @@ def enrich_and_pre_classify(df: pd.DataFrame) -> pd.DataFrame:
     fill = is_batch & df["pre_classification"].isna()
     if fill.any():
         df.loc[fill, "pre_classification"] = "BATCH_FAILURE"
+
+    # Rows with no baseline result. They stay in triage (see
+    # TRIAGE_TRANSITIONS) because a failing NEW test has no baseline by
+    # definition and must not vanish, but there is nothing to diff a signature
+    # against, so they go to a human rather than to the classifier. Same
+    # `pre_classification` mechanism as the env/infra and batch rows; again
+    # only where no more specific pattern already fired.
+    if "transition" in df.columns:
+        no_base = ((df["transition"] == TRANSITION_NO_BASELINE)
+                   & df["pre_classification"].isna())
+        if no_base.any():
+            df.loc[no_base, "pre_classification"] = NO_BASELINE_PRE
 
     return df
 

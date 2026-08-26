@@ -93,6 +93,12 @@ def resolve_diff_path_to_component(diff_path: str) -> str | None:
 DEFAULT_AUTO_CLASSIFY = {
     "BUILD_FAILURE": [
         "The build failed prior to running the test",
+        # Poshi/Gradle harness notice, not a test failure: the task never ran,
+        # so the row carries no health signal for the test at all. Seen as a
+        # BASELINE error on chronically-broken cases, where it made a real
+        # target failure look like a *changed* one (see
+        # _BASELINE_RAN_NOTHING in prepare.py).
+        r"was not executed\. Please check the logs",
     ],
     "ENV_CHROME": [
         "chrome=100.0",
