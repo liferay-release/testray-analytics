@@ -1317,17 +1317,26 @@ def _totals(df: pd.DataFrame, n_clusters: int, meta: dict,
     # which is the same class of error as the old bare "Total tests: 557".
     compared, target_int = _join_coverage(meta)
     if compared:
-        low = target_int and compared < target_int * _LOW_COVERAGE
         # One decimal under 10%, none above: the banner quotes one decimal, and
         # rounding this to a whole percent made the two disagree (1.5% vs 2%)
         # about the same number.
-        pct = (100.0 * compared / target_int) if target_int else 0.0
+        # Denominator: the BIGGER side, not the target. Against the target
+        # alone this read "7,699 (99%)" for a pair where the target ran 7,738
+        # of the baseline's 18,161 cases — 99% is true and useless, because
+        # the target is the side that shrank. Whichever build ran more tests
+        # is the honest measure of what the comparison could have covered.
+        cov = meta.get("coverage") or {}
+        denom = max(int(cov.get("baseline_cases") or 0),
+                    int(cov.get("target_cases") or 0)) or target_int
+        pct = (100.0 * compared / denom) if denom else 0.0
+        low = bool(denom) and compared < denom * _LOW_COVERAGE
         share = (f" ({pct:.1f}%)" if 0 < pct < 10
-                 else (f" ({pct:.0f}%)" if target_int else ""))
+                 else (f" ({pct:.0f}%)" if denom else ""))
         pills.append(
             f'<span class="pill{" warn" if low else ""}" title="Case results '
-            f'that ran on BOTH builds. The diff is an inner join on case id, '
-            f'so anything outside this is invisible to it.">'
+            f'that ran on BOTH builds, as a share of whichever build ran more. '
+            f'The diff is an inner join on case id, so anything outside this '
+            f'is invisible to it.">'
             f'<strong>Compared:</strong> <span class="n">{compared:,}</span>'
             f'<span class="fanout">{share}</span></span>')
     pills.append('<span class="pill" title="Distinct clusterKey values — one cluster '

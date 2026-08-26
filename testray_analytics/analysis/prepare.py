@@ -944,7 +944,8 @@ def attach_baseline_prevalence(df: pd.DataFrame, prevalence: dict[str, int]
 
 
 def compute_test_diff(baseline: pd.DataFrame, target: pd.DataFrame,
-                      *, matrix_out: dict | None = None):
+                      *, matrix_out: dict | None = None,
+                      coverage_out: dict | None = None):
     """Inner-join baseline and target and keep the §12 triage candidates —
     new failures *and changed* ones, not only PASSED→FAILED.
 
@@ -954,7 +955,14 @@ def compute_test_diff(baseline: pd.DataFrame, target: pd.DataFrame,
 
     Join key: `case_id` if the target has one (db, api targets); otherwise
     `(case_name, component_name)` (csv targets). A final dropna on
-    `testray_case_id` discards rows with no persistable id."""
+    `testray_case_id` discards rows with no persistable id.
+
+    The join is an INNER one, so a case the baseline ran and the target did
+    not is silently absent from every count this returns. That is a coverage
+    regression, not a triage row — a suite that stopped running half its tests
+    reads as a healthy build here. `coverage_out` is where it surfaces: an
+    out-parameter (like `matrix_out`) carrying the anti-join both ways, so the
+    report can state the ran-both percentage instead of implying 100%."""
     if baseline.empty or target.empty:
         return pd.DataFrame(), collections.Counter()
 
@@ -967,6 +975,30 @@ def compute_test_diff(baseline: pd.DataFrame, target: pd.DataFrame,
     t = _aggregate_target(target,     key_cols=key_cols)
 
     merged = b.merge(t, on=key_cols, how="inner", suffixes=("_a", "_b"))
+
+    # Coverage BEFORE anything is filtered: what the inner join above threw
+    # away. `baseline_only` is the important half — tests that ran in A and
+    # not in B produce no failure, no transition and no row, so they cannot
+    # be noticed downstream by any means except this.
+    if coverage_out is not None:
+        b_keys = set(map(tuple, b[key_cols].itertuples(index=False, name=None)))
+        t_keys = set(map(tuple, t[key_cols].itertuples(index=False, name=None)))
+        only_b = b_keys - t_keys
+        by_status: dict[str, int] = {}
+        if only_b:
+            mask = [tuple(r) in only_b
+                    for r in b[key_cols].itertuples(index=False, name=None)]
+            for st in b.loc[mask, "status"].fillna("UNTESTED"):
+                by_status[str(st)] = by_status.get(str(st), 0) + 1
+        coverage_out.clear()
+        coverage_out.update({
+            "baseline_cases":         len(b_keys),
+            "target_cases":           len(t_keys),
+            "ran_both":               len(b_keys & t_keys),
+            "baseline_only":          len(only_b),
+            "target_only":            len(t_keys - b_keys),
+            "baseline_only_by_status": by_status or None,
+        })
 
     merged["transition"] = [
         classify_transition(sa, sb, ea, eb)
@@ -1370,7 +1402,8 @@ def write_run_yml(run_dir: Path, *, run_id: str,
                   transition_counts: dict | None = None,
                   baseline_rows: int | None = None,
                   target_rows: int | None = None,
-                  status_matrix: dict | None = None) -> None:
+                  status_matrix: dict | None = None,
+                  coverage: dict | None = None) -> None:
     metadata = {
         "run_id":              run_id,
         "mode":                mode,
@@ -1395,6 +1428,9 @@ def write_run_yml(run_dir: Path, *, run_id: str,
         "target_rows":         target_rows,
         "transition_counts":   dict(transition_counts or {}) or None,
         "status_matrix":       dict(status_matrix or {}) or None,
+        # The anti-join the status_matrix cannot show: cases one build ran
+        # and the other did not. Read by the report's Compared pill.
+        "coverage":            dict(coverage or {}) or None,
         "total_failures":      total_failures,
         "auto_classified":     auto_classified,
         "flaky_excluded":      flaky_excluded,
@@ -2425,6 +2461,7 @@ def _finalize_bundle(
     baseline_rows: int | None = None,
     target_rows: int | None = None,
     status_matrix: dict | None = None,
+    coverage: dict | None = None,
 ) -> Path:
     print(f"→ Step 3/6 git diff …")
     diff_path = run_dir / "git_diff_full.diff"
@@ -2583,6 +2620,7 @@ def _finalize_bundle(
         baseline_rows=baseline_rows,
         target_rows=target_rows,
         status_matrix=status_matrix,
+        coverage=coverage,
     )
 
     rel = _disp(run_dir)
@@ -2622,8 +2660,10 @@ def prepare(baseline: SideSpec, target: SideSpec, classifier: str,
     print(f"   baseline rows: {len(baseline_df)}  target rows: {len(target_df)}")
 
     status_matrix: dict = {}
+    coverage: dict = {}
     df, transitions = compute_test_diff(baseline_df, target_df,
-                                        matrix_out=status_matrix)
+                                        matrix_out=status_matrix,
+                                        coverage_out=coverage)
     if df.empty:
         raise SystemExit(
             "test_diff returned 0 triage rows. Transitions seen: "
@@ -2646,6 +2686,17 @@ def prepare(baseline: SideSpec, target: SideSpec, classifier: str,
               f"builds. The suite was probably re-selected between them; "
               f"verdicts will cover only that overlap, not the build.",
               file=sys.stderr)
+
+    # The other direction, which the check above cannot see: the target ran
+    # FEWER cases than the baseline. Overlap-vs-target stays near 100% while
+    # half the suite quietly stops running, so this needs its own test.
+    only_b = coverage.get("baseline_only") or 0
+    b_cases = coverage.get("baseline_cases") or 0
+    if b_cases and only_b > b_cases * 0.1:
+        print(f"   WARNING: {only_b} of {b_cases} baseline cases "
+              f"({100.0 * only_b / b_cases:.1f}%) did NOT run on the target "
+              f"build. Those tests produce no failure and no row here — a "
+              f"drop in coverage, not a clean build.", file=sys.stderr)
 
     # api caseresults don't carry case names. Backfill test_case from the
     # Testray case object so the fragment matcher has something to anchor on
@@ -2722,6 +2773,7 @@ def prepare(baseline: SideSpec, target: SideSpec, classifier: str,
         baseline_rows=len(baseline_df),
         target_rows=len(target_df),
         status_matrix=status_matrix,
+        coverage=coverage,
         git_repo=git_repo,
         mode=mode,
         fetch_specs=fetch_specs,
