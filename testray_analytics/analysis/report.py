@@ -1315,19 +1315,11 @@ def _totals(df: pd.DataFrame, n_clusters: int, meta: dict,
     # How much of that build the comparison could actually see. Always shown:
     # "Tests in build: 3,579" beside a 54-row matrix read as a full comparison,
     # which is the same class of error as the old bare "Total tests: 557".
-    compared, target_int = _join_coverage(meta)
+    compared, denom = _join_coverage(meta)
     if compared:
         # One decimal under 10%, none above: the banner quotes one decimal, and
         # rounding this to a whole percent made the two disagree (1.5% vs 2%)
         # about the same number.
-        # Denominator: the BIGGER side, not the target. Against the target
-        # alone this read "7,699 (99%)" for a pair where the target ran 7,738
-        # of the baseline's 18,161 cases — 99% is true and useless, because
-        # the target is the side that shrank. Whichever build ran more tests
-        # is the honest measure of what the comparison could have covered.
-        cov = meta.get("coverage") or {}
-        denom = max(int(cov.get("baseline_cases") or 0),
-                    int(cov.get("target_cases") or 0)) or target_int
         pct = (100.0 * compared / denom) if denom else 0.0
         low = bool(denom) and compared < denom * _LOW_COVERAGE
         share = (f" ({pct:.1f}%)" if 0 < pct < 10
@@ -1361,19 +1353,30 @@ _LOW_COVERAGE = 0.5
 
 
 def _join_coverage(meta: dict) -> tuple[int, int]:
-    """(cases compared, case results in the target build).
+    """(cases compared, the number that could have been compared).
 
     The diff is an INNER join on case id, so a case that ran on only one side is
     invisible to it. The matrix is built from that join, so summing it gives the
     number actually compared — no extra field needed.
+
+    The denominator is whichever build ran MORE cases, not the target. Measured
+    against the target alone this read "7,699 (99%)" for a pair that shared 42%
+    of its cases — true, and useless, because the target was the side that
+    shrank. Both the Compared pill and the low-coverage banner read it from
+    here: when they each computed their own, the pill warned at 42% while the
+    banner stayed silent on the same run. Falls back to target_rows for a
+    run.yml written before the `coverage` key existed.
     """
     matrix = meta.get("status_matrix") or {}
     compared = sum(int(n) for row in matrix.values() for n in row.values())
+    cov = meta.get("coverage") or {}
     try:
         target = int(meta.get("target_rows") or 0)
+        denom = max(int(cov.get("baseline_cases") or 0),
+                    int(cov.get("target_cases") or 0)) or target
     except (TypeError, ValueError):
-        target = 0
-    return compared, target
+        denom = 0
+    return compared, denom
 
 
 def _banners(df: pd.DataFrame, meta: dict) -> str:
@@ -1398,15 +1401,15 @@ def _banners(df: pd.DataFrame, meta: dict) -> str:
     # same facts in a denser and more complete form (1,038 fixed IS
     # FAILED->PASSED), so the banner was pure duplication and has been dropped.
 
-    compared, target_rows = _join_coverage(meta)
-    if compared and target_rows and compared < target_rows * _LOW_COVERAGE:
-        pct = 100.0 * compared / target_rows
+    compared, denom = _join_coverage(meta)
+    if compared and denom and compared < denom * _LOW_COVERAGE:
+        pct = 100.0 * compared / denom
         out.append(
             '<section class="rationale warn"><h2>This comparison covers only '
             f'{pct:.1f}% of the build</h2>'
             f"<p>The diff is an inner join on case id: only <strong>"
-            f"{compared:,}</strong> of the target build's <strong>"
-            f"{target_rows:,}</strong> case results ran on <em>both</em> "
+            f"{compared:,}</strong> of the <strong>{denom:,}</strong> case "
+            f"results the larger build ran were run on <em>both</em> "
             f"builds, so everything else is invisible to it. A verdict list "
             f"this short does not mean the build is healthy &mdash; it means "
             f"the two builds ran different test sets.</p>"
