@@ -1,0 +1,380 @@
+module_path,testray_component,team_name
+,AI,Content Management
+,API Builder,Headless
+,Accessibility Checker Tool,Platform Experience
+,Accessibility Framework,Platform Experience
+,Activities Widget,Page Management
+,Alloy UI,Frontend Infrastructure
+,Announcements & Alerts widgets,Content Management
+,App Management,Site Management
+,Application Display Templates,Page Management
+,Applications Menu,Site Management
+,Asset Sharing Framework,Content Management
+,Business Productivity,Business Process Management
+,CMS,Content Management
+,CMS dashboard,Content Management
+,Categories,Content Management
+,Clay,Frontend Infrastructure
+,Collections,Page Management
+,Comments,Content Management
+,Content Display Widgets,Content Management
+,Content Page Experience Personalization,Page Management
+,Content Publishing,Site Management
+,Control Panel Framework,Site Management
+,DXP Components Web,Page Management
+,DXP Editors,Frontend Infrastructure
+,Data Integration,Database Infrastructure
+,Database Access,Database Infrastructure
+,Database Partitioning,Database Infrastructure
+,Database Upgrade Framework,Database Infrastructure
+,Database Upgrade Tool,Database Infrastructure
+,Dev Tools,Dev Tools
+,Document Repository Framework,Content Management
+,Documents & Media,Content Management
+,Environments,Core Infrastructure
+,Fault Tolerance,Core Infrastructure
+,Fragments Toolkit,Page Management
+,Frontend Infra,Frontend Infrastructure
+,Frontend Token Infrastructure,Frontend Infrastructure
+,Headless Admin Content API,Headless
+,Headless Admin Site API,Headless
+,Headless Admin Taxonomy API,Headless
+,Headless Admin User API,Headless
+,Headless Delivery API,Headless
+,Headless Discovery Application,Headless
+,Headless Site API,Headless
+,Headless Site Pages API,Headless
+,Image Editor,Content Management
+,Information Templates,Page Management
+,Invite Members widget,Commerce
+,Item Selector (React)(CMS),Content Management
+,JS APIs and Utilities,Headless
+,JS Portlet Extender,Frontend Infrastructure
+,JS Toolkit,Frontend Infrastructure
+,Knowledge Base Widget,Content Management
+,LES,Search
+,Liferay Faces,Core Infrastructure
+,Mail,Core Infrastructure
+,Media Gallery widget,Content Management
+,Minifier,Frontend Infrastructure
+,My Account,Commerce
+,Out of the box Fragments,Page Management
+,Page Flags widget,Page Management
+,Page Templates,Page Management
+,Pages,Page Management
+,Performance,Core Infrastructure
+,Portal Configuration ,Core Infrastructure
+,Product Menu,Page Management
+,REST Builder,Headless
+,REST infrastructure (vulcan),Headless
+,SEO Tools,Site Management
+,SPA Engine (Senna),Page Management
+,Search Container,Search
+,Search Tuning,Search
+,Segments Editor,Analytics Cloud
+,Simulation Menu,Page Management
+,Site Management,Site Management
+,Social Activity,Content Management
+,Squad:Infrastructure,Core Infrastructure
+,Tag Libraries,Frontend Infrastructure
+,Tags,Frontend Infrastructure
+,Tasks Portlet,Page Management
+,Template Code Editor,Page Management
+,Upgrade Logging,Database Infrastructure
+,Upgrade Report,Database Infrastructure
+,Upgrade Source Formatter,Database Infrastructure
+,Utility Pages,Page Management
+,WebDAV access,Core Infrastructure
+,~ [Archived] Core Infrastructure,Core Infrastructure
+,~ [Archived] Frontend Infrastructure,Frontend Infrastructure
+,~ [Archived] Search Infrastructure,Search
+,~[Archived] Application Security,Application Security
+,~[Archived]Analytics Cloud,Analytics Cloud
+modules/apps/accessibility,Accessibility Framework,
+modules/apps/accessibility,Accessibility Menu,Platform Experience
+modules/apps/account,Account,Commerce
+modules/apps/adaptive-media,Adaptive Media,Content Management
+modules/apps/address,Address,Commerce
+modules/apps/ai-creator,AI-Creator,Content Management
+modules/apps/ai-hub-cell,AI Hub Cell,NoMappedTeam
+modules/apps/ai/ai-hub-web,AI Hub,
+modules/apps/analytics,Analytics Cloud,Analytics Cloud
+modules/apps/announcements,Announcements,Content Management
+modules/apps/application-list,Control Menu,Platform Experience
+modules/apps/archived,Archived Apps,NoMappedTeam
+modules/apps/asset,Asset Framework,Content Management
+modules/apps/asset-categories-admin,Categories,
+modules/apps/asset-list,Asset Framework,
+modules/apps/asset-tags-admin,Tags,
+modules/apps/asset-tags-validator,Asset Publisher Widget,Content Management
+modules/apps/auto-tagging,Auto Tagging,
+modules/apps/batch-engine,Headless Batch Engine API,Headless
+modules/apps/batch-planner,Data Migration Center,Headless
+modules/apps/bean-portlet,Bean Portlet,Core Infrastructure
+modules/apps/blogs,Blogs,Content Management
+modules/apps/bookmarks,Bookmarks,Content Management
+modules/apps/bulk,Documents and Media,Content Management
+modules/apps/calendar,Calendar,Business Process Management
+modules/apps/captcha,CAPTCHA,Application Security
+modules/apps/change-tracking,Publications,Site Management
+modules/apps/changeset,Staging,Site Management
+modules/apps/click-to-chat,Click to Chat,Site Management
+modules/apps/client-extension,Frontend Client Extensions,Frontend Infrastructure
+modules/apps/comment,Comment,Content Management
+modules/apps/commerce,Commerce,Commerce
+modules/apps/commerce,Order Management,Commerce
+modules/apps/commerce,Product Info Management,
+modules/apps/commerce,Product Information Management,Commerce
+modules/apps/commerce,Shopping Experience,Commerce
+modules/apps/company,Virtual Instances,Core Infrastructure
+modules/apps/configuration-admin,System Settings,Platform Experience
+modules/apps/connected-app,Documents and Media,Content Management
+modules/apps/consent-management-platform,Application Security,Application Security
+modules/apps/contacts,Contacts Center,Commerce
+modules/apps/content-dashboard,Content Dashboard,Content Management
+modules/apps/cookies,Cookies,Application Security
+modules/apps/counter,Portal Services,Core Infrastructure
+modules/apps/data-cleanup,Data Cleanup,Database Infrastructure
+modules/apps/data-engine,Data Engine,Business Process Management
+modules/apps/depot,Asset Libraries,Content Management
+modules/apps/design-library,Design Library,Frontend Infrastructure
+modules/apps/diff,Portal Services,NoMappedTeam
+modules/apps/digital-signature,Digital Signature,Business Process Management
+modules/apps/dispatch,Job Scheduler,Headless
+modules/apps/document-library,Documents and Media,Content Management
+modules/apps/document-library-google-docs,External Document Repositories,Content Management
+modules/apps/document-library-opener,External Document Repositories,Content Management
+modules/apps/dynamic-data-lists,Dynamic Data Lists,Business Process Management
+modules/apps/dynamic-data-mapping,Dynamic Data Mapping,Business Process Management
+modules/apps/expando,Custom Fields,Core Infrastructure
+modules/apps/export-import,Export/Import,Headless
+modules/apps/external-reference,Portal Services,Core Infrastructure
+modules/apps/feature-flag,Feature Flag,Platform Experience
+modules/apps/flags,Page > Page Flags,Content Management
+modules/apps/fragment,Fragment Administration,Page Management
+modules/apps/fragment,Out of the box Fragments,
+modules/apps/friendly-url,Friendly URL Service,Site Management
+modules/apps/frontend-css,Liferay Themes,Platform Experience
+modules/apps/frontend-data-set,Frontend Data Set,Frontend Infrastructure
+modules/apps/frontend-editor,Frontend Editor,Frontend Infrastructure
+modules/apps/frontend-icons,Frontend Other,Frontend Infrastructure
+modules/apps/frontend-js,Clay,
+modules/apps/frontend-js,Frontend JS,Frontend Infrastructure
+modules/apps/frontend-js,JS APIs and Utilities,
+modules/apps/frontend-taglib,Frontend Taglib,Frontend Infrastructure
+modules/apps/frontend-theme,Liferay Themes,Platform Experience
+modules/apps/frontend-token,Style Books,Platform Experience
+modules/apps/frontend-view-state,Frontend Other,Frontend Infrastructure
+modules/apps/glowroot,Glow Root,Core Infrastructure
+modules/apps/gogo-shell,Gogo Shell,Core Infrastructure
+modules/apps/google-places,Forms,Content Management
+modules/apps/google-places,Google Places,
+modules/apps/headless,Content Management Headless,
+modules/apps/headless,Headless,Headless
+modules/apps/headless,Headless Admin Configuration,
+modules/apps/headless,Headless CMP API,
+modules/apps/headless,Headless Delivery API,
+modules/apps/headless,Headless Portal Instances API,
+modules/apps/headless,Headless Site API,
+modules/apps/headless/headless-admin-site/headless-admin-site-client/src/main,Headless Site API,
+modules/apps/headless/headless-admin-site/headless-admin-site-impl/src/main,Headless Site API,
+modules/apps/iframe,IFrame Portlet,Page Management
+modules/apps/image,Documents and Media,Content Management
+modules/apps/image-uploader,,Content Management
+modules/apps/imageio-plugins,Portal Services,Content Management
+modules/apps/info,Info Framework,Page Management
+modules/apps/invitation,Invite Members,Content Management
+modules/apps/ip-geocoder,Analytics Cloud,Content Management
+modules/apps/item-selector,Item Selector,Content Management
+modules/apps/journal,Content Management System,
+modules/apps/journal,Web Content,Content Management
+modules/apps/json-storage,Portal Services,Content Management
+modules/apps/knowledge-base,Knowledge Base,Content Management
+modules/apps/layout,Content Page Templates,
+modules/apps/layout,Content Pages,Page Management
+modules/apps/layout,Display Page Templates,
+modules/apps/layout,Page Administration,
+modules/apps/layout,Page Templates,
+modules/apps/learn,Setup Wizard,NoMappedTeam
+modules/apps/license-manager,License,Core Infrastructure
+modules/apps/list-type,Object,Business Process Management
+modules/apps/locked-items,Knowledge Base,Content Management
+modules/apps/login,Login,Application Security
+modules/apps/mail,Portal Services,Content Management
+modules/apps/map,Frontend Other,Frontend Infrastructure
+modules/apps/marketplace,Marketplace,Marketplace
+modules/apps/mcp,,Content Management
+modules/apps/mentions,Mentions,Content Management
+modules/apps/message-boards,Message Boards,Content Management
+modules/apps/microblogs,Microblogs,Content Management
+modules/apps/microsoft-translator,Translations Management,Content Management
+modules/apps/monitoring,Monitoring,Core Infrastructure
+modules/apps/my-subscriptions,My Subscriptions Widget,Content Management
+modules/apps/nested-portlets,Nested Portlets Widget,Page Management
+modules/apps/normalizer,Portal Services,Core Infrastructure
+modules/apps/notification,Notifications Framework,Business Process Management
+modules/apps/notifications,Notifications,Content Management
+modules/apps/oauth-client,OAuth 2,Application Security
+modules/apps/oauth2-provider,OAuth 2,Application Security
+modules/apps/object,Headless Object API,
+modules/apps/object,Object Entries REST APIs,
+modules/apps/object,Objects,Business Process Management
+modules/apps/on-demand-admin,On Demand Admin,Commerce
+modules/apps/organizations,Users and Organizations,Commerce
+modules/apps/password-policies-admin,Password Policies,Application Security
+modules/apps/password-policy,Password Policies,Application Security
+modules/apps/plugins-admin,Components Admin,Core Infrastructure
+modules/apps/portal,Core Infrastructure,
+modules/apps/portal,Database Access,
+modules/apps/portal,Database Partitioning,
+modules/apps/portal,Database Upgrade Framework,
+modules/apps/portal,Portal Services,Core Infrastructure
+modules/apps/portal,Upgrade Logging,
+modules/apps/portal,Upgrade Report,
+modules/apps/portal,Virtual Instances,
+modules/apps/portal-background-task,Portal Services,Core Infrastructure
+modules/apps/portal-cache,Portal Services,Core Infrastructure
+modules/apps/portal-configuration,Portal Configuration,Core Infrastructure
+modules/apps/portal-crypto-hash,Password,Application Security
+modules/apps/portal-instances,Instance Settings,
+modules/apps/portal-instances,Virtual Instances,Database Infrastructure
+modules/apps/portal-language,Language Override,Platform Experience
+modules/apps/portal-lock,Portal Services,Core Infrastructure
+modules/apps/portal-model-relationship,Staging,Business Process Management
+modules/apps/portal-odata,Headless Batch Engine API,Core Infrastructure
+modules/apps/portal-osgi-debug,Portal Services,Core Infrastructure
+modules/apps/portal-portlet-bridge,Portal Services,Core Infrastructure
+modules/apps/portal-relationship,Portal Services,Core Infrastructure
+modules/apps/portal-remote,Web Services,Core Infrastructure
+modules/apps/portal-reports-engine,Reports,Business Process Management
+modules/apps/portal-rules-engine,Rules,Business Process Management
+modules/apps/portal-scheduler,Scheduler,Core Infrastructure
+modules/apps/portal-scripting,Server Administration,Core Infrastructure
+modules/apps/portal-search,Search,
+modules/apps/portal-search,Web Search,Search
+modules/apps/portal-search-elasticsearch7,Search Infrastructure > Elasticsearch Connector,Search
+modules/apps/portal-search-elasticsearch8,Search Infrastructure > Elasticsearch Connector,Search
+modules/apps/portal-search-elasticsearch8/portal-search-elasticsearch8-impl/src/main,Search Infrastructure > Elasticsearch Connector,
+modules/apps/portal-search-opensearch2,Search Infrastructure > OpenSearch Connector,Search
+modules/apps/portal-search-solr8,Search Infrastructure > Solr Connector,Search
+modules/apps/portal-security,Auth Verifiers,
+modules/apps/portal-security,Auto Login,
+modules/apps/portal-security,Security,Application Security
+modules/apps/portal-security-audit,Audit,Application Security
+modules/apps/portal-security-sso,LDAP,
+modules/apps/portal-security-sso,OpenID Connect,
+modules/apps/portal-security-sso,Security,Application Security
+modules/apps/portal-settings,Login,Application Security
+modules/apps/portal-store,Document Library Stores,Core Infrastructure
+modules/apps/portal-template,Templates Engine,Core Infrastructure
+modules/apps/portal-transaction,Portal Services,Core Infrastructure
+modules/apps/portal-url-builder,Frontend Other,Frontend Infrastructure
+modules/apps/portal-validation,Staging,Core Infrastructure
+modules/apps/portal-vulcan,REST Infrastructure,Headless
+modules/apps/portal-workflow,Workflow,Business Process Management
+modules/apps/portlet,Portal Services,Page Management
+modules/apps/portlet-configuration,Widget Configuration,Page Management
+modules/apps/portlet-dependency-factory,Portal Services,Page Management
+modules/apps/portlet-display-template,Widget Page Templates,Page Management
+modules/apps/portlet-preferences,Portal Services,Page Management
+modules/apps/product-analytics,Product Analytics,Analytics Cloud
+modules/apps/product-navigation,Control Menu,Platform Experience
+modules/apps/push-notifications,Notifications,Content Management
+modules/apps/questions,Questions,Content Management
+modules/apps/ratings,Ratings,Content Management
+modules/apps/reading-time,Blogs,Content Management
+modules/apps/redirect,URL Redirections,Site Management
+modules/apps/repository,Documents and Media,Content Management
+modules/apps/roles,Permissions,
+modules/apps/roles,Roles,Commerce
+modules/apps/rss,RSS Publisher Widget,Content Management
+modules/apps/sanitizer,AntiSamy,Core Infrastructure
+modules/apps/saved-content,Documents and Media,Content Management
+modules/apps/search,Search Infrastructure,Search
+modules/apps/segments,Segmentation,Analytics Cloud
+modules/apps/server,Server Administration,Core Infrastructure
+modules/apps/service-component,Portal Services,Core Infrastructure
+modules/apps/shared-dependencies,Portal Services,Core Infrastructure
+modules/apps/sharing,Asset Sharing,Site Management
+modules/apps/site,Site Teams,
+modules/apps/site,Site Templates,
+modules/apps/site,Sites Administration,Site Management
+modules/apps/site-initializer,Site Management > Site Initializer,Site Management
+modules/apps/site-initializer/site-initializer-extender,Site Management > Site Initializer,
+modules/apps/site-navigation,Navigation Menus,Site Management
+modules/apps/social,Social Bookmarks,Content Management
+modules/apps/staging,Staging,Headless
+modules/apps/static,File Install,Core Infrastructure
+modules/apps/style-book,Style Books,Platform Experience
+modules/apps/subscription,My Subscriptions Widget,Content Management
+modules/apps/template,Templates,Page Management
+modules/apps/text-localizer,Users and Organizations,Content Management
+modules/apps/translation,Translations Management,Content Management
+modules/apps/trash,Recycle Bin,Content Management
+modules/apps/upload,Item Selector,Content Management
+modules/apps/user,User Management,Commerce
+modules/apps/user,Users and Organizations,Commerce
+modules/apps/user-associated-data,Personal Data,Commerce
+modules/apps/user-groups-admin,User Groups,Commerce
+modules/apps/users-admin,Users and Organizations,Commerce
+modules/apps/view-count,Util,Core Infrastructure
+modules/apps/website,Personal Data,Commerce
+modules/apps/websocket,Portal Services,Core Infrastructure
+modules/apps/wiki,Wiki,Content Management
+modules/apps/words,,Content Management
+modules/apps/xstream,Portal Services,Content Management
+modules/core/petra,Core Infrastructure,Core Infrastructure
+modules/core/portal-bootstrap,Core Infrastructure,Core Infrastructure
+modules/dxp/apps/ai-hub,AI Hub,Content Management
+modules/dxp/apps/akismet,Akismet,Content Management
+modules/dxp/apps/analytics,A/B Test,
+modules/dxp/apps/analytics,Analytics Cloud,Analytics Cloud
+modules/dxp/apps/antivirus,Antivirus,Application Security
+modules/dxp/apps/commerce,Commerce,Commerce
+modules/dxp/apps/commerce-avalara,Commerce,Commerce
+modules/dxp/apps/commerce-demo-pack,Commerce,Commerce
+modules/dxp/apps/commerce-punchout,Commerce,Commerce
+modules/dxp/apps/digital-sales-room,Commerce,Commerce
+modules/dxp/apps/document-library-opener,External Document Repositories,Content Management
+modules/dxp/apps/enterprise-product-notification,User Notifications,Content Management
+modules/dxp/apps/frontend-theme,Liferay Themes,Platform Experience
+modules/dxp/apps/multi-factor-authentication,Multi Factor Authentication,Application Security
+modules/dxp/apps/osb,Analytics Cloud,NoMappedTeam
+modules/dxp/apps/portal,Database Access,
+modules/dxp/apps/portal,Portal Services,Core Infrastructure
+modules/dxp/apps/portal-reports-engine-console,Reports,Business Process Management
+modules/dxp/apps/portal-rules-engine-drools,Rules,Business Process Management
+modules/dxp/apps/portal-search-elasticsearch-cross-cluster-replication,Search Infrastructure > Elasticsearch Connector,Search
+modules/dxp/apps/portal-search-elasticsearch-monitoring,Search Infrastructure > Elasticsearch Connector,Search
+modules/dxp/apps/portal-search-learning-to-rank,Search Infrastructure > Elasticsearch Connector,Search
+modules/dxp/apps/portal-search-similar-results,Search Infrastructure > Elasticsearch Connector,Search
+modules/dxp/apps/portal-search-tuning,Search Infrastructure > Elasticsearch Connector,Search
+modules/dxp/apps/portal-security-audit,Audit,Application Security
+modules/dxp/apps/portal-workflow,Workflow Metrics,Business Process Management
+modules/dxp/apps/portal-workflow-kaleo-forms,Kaleo Designer,
+modules/dxp/apps/portal-workflow-kaleo-forms,Kaleo Forms Admin,Business Process Management
+modules/dxp/apps/salesforce-connector,Commerce,Commerce
+modules/dxp/apps/saml,SAML,Application Security
+modules/dxp/apps/scim,SCIM,Application Security
+modules/dxp/apps/search-experiences,Search Blueprints,Search
+modules/dxp/apps/segments,Segmentation,Analytics Cloud
+modules/dxp/apps/sharepoint-rest,External Document Repositories,Content Management
+modules/dxp/apps/sharepoint-soap,External Document Repositories,Content Management
+modules/util/portal-tools-db-migration-importer,Database Upgrade Framework,
+modules/util/portal-tools-db-partition-migration-validator,Database Partitioning,
+modules/util/portal-tools-db-upgrade-client,Database Upgrade Tool,
+portal-impl,Data Cleanup,
+portal-impl,Database Access,
+portal-impl,Database Partitioning,
+portal-impl,Database Upgrade Framework,
+portal-impl,Portal Services,Core Infrastructure
+portal-impl/src/com,Core Infrastructure,Core Infrastructure
+portal-kernel,Data Cleanup,
+portal-kernel,Database Access,
+portal-kernel,Database Partitioning,
+portal-kernel,Database Upgrade Framework,
+portal-kernel,Portal Services,Core Infrastructure
+portal-kernel,Virtual Instances,
+portal-kernel/src/com,Core Infrastructure,Core Infrastructure
+util-java,Core Infrastructure Util,Core Infrastructure
+util-taglib/src/com,Frontend Taglib,Frontend Infrastructure

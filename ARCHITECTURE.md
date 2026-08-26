@@ -146,6 +146,34 @@ additive scope.)
 > land here, and **tune the rubric after analyzing human overrides**. Deliberately
 > **no second classification pass** (extra tokens for little gain). See §13 (resolved).
 
+### The component → team map — RAP's file, copied
+
+`config/module_component_map.csv` (`module_path, testray_component, team_name`)
+is read by `prompt_helpers.load_component_map()`, and through it by
+`team_for_component()`, which fills `team_name` on rows where Testray left it
+blank. Triage reads the **CSV directly rather than the database** so the tool
+runs on a dev laptop with no local `release_analytics` instance — that is the
+whole reason the file exists here instead of a query.
+
+It is a **copy** of the identically-named file in `liferay-release-analytics`,
+where it is tracked under LPD-82941 and is itself treated as generated output.
+Two consequences worth knowing:
+
+- **It will drift.** This copy is frozen at RAP's state on the day it was
+  taken; nothing signals when the upstream one changes. **Edit RAP's copy and
+  re-copy** — do not fix a mapping only here.
+- **Line endings differ.** Git normalises this copy to LF while RAP's is CRLF,
+  so comparing them needs `diff --strip-trailing-cr`. Both parse identically:
+  Python opens the file in text mode, so universal newlines strip the `\r`
+  before `csv.DictReader` ever sees a value.
+
+> **Planned — the generator moves into this repo.** The mapping is currently
+> hand-maintained, which is why it is a checked-in artifact at all. The intent
+> is for *this* repo to own the pipeline that produces it, from three sources:
+> **CODEOWNERS** for `team_name`, **Jira** (the story export plus the component
+> alias list) for the Jira-side component, and `test.properties` for the Testray
+> component. Until that lands, the CSV is the contract and RAP is upstream of it.
+
 ## 5. What gets cut in the extraction
 
 These pieces existed only because the previous Release Analytics Platform ran
