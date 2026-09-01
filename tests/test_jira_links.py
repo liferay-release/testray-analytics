@@ -40,12 +40,26 @@ def _row(cid=1, sid=555):
     )
 
 
+def _create_href(html_text: str) -> str:
+    """The Create-Jira-Ticket URL out of a rendered report.
+
+    Matched on the Jira endpoint rather than on a CSS class: these tests are
+    about what goes INTO the URL, and they should not break again the next
+    time the link is restyled or moved (it has already moved once, from a
+    bare `a.jira-create` button into the actions kebab).
+    """
+    import html as H
+    import re
+    m = re.search(r'href="([^"]*CreateIssueDetails[^"]*)"', html_text)
+    assert m, "no Create Jira Ticket link in the rendered report"
+    return H.unescape(m.group(1))
+
+
 def _jira_params(tmp_path, meta):
     render_run(tmp_path, pd.DataFrame([_row()]), meta)
     html = (tmp_path / "report.html").read_text(encoding="utf-8")
-    href = html.split('class="jira-create" href="')[1].split('"')[0]
-    import html as H
-    return urllib.parse.parse_qs(urllib.parse.urlparse(H.unescape(href)).query)
+    href = _create_href(html)
+    return urllib.parse.parse_qs(urllib.parse.urlparse(href).query)
 
 
 # --- settings resolution ---------------------------------------------------
@@ -164,8 +178,7 @@ def test_long_fields_are_capped(tmp_path):
     row["reason"] = "R" * 9000
     render_run(tmp_path, pd.DataFrame([row]), META)
     html = (tmp_path / "report.html").read_text(encoding="utf-8")
-    import html as H
-    href = H.unescape(html.split('class="jira-create" href="')[1].split('"')[0])
+    href = _create_href(html)
     p = urllib.parse.parse_qs(urllib.parse.urlparse(href).query)
     assert len(p["summary"][0]) <= _JIRA_SUMMARY_MAX
     assert len(p["description"][0]) <= _JIRA_DESC_MAX

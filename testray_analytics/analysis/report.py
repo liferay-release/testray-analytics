@@ -34,6 +34,7 @@ palette. That is a deliberate split, not drift.
 import collections
 import html
 import json
+import re
 import urllib.parse
 from pathlib import Path
 
@@ -173,7 +174,12 @@ _CSS = """
     border: 1px solid var(--c-border); border-radius: 4px;
   }
   .matrix table { margin: 0 auto; }
-  .matrix-title { font-weight: 700; font-size: 13px; margin-bottom: 6px; }
+  /* Was "Runs", which named the thing without explaining how to read it.
+     Wraps rather than forcing the panel wider. */
+  .matrix-title {
+    font-weight: 600; font-size: 12px; margin-bottom: 8px;
+    color: var(--c-muted); line-height: 1.35; text-align: center;
+  }
   .matrix table { width: auto; border-collapse: collapse; font-size: 12px; }
   .matrix th {
     position: static; background: none; border: none; padding: 5px 20px;
@@ -185,9 +191,19 @@ _CSS = """
     padding: 9px 20px; text-align: center; font-weight: 700;
     border: 1px solid #edf0f3; font-size: 13px; min-width: 74px;
   }
+  /* The count stays the loud thing; the note is a caption under it, not a
+     second number competing with it. */
+  .matrix .cell-n { display: block; }
+  .matrix .cell-note {
+    display: block; font-size: 9.5px; font-weight: 500; line-height: 1.2;
+    margin-top: 2px; opacity: .75; white-space: nowrap;
+  }
   .matrix td.same   { background: #f4f6f8; color: var(--c-fg); }
   .matrix td.worse  { background: #fdecea; color: #a4302a; }
   .matrix td.better { background: #e9f7ef; color: #1e6b45; }
+  /* Neither a fix nor a regression — counted, but making no claim. Kept
+     visually distinct from the grey diagonal, which means "unchanged". */
+  .matrix td.neutral { background: #fbfcfd; color: var(--c-fg); }
   .matrix td.zero   { background: #fbfcfd; }
   .totals .pill {
     display: inline-flex; align-items: baseline; gap: 6px; font-size: 13px;
@@ -267,13 +283,22 @@ _CSS = """
     display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
     min-width: 0;
   }
-  .filters label { font-weight: 600; }
+  .filters label { font-weight: 600; white-space: nowrap; }
+  /* A label and its select are ONE flex item, so a wrap can never separate
+     them — that is what stranded "Transition:" on a line above its dropdown. */
+  .filter-field {
+    display: flex; align-items: center; gap: 6px; min-width: 0; flex: 0 1 auto;
+  }
   /* The selects must be able to shrink: five of them at a fixed 200px kept
      the controls column above 1000px, which forced the matrix to wrap onto
-     its own row instead of sitting beside them. */
-  .filters select { min-width: 0; flex: 1 1 140px; max-width: 220px; }
+     its own row instead of sitting beside them. Widths are per-vocabulary so
+     all five fit one row — Confidence holds four short words and does not
+     need the same room as Component. */
+  .filters select { min-width: 0; flex: 1 1 auto; }
+  .ff-lg select { flex-basis: 130px; max-width: 190px; }
+  .ff-md select { flex-basis: 104px; max-width: 132px; }
+  .ff-sm select { flex-basis: 74px;  max-width: 92px; }
   .filters input[type="search"] { min-width: 0; flex: 1 1 220px; }
-  .filters-row > label { white-space: nowrap; }
   .filters .visible-count { color: var(--c-muted); margin-left: auto; }
   button.cluster-btn {
     font: inherit; font-size: 12.5px; padding: 4px 10px;
@@ -324,14 +349,58 @@ _CSS += """
   th.col-culprit, td.col-culprit { min-width: 220px; }
   th.col-reasoning, td.col-reasoning { min-width: 320px; }
   td.col-culprit, td.col-reasoning { white-space: normal; line-height: 1.45; }
-  th.col-jira, td.col-jira { width: 110px; text-align: center; }
-  th.col-jira { cursor: help; }
-  a.jira-create {
-    display: inline-block; padding: 4px 10px; background: #0052cc;
-    color: #fff; border-radius: 3px; font-size: 12px;
-    text-decoration: none; white-space: nowrap;
+  /* Issues already linked on the CaseResult. Its own column so a key is
+     scannable down the table; the global overflow-wrap:anywhere would
+     otherwise split one mid-token ("LPD-" / "99999"), so wrap BETWEEN keys. */
+  /* 92px fitted "Ticket"; "Existing Ticket" needs the extra room to stay on
+     one line beside its sort arrow. */
+  th.col-ticket, td.col-ticket { width: 112px; text-align: center; }
+  td.col-ticket { font-size: 11.5px; }
+  .ticket-key {
+    display: inline-block; overflow-wrap: normal; white-space: nowrap;
+    word-break: normal;
   }
-  a.jira-create:hover { background: #0747a6; }
+  .ticket-key + .ticket-key { margin-left: 4px; }
+  .ticket-none { color: var(--c-muted); }
+
+  /* A kebab needs a fraction of the 110px the "Create ticket" button did.
+     Linked issues used to share this cell and forced it wider; they have
+     their own Ticket column now. */
+  th.col-jira, td.col-jira { width: 56px; text-align: center; }
+  th[title], .filter-field[title], .viewbar-label[title] { cursor: help; }
+  .actions-menu { display: inline-block; position: relative; }
+  .actions-kebab {
+    background: none; border: 1px solid transparent; border-radius: 3px;
+    color: var(--c-muted); cursor: pointer; line-height: 0; padding: 4px 6px;
+  }
+  .actions-kebab:hover, .actions-kebab.is-open {
+    background: #e4eaf0; border-color: #c9d2db; color: var(--c-fg);
+  }
+  .actions-kebab svg { fill: currentColor; }
+  /* Right-aligned because this is the last column — a left-aligned menu
+     would run off the page. z-index clears the rows below it. */
+  .actions-list {
+    background: #fff; border: 1px solid #cdd5dd; border-radius: 4px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.14);
+    min-width: 190px; padding: 4px 0; position: absolute; right: 0;
+    text-align: left; top: calc(100% + 2px); z-index: 20;
+  }
+  .actions-item {
+    color: var(--c-fg); display: block; font-size: 12.5px;
+    padding: 6px 12px; text-decoration: none; white-space: nowrap;
+  }
+  a.actions-item:hover { background: #eef1f4; }
+  /* Disabled, not hidden: the menu is landing before two of its three
+     actions work, and saying what is coming is the point. */
+  .actions-item.is-pending {
+    align-items: center; color: var(--c-muted); cursor: default;
+    display: flex; gap: 8px; justify-content: space-between;
+  }
+  .actions-soon {
+    background: #eef1f4; border-radius: 8px; color: var(--c-muted);
+    font-size: 9.5px; letter-spacing: 0.04em; padding: 1px 6px;
+    text-transform: uppercase;
+  }
   /* ---- click-to-expand rows -------------------------------------------- */
   tr.case-row { cursor: pointer; }
   tr.case-row:hover td { background: #eef1f4; }
@@ -389,7 +458,6 @@ _CSS += """
   tr.cluster-row > td.cluster-reason { font-size: 12.5px; line-height: 1.5; white-space: normal; }
   tr.cluster-row .cluster-title { font-weight: 700; }
   .cluster-reason-mixed { font-style: italic; color: #42526e; }
-  tr.cluster-row a.jira-create { font-size: 11.5px; padding: 3px 8px; white-space: normal; }
   /* Member rows: indented, shared cells collapse to a pointer. */
   tr.case-row.in-cluster td.col-idx { padding-left: 18px; }
   .same-as-cluster { color: var(--c-muted); font-size: 12px; white-space: nowrap; }
@@ -399,6 +467,92 @@ _CSS += """
   .same-as-cluster a { color: #0747a6; text-decoration: none; }
   .same-as-cluster a:hover { text-decoration: underline; }
   .cluster-key { font-size: 11px; color: var(--c-muted); }
+  details.pre-existing { margin-top: 28px; }
+  details.pre-existing > summary {
+    cursor: pointer; padding: 8px 10px; border: 1px solid var(--c-border);
+    border-radius: 4px; background: var(--c-row); font-size: 14px;
+  }
+  details.pre-existing > summary .hint {
+    display: block; font-weight: 400; margin-top: 2px;
+  }
+  details.pre-existing > table { margin-top: 10px; }
+
+  /* Reads as a link, not as a code chip. The grey `code` background made it
+     look like the inert run-id and mode chips beside it in the summary line,
+     so the one clickable thing there was the one nobody clicked. Underlined by
+     default rather than on hover — hover discovery does not work for something
+     a reader has no reason to hover over. */
+  a.hash-link code {
+    background: none; padding: 0; border-radius: 0;
+    color: #0747a6; text-decoration: underline;
+  }
+  a.hash-link { text-decoration: none; }
+  a.hash-link:hover code { color: #0747a6; text-decoration: underline;
+    text-decoration-thickness: 2px; }
+  /* Handoff prompt. The text is always visible and selectable, so the copy
+     button is a convenience rather than the only route: an artifact renders in
+     a sandboxed frame where the clipboard API can be blocked outright. */
+  .handoff { display: flex; flex-direction: column; gap: 6px; align-items: flex-start; }
+  /* The prompt rides inside the menu as hidden text for the copy handler
+     to read; it must never take part in the menu's layout. */
+  .actions-list pre.handoff-text { display: none !important; }
+  button.actions-item.handoff-copy {
+    background: none; border: 0; color: var(--c-fg); cursor: pointer;
+    font: inherit; font-size: 12.5px; padding: 6px 12px; text-align: left;
+    width: 100%;
+  }
+  button.actions-item.handoff-copy:hover { background: #eef1f4; }
+  button.handoff-copy {
+    font: inherit; font-size: 12px; padding: 3px 10px; cursor: pointer;
+    background: #0052cc; color: #fff; border: 1px solid #0747a6;
+    border-radius: 3px;
+  }
+  button.handoff-copy:hover { background: #0747a6; }
+  button.handoff-copy.copied { background: #1e6b45; border-color: #1e6b45; }
+  .handoff-hint { color: var(--c-muted); font-size: 11.5px; }
+  pre.handoff-text {
+    margin: 0; padding: 10px 12px; width: 100%; max-height: 260px;
+    overflow: auto; background: var(--c-code-bg);
+    border: 1px solid var(--c-border); border-radius: 3px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 11.5px; line-height: 1.45; white-space: pre-wrap;
+  }
+  .pre-count { color: var(--c-muted); font-weight: 400; margin-left: 8px;
+    font-size: 12px; }
+  details.verdict-legend { margin-top: 14px; }
+  details.verdict-legend > summary {
+    cursor: pointer; padding: 8px 10px; border: 1px solid var(--c-border);
+    border-radius: 4px; background: var(--c-row); font-size: 14px;
+  }
+  details.verdict-legend > summary .hint {
+    display: block; font-weight: 400; margin-top: 2px;
+  }
+  .legend-grid {
+    display: grid; grid-template-columns: max-content 1fr;
+    gap: 8px 14px; align-items: baseline; margin: 12px 4px 4px;
+  }
+  .legend-item { display: contents; }
+  .legend-text { color: var(--c-fg); font-size: 12.5px; line-height: 1.5; }
+
+  /* Candidate tickets, shown when the classifier named causes but no file. */
+  .cause-tickets { display: flex; flex-wrap: wrap; gap: 4px; }
+  a.cause-ticket {
+    display: inline-block; padding: 1px 6px; border-radius: 3px;
+    background: var(--c-code-bg); border: 1px solid var(--c-border);
+    color: #0747a6; text-decoration: none;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px;
+  }
+  a.cause-ticket:hover { text-decoration: underline; }
+
+  /* Flaky is a modifier on the verdict, not a verdict — hence a badge that
+     sits beside the pill rather than another pill colour. */
+  .flaky-badge {
+    display: inline-block; margin-left: 4px; padding: 0 5px;
+    border: 1px dashed #b7791f; border-radius: 3px;
+    color: #8a6116; background: #fdf6e3;
+    font-size: 10px; font-weight: 700; letter-spacing: .04em; vertical-align: middle;
+  }
+
   /* The ticket/commit that touched the culprit file — the actionable half. */
   .culprit-commits {
     font-size: 11.5px; color: #42526e; margin-top: 3px; line-height: 1.4;
@@ -488,7 +642,103 @@ _JS = """
     applyFilters();
   }
 
+  // ---- handoff prompt ---------------------------------------------------
+  // Selects the text as the fallback rather than reporting failure: in a
+  // sandboxed frame navigator.clipboard can be missing or rejected, and a
+  // selected block still answers Ctrl-C.
   document.addEventListener('click', function (e) {
+    var btn = e.target.closest('button.handoff-copy');
+    if (!btn) return;
+    // Inside the kebab the menu's own handler would otherwise treat this as a
+    // click on a menu item and close the menu before the copy resolves.
+    e.stopPropagation();
+    e.preventDefault();
+    var scope = btn.closest('.actions-list') || btn.parentNode;
+    var pre = scope.querySelector('pre.handoff-text');
+    if (!pre) return;
+
+    // execCommand('copy') via a throwaway textarea. Needed because
+    // navigator.clipboard is rejected outright in a sandboxed artifact frame
+    // (NotAllowedError), and because selecting the menu's hidden <pre> copies
+    // NOTHING — a display:none element has no selectable content, so the
+    // earlier "Selected — press Ctrl-C" fallback was telling the reader
+    // something untrue. This actually puts the text on the clipboard.
+    function legacyCopy(text) {
+      var ta = document.createElement('textarea');
+      ta.value = text;
+      ta.setAttribute('readonly', '');
+      ta.style.position = 'fixed';
+      ta.style.top = '0';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      var ok = false;
+      try { ok = document.execCommand('copy'); } catch (err) { ok = false; }
+      document.body.removeChild(ta);
+      return ok;
+    }
+    function done(label) {
+      var was = btn.textContent;
+      btn.textContent = label;
+      btn.classList.add('copied');
+      setTimeout(function () {
+        btn.textContent = was;
+        btn.classList.remove('copied');
+      }, 1600);
+    }
+
+    var text = pre.textContent;
+    function fallback() {
+      // Only ever report what actually happened. If both routes fail the
+      // prompt is still readable and selectable in the row's detail panel,
+      // so say that rather than claiming a copy that did not occur.
+      done(legacyCopy(text) ? 'Copied' : 'Copy failed — open row detail');
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(function () { done('Copied'); },
+                                              fallback);
+    } else {
+      fallback();
+    }
+  }, true);
+
+  // ---- actions kebab ----------------------------------------------------
+  // One open menu at a time. The row underneath expands on click, so every
+  // path here returns before the row handler below can see the event — the
+  // CX gets this from stopPropagation on the wrapper; here the guard in the
+  // row handler does the same job.
+  function closeMenus(except) {
+    document.querySelectorAll('.actions-menu').forEach(function (m) {
+      if (m === except) return;
+      m.querySelector('.actions-list').hidden = true;
+      var b = m.querySelector('.actions-kebab');
+      b.classList.remove('is-open');
+      b.setAttribute('aria-expanded', 'false');
+    });
+  }
+
+  document.addEventListener('click', function (e) {
+    var kebab = e.target.closest('.actions-kebab');
+    if (kebab) {
+      var menu = kebab.closest('.actions-menu');
+      var list = menu.querySelector('.actions-list');
+      var open = list.hidden;
+      closeMenus(menu);
+      list.hidden = !open;
+      kebab.classList.toggle('is-open', open);
+      kebab.setAttribute('aria-expanded', open ? 'true' : 'false');
+      return;
+    }
+    if (!e.target.closest('.actions-menu')) closeMenus(null);
+  }, true);
+
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape') closeMenus(null);
+  });
+
+  document.addEventListener('click', function (e) {
+    // A click inside the menu must not also fold the cluster or expand the row.
+    if (e.target.closest('.actions-menu') || e.target.closest('.handoff')) return;
     var head = e.target.closest('tr.cluster-row');
     if (head && !e.target.closest('a')) {
       setCluster(head, !head.classList.contains('expanded'));
@@ -534,11 +784,18 @@ _JS = """
       return sel[k] && sel[k].value;
     });
     var shown = 0;
+    var matched = 0;
     document.querySelectorAll('tr.case-row').forEach(function (tr) {
       var hit = matches(tr);
-      // A filter hit always shows, even inside a collapsed cluster —
-      // otherwise a search silently misses rows that are folded away.
-      var hide = !hit || (!filtering && tr.dataset.collapsed === '1');
+      if (hit) matched++;
+      // `collapsed` is ALWAYS honoured. This used to read
+      // `!hit || (!filtering && collapsed)`, which kept a matching row visible
+      // no matter what — so while a filter was active a cluster could not be
+      // collapsed at all: the header arrow flipped and the rows stayed put.
+      // Revealing folded-away matches is still wanted, but it belongs at the
+      // moment a filter CHANGES (onFilterChanged), not in a rule that
+      // overrides every later click.
+      var hide = !hit || tr.dataset.collapsed === '1';
       // Whether a row MATCHED is distinct from whether it is displayed: a
       // collapsed cluster still owns its rows, so its header must stay
       // clickable. Conflating the two made "Collapse all" hide the headers
@@ -560,15 +817,72 @@ _JS = """
       });
       head.hidden = !any;
     });
-    count.textContent = shown + ' of ' + document.querySelectorAll('tr.case-row').length + ' shown';
+    // Report MATCHES, not visible rows. Counting what is displayed read
+    // "0 of 93 shown" whenever the table was collapsed — which is its default
+    // state — and that looks like nothing matched rather than nothing expanded.
+    var total = document.querySelectorAll('tr.case-row').length;
+    count.textContent = filtering
+      ? matched + ' of ' + total + ' match'
+      : total + (total === 1 ? ' row' : ' rows');
+
+    // The pre-existing rows are on the page, so the filters have to reach them
+    // too — otherwise selecting Transition=same_failure emptied the table and
+    // silently left seven matching rows sitting below it. They carry the same
+    // data-* keys, and no data-verdict/-confidence, so a verdict or confidence
+    // filter correctly excludes them: they were never classified.
+    var pre = document.querySelectorAll('tr.pre-row');
+    if (pre.length) {
+      var preShown = 0;
+      pre.forEach(function (tr) {
+        var hit = matches(tr);
+        tr.hidden = !hit;
+        if (hit) preShown++;
+      });
+      var box = document.querySelector('details.pre-existing');
+      var label = document.getElementById('pre-count');
+      if (label) {
+        label.textContent = filtering
+          ? preShown + ' of ' + pre.length + ' match'
+          : '';
+      }
+      // A match must not stay hidden inside a folded section, the same reason a
+      // hit inside a collapsed cluster is forced open.
+      if (box && filtering && preShown) box.open = true;
+    }
+  }
+
+  var wasFiltering = false;
+
+  function isFiltering() {
+    if (search.value.trim()) return true;
+    return Object.keys(sel).some(function (k) {
+      return sel[k] && sel[k].value;
+    });
+  }
+
+  // Runs when a FILTER control changes — never when a cluster is toggled, which
+  // is the distinction that lets an explicit collapse survive an active filter.
+  function onFilterChanged() {
+    // Filtering narrows the OVERVIEW, so it collapses rather than expands: the
+    // matching cluster headers are the answer, and their members are one click
+    // away. An earlier version expanded every matching group, which turned a
+    // filter into a wall of member rows and buried the thing being looked for.
+    //
+    // Nothing is hidden by this. applyFilters marks a row matched whether or
+    // not it is displayed, and a header shows whenever any of its members
+    // matched — so a search still surfaces a hit inside a folded cluster, as
+    // that header.
+    setAll(false);
+    wasFiltering = isFiltering();
+    applyFilters();
   }
 
   Object.keys(sel).forEach(function (k) {
-    if (sel[k]) sel[k].addEventListener('change', applyFilters);
+    if (sel[k]) sel[k].addEventListener('change', onFilterChanged);
   });
-  search.addEventListener('input', applyFilters);
+  search.addEventListener('input', onFilterChanged);
   search.addEventListener('keydown', function (e) {
-    if (e.key === 'Escape') { search.value = ''; applyFilters(); }
+    if (e.key === 'Escape') { search.value = ''; onFilterChanged(); }
   });
   document.getElementById('group-by').addEventListener('change', function (e) {
     regroup(e.target.value);
@@ -844,7 +1158,13 @@ def _header_row(mode: str, idx: int, label: str, members: pd.DataFrame,
         culprit_cell = (f'<span class="cluster-culprit-none" title="{_esc(" · ".join(sorted(culprits)))}">'
                         f"{len(culprits)} files</span>")
     else:
-        culprit_cell = '<span class="cluster-culprit-none">no culprit named</span>'
+        # No file named anywhere in the cluster — fall back to the candidate
+        # tickets its members named instead, so the header carries the same
+        # actionable content the member rows now do.
+        chips = _cause_tickets(meta, " ; ".join(
+            _text(x) for x in members.get("specific_change", [])))
+        culprit_cell = (f'<div class="cause-tickets">{chips}</div>' if chips
+                        else '<span class="cluster-culprit-none">no cause named</span>')
 
     reasons = {r for r in (_text(x) for x in members.get("reason", [])) if r}
     if len(reasons) == 1:
@@ -872,17 +1192,26 @@ def _header_row(mode: str, idx: int, label: str, members: pd.DataFrame,
         + _rollup_cell(members.get("team_name", []), "col-team")
         + _rollup_cell(members.get("component_name", []), "col-comp")
         + '<td class="col-status cluster-cell"></td>'
-        + f'<td class="col-verdict cluster-cell"{_verdict_rank_attr(verdict)}>{_verdict_span(verdict)}</td>'
+        + f'<td class="col-verdict cluster-cell"{_verdict_rank_attr(verdict)}>'
+          f'{_verdict_span(verdict)}{_flaky_badge(members)}</td>'
         f'<td class="col-confidence cluster-cell"{_conf_rank_attr(top)}'
         + (f' title="Highest confidence in this group. Breakdown: {_esc(breakdown)}"' if breakdown else "")
         + f">{_conf_span(top)}</td>"
         f'<td class="col-culprit cluster-cell cluster-culprit">{culprit_cell}</td>'
         f'<td class="col-reasoning cluster-cell cluster-reason">{reason_cell}</td>'
+        + _ticket_cell(members.get("linked_issues", []), cluster=True)
         + f'<td class="col-jira cluster-cell">'
-        + _jira_link(meta, verdict=verdict,
-                     summary_text=(next(iter(reasons)) if len(reasons) == 1 else ''),
-                     rows=[members.iloc[0]] if len(members) else [],
-                     n=n)
+        + _actions_menu(
+            _jira_href(meta, verdict=verdict,
+                       summary_text=(next(iter(reasons)) if len(reasons) == 1 else ''),
+                       rows=[members.iloc[0]] if len(members) else [],
+                       n=n),
+            label="Actions for this cluster",
+            prompt=(_reviewer_prompt(
+                        members.iloc[0], meta,
+                        [_text(t) for t in members.get("test_case", [])],
+                        verdict=verdict)
+                    if verdict in _NEEDS_HUMAN and len(members) else None))
         + '</td>'
         "</tr>"
     )
@@ -896,6 +1225,14 @@ def _member_rows(df: pd.DataFrame, meta: dict, cluster_no: dict[str, int],
     re-rendered per mode: a row's identity does not change when you regroup it,
     and duplicating rows would duplicate their ids.
     """
+    # clusterKey -> its member test names, one pass. Not recomputed per row:
+    # see the warning in _cluster_index about per-row _cluster_of calls.
+    tests_by_cluster: dict[str, list[str]] = {}
+    for pos, ck in enumerate(ckeys):
+        name = _text(df.iloc[pos].get("test_case"))
+        if name:
+            tests_by_cluster.setdefault(ck, []).append(name)
+
     parts = []
     for i, (_, r) in enumerate(df.iterrows()):
         verdict = _text(r.get("display_verdict")) or _text(r.get("classification"))
@@ -933,10 +1270,9 @@ def _member_rows(df: pd.DataFrame, meta: dict, cluster_no: dict[str, int],
         if cno is not None and culprit and _shared_in_cluster(shared, ckey, "culprit_file", culprit):
             culprit_cell = _collapsible(f"<code>{_esc(culprit)}</code>", culprit)
         else:
-            culprit_cell = f"<code>{_esc(culprit)}</code>" if culprit else "—"
-            commits = _text(r.get("culprit_commits"))
-            if culprit and commits:
-                culprit_cell += f'<div class="culprit-commits">{_esc(commits)}</div>'
+            culprit_cell = _cause_cell(meta, culprit,
+                                       _text(r.get("culprit_commits")),
+                                       r.get("specific_change"))
 
         # A cluster with one verdict says it once, on its header. Repeating it
         # on every member is the noise that made the flat table unreadable.
@@ -946,17 +1282,31 @@ def _member_rows(df: pd.DataFrame, meta: dict, cluster_no: dict[str, int],
             verdict_cell = _collapsible(_verdict_span(verdict), verdict)
         else:
             verdict_cell = _verdict_span(verdict)
+        # Flaky is a MODIFIER, not a verdict. A test can be known-flaky and
+        # still need review — the two answer different questions ("how much do
+        # we trust this signal" vs "what is the failure"), so the badge sits
+        # beside the pill instead of replacing it. Same shape as
+        # NOT_ATTRIBUTABLE in verdicts.py: display-only, nothing stored.
+        if _is_flaky(r):
+            verdict_cell += (' <span class="flaky-badge" title="Marked flaky on '
+                             'the Testray case — excluded from classification, '
+                             'shown for awareness.">FLAKY</span>')
         conf = _text(r.get("confidence"))
         if cno is not None and _shared_in_cluster(shared, ckey, "confidence", conf):
             conf_cell = _collapsible(_conf_span(conf), conf)
         else:
             conf_cell = _conf_span(r.get("confidence"))
 
-        issues = _text(r.get("linked_issues"))
-        # An already-linked issue wins: the button exists to avoid filing
-        # a duplicate, so where Testray already has one we show that.
-        jira_cell = _esc(issues) if issues else _jira_link(
-            meta, verdict=verdict, summary_text=reason, rows=[r], n=1)
+        # Ticket and Actions are separate columns now: "has this been filed
+        # already" is a fact about the failure, "file it" is something you do.
+        # They used to share one cell, which meant a row with a linked issue
+        # offered no way to act on it at all.
+        ticket_cell = _ticket_cell([r.get("linked_issues")])
+        actions_cell = _actions_menu(
+            _jira_href(meta, verdict=verdict, summary_text=reason,
+                       rows=[r], n=1),
+            prompt=(_reviewer_prompt(r, meta, tests_by_cluster.get(ckey, []))
+                    if verdict in _NEEDS_HUMAN else None))
 
         parts.append(
             f'<tr class="case-row in-cluster" id="{rid}" data-cluster="{_esc(ckey)}" '
@@ -974,15 +1324,19 @@ def _member_rows(df: pd.DataFrame, meta: dict, cluster_no: dict[str, int],
             f'<td class="col-confidence"{_conf_rank_attr(conf)}>{conf_cell}</td>'
             f'<td class="col-culprit">{culprit_cell}</td>'
             f'<td class="col-reasoning">{reason_cell}</td>'
-            f'<td class="col-jira">{jira_cell}</td>'
+            f'{ticket_cell}'
+            f'<td class="col-jira">{actions_cell}</td>'
             "</tr>"
         )
-        parts.append(_detail_row(r, rid, css, ckey, meta))
+        # The whole cluster's tests, not just this row's: a cluster is one
+        # shared error, so a reviewer needs every test it covers.
+        parts.append(_detail_row(r, rid, css, ckey, meta,
+                                 tests_by_cluster.get(ckey, [])))
     return "\n".join(parts)
 
 
 
-def _jira_link(meta: dict, *, verdict: str, summary_text: str, rows: list,
+def _jira_href(meta: dict, *, verdict: str, summary_text: str, rows: list,
                n: int = 1) -> str:
     """A prefilled Jira draft link. Opens a draft — nothing is filed.
 
@@ -1055,11 +1409,8 @@ def _jira_link(meta: dict, *, verdict: str, summary_text: str, rows: list,
     if str(jira.get("reporter_account_id") or "").strip():
         params["reporter"] = str(jira["reporter_account_id"]).strip()
 
-    href = (f"{base}/secure/CreateIssueDetails!init.jspa?"
+    return (f"{base}/secure/CreateIssueDetails!init.jspa?"
             + urllib.parse.urlencode(params))
-    return (f'<a class="jira-create" href="{_esc(href)}" target="_blank" '
-            f'rel="noopener" title="Opens a prefilled Jira draft — nothing is '
-            f'filed automatically">Create ticket</a>')
 
 
 def _cluster_index(df: pd.DataFrame) -> tuple[list[str], dict]:
@@ -1081,6 +1432,318 @@ def _cluster_index(df: pd.DataFrame) -> tuple[list[str], dict]:
     return keys, shared
 
 
+# The two actions that are not wired yet, declared once so a cluster header and
+# a member row cannot drift into advertising different things. Ported verbatim
+# in intent from the CX's PENDING_ACTIONS (ActionsMenu.tsx).
+_PENDING_ACTIONS = [
+    ("Change verdict",
+     "Correct the AI verdict, link an issue and leave a comment — the same "
+     "shape as Edit on a Testray case result. Changing a cluster will apply to "
+     "every test in it; changing one row stays on that row"),
+    ("Send Test Fix PR",
+     "Triggers the /test-fix skill and opens a pull request for the team to "
+     "review — nothing is merged automatically"),
+]
+
+
+def _actions_menu(jira_href: str, label: str = "Actions",
+                  prompt: str | None = None) -> str:
+    """The row/cluster actions kebab — the last column of the triage table.
+
+    Ported from the CX's ActionsMenu.tsx so both renderers offer the same three
+    things (§12 view contract). Items are ordered ALPHABETICALLY, not by
+    importance: whether you file, correct or fix first depends on the verdict,
+    so any importance order would be a guess, and alphabetical is at least
+    predictable.
+
+    Only Create Jira Ticket is wired. The other two render disabled rather than
+    hidden, deliberately — the point is to show the shape of the menu and
+    advertise what is coming, and each carries a tooltip so a disabled item
+    reads as unfinished rather than broken.
+
+    Unlike the CX this is one static menu per row with no framework behind it,
+    so the open/close behaviour lives in _JS and the markup here is inert.
+    """
+    items = [
+        f'<span class="actions-item is-pending" role="menuitem" '
+        f'aria-disabled="true" title="{_esc(_PENDING_ACTIONS[0][1])} '
+        f'(not wired yet)">{_esc(_PENDING_ACTIONS[0][0])}'
+        f'<span class="actions-soon">Soon</span></span>',
+    ]
+    # Alphabetically between "Change verdict" and "Create Jira Ticket". This
+    # lives in the MENU, not only in the row detail panel: the report opens
+    # fully collapsed, so a detail-panel-only affordance is two clicks deep
+    # behind a cluster a reader has no reason to expand — which is exactly how
+    # it went unnoticed. The kebab is on every visible cluster header.
+    if prompt:
+        items.append(
+            '<button type="button" class="actions-item handoff-copy" '
+            'role="menuitem" title="Copies a ready-to-paste prompt describing '
+            'this failure, the commit range and the candidate causes, to run '
+            'against a local liferay-portal checkout in your own Claude Code '
+            'session.">'
+            'Copy prompt for local verification</button>'
+            f'<pre class="handoff-text" hidden>{_esc(prompt)}</pre>')
+    items += [
+        f'<a class="actions-item" role="menuitem" href="{_esc(jira_href)}" '
+        f'target="_blank" rel="noopener" title="Opens a prefilled Jira draft '
+        f'in a new tab for you to confirm — nothing is filed automatically">'
+        f'Create Jira Ticket</a>',
+        f'<span class="actions-item is-pending" role="menuitem" '
+        f'aria-disabled="true" title="{_esc(_PENDING_ACTIONS[1][1])} '
+        f'(not wired yet)">{_esc(_PENDING_ACTIONS[1][0])}'
+        f'<span class="actions-soon">Soon</span></span>',
+    ]
+    return (f'<div class="actions-menu">'
+            f'<button type="button" class="actions-kebab" aria-haspopup="menu" '
+            f'aria-expanded="false" aria-label="{_esc(label)}" '
+            f'title="{_esc(label)}">'
+            f'<svg aria-hidden="true" height="14" viewBox="0 0 4 16" width="4">'
+            f'<circle cx="2" cy="2" r="1.6"/><circle cx="2" cy="8" r="1.6"/>'
+            f'<circle cx="2" cy="14" r="1.6"/></svg></button>'
+            f'<div class="actions-list" role="menu" hidden>{"".join(items)}</div>'
+            f'</div>')
+
+
+def _ticket_cell(values, cluster: bool = False) -> str:
+    """Issues ALREADY linked to the failure — not a place to create one.
+
+    Its own column (ported from the CX's Tickets cell) because the question it
+    answers is "has this been filed before?", which is read down the column,
+    not per row. Creating a ticket is an action and lives in the kebab.
+
+    An issue key must not break at its hyphen: normal wrapping still treats the
+    "-" in LPD-99999 as a break opportunity and a narrow column rendered it as
+    "LPD-" / "99999". One nowrap span per key, wrapping between keys instead.
+    Testray's separator is not guaranteed, so split on commas and whitespace.
+    """
+    distinct = list(dict.fromkeys(v for v in (_text(x) for x in values) if v))
+    cls = "col-ticket cluster-cell" if cluster else "col-ticket"
+    if not distinct:
+        # A cluster header leaves shared-but-absent cells blank; a member row
+        # says "nothing linked" explicitly.
+        inner = "" if cluster else '<span class="ticket-none">&mdash;</span>'
+    elif len(distinct) > 1:
+        inner = (f'<span class="cluster-culprit-none" '
+                 f'title="{_esc(" · ".join(sorted(distinct)))}">'
+                 f'{len(distinct)} values</span>')
+    else:
+        inner = "".join(f'<span class="ticket-key">{_esc(k)}</span>'
+                        for k in re.split(r"[,\s]+", distinct[0]) if k)
+    return f'<td class="{cls}">{inner}</td>'
+
+
+def _flaky_badge(members) -> str:
+    """FLAKY badge for a cluster header, when any member is marked flaky.
+
+    Clusters render COLLAPSED, so a badge that only exists on member rows is
+    invisible in the default view — which is the one a reader actually sees.
+    "some" rather than "all" is spelled out, because a mixed cluster where one
+    member is flaky and another is not is exactly the case where the reader
+    must not assume the whole cluster can be discounted.
+    """
+    flags = [str(v).strip().lower() in ("true", "1", "1.0", "yes")
+             for v in members.get("known_flaky", [])]
+    if not flags or not any(flags):
+        return ""
+    label = "FLAKY" if all(flags) else "SOME FLAKY"
+    return (f' <span class="flaky-badge" title="Marked flaky on the Testray '
+            f'case — excluded from classification, shown for awareness.">'
+            f'{label}</span>')
+
+
+# What each verdict MEANS, for a reader who did not write the rubric. Wording
+# tracks the classify prompt and submit._auto_label — if the rubric moves, these
+# move with it, because a legend that disagrees with the classifier is worse
+# than no legend.
+_VERDICT_LEGEND = {
+    "BUG":
+        "A change in this range caused the failure, and that change is a real "
+        "defect. Suspicious cause always names the file, with the ticket and "
+        "commits that touched it.",
+    "POSSIBLE_BUG":
+        "A single plausible cause in the diff that could not be confirmed. "
+        "Suspicious cause names that one candidate file.",
+    "NEEDS_REVIEW":
+        "Could not be narrowed to one cause \u2014 several changes could explain "
+        "it, or nothing concrete could be tied to it. Suspicious cause lists "
+        "the candidate tickets instead of a file. A human decides.",
+    "TEST_FIX":
+        "The diff did cause this, but the production change was intentional "
+        "and correct \u2014 the test asserts the old behaviour. Fix the test, not "
+        "production. Suspicious cause names the ticket behind the change, or "
+        "the stale test, never the production file.",
+    "NOT_ATTRIBUTABLE":
+        "A NEEDS_REVIEW the classifier had low confidence in \u2014 it could not "
+        "attribute the failure at all. Not a claim that a person must review "
+        "every one.",
+    "FALSE_POSITIVE":
+        "A real failure, but nothing in this range caused it \u2014 a flake, or a "
+        "failure that predates the change.",
+    "ENV_FAILURE":
+        "Infrastructure or environment, not the product.",
+    "DID_NOT_RUN":
+        "The test produced no result to compare \u2014 the build or batch failed, "
+        "or no error text was recorded. Nothing was analysed, so someone "
+        "should check why it did not run: a real failure can hide behind one "
+        "of these.",
+    "AUTO_CLASSIFIED":
+        "Labelled upstream by pattern, never sent to the model.",
+    "PENDING":
+        "Not yet classified.",
+}
+
+
+# The verdicts the guide documents, in severity order. STATIC — the same six on
+# every report, whether or not a given run used them. A key that changed shape
+# per run would not be a reference: a reader who learned it on one report would
+# find a different guide on the next, and could not look up a verdict they had
+# seen last week. Sourced from verdicts.VERDICT_ORDER, so the guide is ordered
+# the way the table sorts.
+_LEGEND_VERDICTS = ("BUG", "POSSIBLE_BUG", "NEEDS_REVIEW", "TEST_FIX",
+                    "NOT_ATTRIBUTABLE", "FALSE_POSITIVE", "ENV_FAILURE",
+                    "DID_NOT_RUN")
+
+
+def _verdict_legend() -> str:
+    """The standing guide to the verdict vocabulary.
+
+    Takes no run data on purpose — see _LEGEND_VERDICTS. This report is read by
+    people who did not write the rubric, so the vocabulary has to be legible
+    from the page itself rather than from the prompt.
+    """
+    shown = [v for v in verdicts.VERDICT_ORDER if v in _LEGEND_VERDICTS]
+    items = "".join(
+        f'<div class="legend-item">{_verdict_span(v)}'
+        f'<span class="legend-text">{_esc(_VERDICT_LEGEND[v])}</span></div>'
+        for v in shown)
+    return f"""
+  <details class="verdict-legend">
+    <summary><strong>What the verdicts mean</strong>
+      <span class="hint">A guide to the verdict vocabulary, most severe first.
+      The same on every report &mdash; a run will not use all of
+      them.</span></summary>
+    <div class="legend-grid">{items}</div>
+  </details>"""
+
+
+def _pre_existing_section(pre_df, meta: dict) -> str:
+    """Collapsed table of failures that were already failing on the baseline.
+
+    Deliberately its own section rather than rows in the main table: these
+    carry no verdict (nothing was asked of the classifier) and no culprit, so
+    they would be five empty columns under a "root cause" heading. Collapsed by
+    default because on a sticky routine this is the longest list on the page
+    and it is context, not work.
+    """
+    if pre_df is None or not len(pre_df):
+        return ""
+    rows = []
+    for i, r in enumerate(pre_df.to_dict("records")):
+        test = _text(r.get("test_case")) or "(unnamed)"
+        url  = _case_url(meta, r.get("caseresult_id"))
+        cell = (f'<a class="test-link" href="{_esc(url)}" target="_blank" '
+                f'rel="noopener">{_esc(test)}</a>' if url else _esc(test))
+        if _is_flaky(r):
+            cell += (' <span class="flaky-badge" title="Marked flaky on the '
+                     'Testray case.">FLAKY</span>')
+        rows.append(
+            f'<tr class="pre-row" '
+            f'data-team="{_esc(_text(r.get("team_name")))}" '
+            f'data-component="{_esc(_text(r.get("component_name")))}" '
+            f'data-transition="{_esc(_text(r.get("transition")))}">'
+            f'<td class="col-idx col-num">{i + 1}</td>'
+            f'<td class="col-test">{cell}</td>'
+            f'<td class="col-team">{_esc(_text(r.get("team_name"))) or "—"}</td>'
+            f'<td class="col-comp">{_esc(_text(r.get("component_name"))) or "—"}</td>'
+            f'<td class="col-reasoning"><pre class="error">'
+            f'{_esc(_truncate(_text(r.get("error_message"))))}</pre></td></tr>')
+    return f"""
+  <details class="pre-existing">
+    <summary><strong>Pre-existing failures ({len(pre_df)})</strong>
+      <span class="pre-count" id="pre-count"></span>
+      <span class="hint">Already failing with the same error on the baseline —
+      not caused by this range, and not analyzed.</span></summary>
+    <table class="per-test-table">
+<thead><tr><th class="col-idx">#</th><th class="col-test">Test</th>
+<th class="col-team">Team</th><th class="col-comp">Component</th>
+<th class="col-reasoning">Error</th></tr></thead>
+<tbody>
+{chr(10).join(rows)}
+</tbody>
+    </table>
+  </details>"""
+
+
+def _is_flaky(row) -> bool:
+    """Whether a row is marked flaky upstream on the Testray case."""
+    v = row.get("known_flaky")
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return False
+    return str(v).strip().lower() in ("true", "1", "1.0", "yes")
+
+
+# Ticket keys the classifier names in `specific_change` when it will not name a
+# file. Mirrors prepare._LPD_RE — kept local rather than reaching into a private
+# name, so the two have to be changed together.
+# The candidate-ticket pattern lives in verdicts.py, because the display
+# rule depends on it: three copies had already drifted apart in wording.
+_TICKET_RE = verdicts.CANDIDATE_RE
+
+
+def _jira_base(meta: dict) -> str:
+    """Jira base URL for ticket links, resolved the same way _jira_href does."""
+    jira = meta.get("jira")
+    if not isinstance(jira, dict):
+        jira = resolve_jira_settings({})
+    return str(jira.get("base_url") or "https://liferay.atlassian.net").rstrip("/")
+
+
+def _cause_tickets(meta: dict, specific_change) -> str:
+    """Linked chips for every ticket named in `specific_change`, de-duplicated.
+
+    The rubric tells the classifier to leave `culprit_file` NULL and list all
+    candidate tickets in `specific_change` whenever two or more changes could
+    explain a failure (prompt: "NEEDS_REVIEW — two or more candidate causes").
+    Without this the actionable half of that answer never reaches the column:
+    `culprit_commits` is derived from the FILE in submit.annotate_culprit_
+    commits, so a null culprit yields no commits either, and the cell renders
+    "—" for a row the classifier did have an opinion about.
+    """
+    text = _text(specific_change)
+    if not text:
+        return ""
+    base, seen, chips = _jira_base(meta), set(), []
+    for key in _TICKET_RE.findall(text):
+        if key in seen:
+            continue
+        seen.add(key)
+        chips.append(f'<a class="cause-ticket" href="{_esc(base)}/browse/{_esc(key)}" '
+                     f'target="_blank" rel="noopener">{_esc(key)}</a>')
+    return "".join(chips)
+
+
+def _cause_cell(meta: dict, culprit: str, commits: str, specific_change) -> str:
+    """The Suspicious cause cell.
+
+    One column, two kinds of answer: the culprit file when the classifier
+    committed to one (with the commits that touched it), else the candidate
+    tickets it named instead. `culprit_file` itself is untouched — it is a
+    stored verdict field that feeds defect-attribution training data and
+    error_signature.cluster_key, so this is a rendering fallback, not a
+    repurposing of the field.
+    """
+    if culprit:
+        cell = f"<code>{_esc(culprit)}</code>"
+        if commits:
+            cell += f'<div class="culprit-commits">{_esc(commits)}</div>'
+        return cell
+    chips = _cause_tickets(meta, specific_change)
+    if chips:
+        return f'<div class="cause-tickets">{chips}</div>'
+    return "—"
+
+
 def _shared_in_cluster(shared: dict, ckey: str, column: str, value: str) -> bool:
     """True when every member of the cluster carries this same value."""
     vals = shared.get((ckey, column))
@@ -1100,7 +1763,91 @@ def _is_changed_failure(transition) -> bool:
     return _text(transition).strip().lower() in _CHANGED_TRANSITIONS
 
 
-def _detail_row(r, rid: str, css: str, ckey: str, meta: dict) -> str:
+# Verdicts where a human still has to finish the job. A BUG or TEST_FIX has
+# already named its cause, so a "go investigate" prompt would be noise there.
+_NEEDS_HUMAN = {"NEEDS_REVIEW", "NOT_ATTRIBUTABLE", "POSSIBLE_BUG"}
+
+# Tests listed in a handoff prompt before it collapses to a count.
+_PROMPT_MAX_TESTS = 12
+
+
+def _reviewer_prompt(r, meta: dict, sibling_tests: list[str],
+                     verdict: str = "") -> str:
+    """A copy-pasteable prompt for whoever picks this row up in their own
+    Claude Code session.
+
+    Written as an instruction to an agent, not a summary for a human: it names
+    the repo and range so the agent can read the diff itself, lists the
+    candidate tickets triage could not choose between, and — the part that
+    makes it useful rather than a restatement — says what to DO with them.
+    "Verify this" on its own gives an agent nothing to act on.
+
+    The range is given as hashes rather than build ids: a Testray build id
+    means nothing in a checkout, and the whole point is that the reviewer
+    works in the repo.
+
+    `verdict` is passed in rather than read off `r`. On a cluster header the
+    label shown is the ROLLUP of the members, and reading the first member's
+    own verdict instead produced prompts that opened "classified as
+    FALSE_POSITIVE — it could not settle the cause", which is both wrong and
+    self-contradicting.
+    """
+    verdict = verdict or _text(r.get("display_verdict")) or _text(r.get("classification"))
+    ha, hb = _text(meta.get("git_hash_a")), _text(meta.get("git_hash_b"))
+    branch = _text(meta.get("base_branch"))
+    tickets = list(dict.fromkeys(
+        _TICKET_RE.findall(_text(r.get("specific_change")))))
+    tests = [t for t in (sibling_tests or [_text(r.get("test_case"))]) if t]
+    conf = _text(r.get("confidence"))
+    rng = f"{ha[:12]}..{hb[:12]}" if ha and hb else ""
+
+    L = [f"A Liferay test-analysis run classified this failure as {verdict}"
+         + (f" ({conf} confidence)" if conf else "")
+         + " — it could not settle the cause. Please finish the triage.", ""]
+    L.append("Repo:   liferay-portal" + (f", branch {branch}" if branch else ""))
+    if rng:
+        L.append(f"Range:  {rng}   (the target build ran at {hb[:12]})")
+        L.append(f"        {_GITHUB_COMPARE.format(a=ha, b=hb)}")
+
+    # A cluster can hold sixty tests. Listing them all buries the instructions
+    # under a wall of names and bloats every copy of the prompt; the shared
+    # error is what identifies the cluster, not the roster.
+    L += ["", f"Failing test{'s' if len(tests) > 1 else ''}"
+              + (f" ({len(tests)} in this cluster, first {_PROMPT_MAX_TESTS} shown)"
+                 if len(tests) > _PROMPT_MAX_TESTS else "") + ":"]
+    L += [f"  - {t}" for t in tests[:_PROMPT_MAX_TESTS]]
+    if len(tests) > _PROMPT_MAX_TESTS:
+        L.append(f"  … and {len(tests) - _PROMPT_MAX_TESTS} more")
+
+    err = _text(r.get("error_message"))
+    if err:
+        L += ["", "Shared error:", f"  {_truncate(err, 400)}"]
+
+    L += [""]
+    if tickets:
+        L += ["Candidate causes triage found but could not choose between:",
+              "  " + ", ".join(tickets), "",
+              "Please:",
+              "1. Read each candidate's commits in the range",
+              f"   (git log {rng} --grep={tickets[0]}) and judge whether that",
+              "   change could produce this error."]
+    else:
+        L += ["Triage found no concrete candidate, so start from the range.", "",
+              "Please:",
+              "1. Find changes in the range touching the failing test's module",
+              f"   (git log {rng} -- <module path>) and judge whether any could",
+              "   produce this error."]
+    L += ["2. If one is the cause, say which it is:",
+          "     BUG      — the production change is a defect",
+          "     TEST_FIX — the production change was intentional and the test",
+          "                asserts the old behaviour, so the test needs updating",
+          "3. Run the failing test locally to confirm before concluding.",
+          "4. Report the verdict, the culprit file, and the evidence you used."]
+    return "\n".join(L)
+
+
+def _detail_row(r, rid: str, css: str, ckey: str, meta: dict,
+                sibling_tests: list[str] | None = None) -> str:
     """The per-row detail panel: everything the table had to truncate."""
     items = []
 
@@ -1127,10 +1874,11 @@ def _detail_row(r, rid: str, css: str, ckey: str, meta: dict) -> str:
         add("Error", f'<pre class="error">{_esc(error)}</pre>')
 
     culprit = _text(r.get("culprit_file"))
-    add("Culprit file", f"<code>{_esc(culprit)}</code>" if culprit else "—")
-
     commits = _text(r.get("culprit_commits"))
-    if commits:
+    add("Suspicious cause",
+        _cause_cell(meta, culprit, commits, r.get("specific_change")))
+
+    if culprit and commits:
         add("Changed by", _esc(commits))
 
     change = _text(r.get("specific_change"))
@@ -1143,6 +1891,16 @@ def _detail_row(r, rid: str, css: str, ckey: str, meta: dict) -> str:
     add("Ticket already linked", _esc(issues) if issues else "—")
 
     add("Cluster key", f'<code>{_esc(ckey)}</code>')
+
+    verdict = _text(r.get("display_verdict")) or _text(r.get("classification"))
+    if verdict in _NEEDS_HUMAN:
+        prompt = _reviewer_prompt(r, meta, sibling_tests or [])
+        add("Verify locally",
+            '<div class="handoff">'
+            '<button type="button" class="handoff-copy">Copy prompt</button>'
+            '<span class="handoff-hint">Paste into a Claude Code session in a '
+            'liferay-portal checkout.</span>'
+            f'<pre class="handoff-text">{_esc(prompt)}</pre></div>')
 
     for label, col in (("Case id", "testray_case_id"),
                        ("Case result id", "caseresult_id"),
@@ -1158,24 +1916,36 @@ def _detail_row(r, rid: str, css: str, ckey: str, meta: dict) -> str:
             + "</dl></div></td></tr>")
 
 
-_HINT = """Cluster headers sit on the same columns as their member rows: the test count and
-  cluster key under <em>Test</em>, the component and team rollups under their own columns
-  (hover for the full breakdown), the shared culprit file and reasoning under theirs.
-  <strong>Group by</strong> re-cuts the same rows in place &mdash; the default
-  <strong>error signature</strong> is the <code>clusterKey</code> the pipeline persists;
-  component, team and verdict regroup without a re-render.
-  Click a cluster header to fold its members in or out; click a row to expand its own
-  details. Member rows don't repeat the shared culprit and reasoning &mdash; those are on
-  the header, in the row's hover title, and in full in its detail panel.
-  Searching or filtering opens every cluster that has a hit.
-  Press <kbd>Esc</kbd> in the search box to clear."""
-
-
-
 # Testray's own comparison order, so the matrix reads the same way it does in
 # the product.
+# The commit range behind a run, as a GitHub compare link. Points at the
+# canonical public repo rather than whichever remote `prepare` happened to
+# fetch the commits from (bchan, release-ee, a PR fork): this link is for a
+# person to click, so it has to be the repo they can actually open.
+#
+# Testray's Build object has a `githubCompareURLs` field for this, but it reads
+# "null" on every build measured on prod, so the URL is built here instead.
+_GITHUB_COMPARE = "https://github.com/liferay/liferay-portal/compare/{a}...{b}"
+
+
 _STATUS_ORDER = ["PASSED", "FAILED", "BLOCKED", "TESTFIX", "UNTESTED", "DIDNOTRUN"]
 _STATUS_LABEL = {"TESTFIX": "Test Fix", "UNTESTED": "DNR", "DIDNOTRUN": "DNR"}
+
+# What each PASSED/FAILED cell MEANS, printed under the number. Reading a
+# cross-tab means holding "row = baseline, column = target" in your head and
+# re-deriving the meaning four times; the label does that once. Keyed
+# (A status, B status).
+#
+# Only the four pass/fail combinations are named. BLOCKED / Test Fix / DNR
+# cells are left bare on purpose — a phrase for every combination would be
+# nine notes of clutter to explain four that matter, and the ones that matter
+# are the ones a reader acts on.
+_CELL_NOTE = {
+    ("PASSED", "PASSED"): "passed in both",
+    ("PASSED", "FAILED"): "new failures",
+    ("FAILED", "PASSED"): "now passing",
+    ("FAILED", "FAILED"): "failed in both",
+}
 
 
 def _status_label(code: str) -> str:
@@ -1208,11 +1978,20 @@ def _status_matrix(meta: dict) -> str:
         for c in cols:
             n = raw.get(r, {}).get(c, 0)
             # An unchanged diagonal is context, not news; a transition is news.
-            cls = "same" if r == c else ("worse" if _worse(r, c) else "better")
-            cells.append(f'<td class="{cls}">{n:,}</td>' if n else '<td class="zero"></td>')
+            cls = _cell_class(r, c)
+            if not n:
+                cells.append('<td class="zero"></td>')
+                continue
+            note = _CELL_NOTE.get((r, c))
+            note_html = (f'<span class="cell-note">{_esc(note)}</span>'
+                         if note else "")
+            cells.append(f'<td class="{cls}"><span class="cell-n">{n:,}</span>'
+                         f'{note_html}</td>')
         body.append(f'<tr><th>A<br><span>{_esc(_status_label(r))}</span></th>'
                     + "".join(cells) + "</tr>")
-    return ('<div class="matrix"><div class="matrix-title">Runs</div>'
+    return ('<div class="matrix">'
+            '<div class="matrix-title">Where A is the previous build, '
+            'and B is the new build</div>'
             f'<table><thead><tr><th></th>{head}</tr></thead>'
             f'<tbody>{"".join(body)}</tbody></table></div>')
 
@@ -1220,6 +1999,38 @@ def _status_matrix(meta: dict) -> str:
 def _worse(a: str, b: str) -> bool:
     """Did the status get worse from A to B? PASSED is the only good state."""
     return a == "PASSED" and b != "PASSED"
+
+
+def _cell_class(a: str, b: str) -> str:
+    """Colour for one status-matrix cell.
+
+    Green means ONLY "ended up passing", red means ONLY "was passing and no
+    longer is". Everything else is uncoloured, because it is neither.
+
+    This used to read `worse(a, b) ? red : green`, which made green the default
+    for every off-diagonal cell — so DNR -> FAILED and FAILED -> DNR both
+    rendered green, reading as good news when nothing good happened. Green is a
+    claim about the target column, not the absence of a regression.
+    """
+    if a == b:
+        return "same"           # the diagonal: context, not news
+    if b == "PASSED":
+        return "better"         # whatever it came from, it passes now
+    if b == "FAILED" or _worse(a, b):
+        # Red is the mirror of green: "ended up failing", wherever it came
+        # from, PLUS "was passing and no longer is" (which also covers ending
+        # up BLOCKED or not-run).
+        #
+        # UNTESTED -> FAILED is red for a reason worth keeping: that is
+        # TRANSITION_NO_BASELINE, which prepare puts in TRIAGE_TRANSITIONS
+        # deliberately because the usual cause is a NEW test that fails — the
+        # thing triage exists to catch. Leaving it uncoloured made the matrix
+        # quieter than the triage list it sits above.
+        return "worse"
+    # Neither: a move between two non-passing states that does not end in a
+    # failure — FAILED -> BLOCKED, FAILED -> not-run. A lost signal rather
+    # than a failure, and prepare already warns about coverage drops.
+    return "neutral"
 
 
 
@@ -1299,11 +2110,28 @@ def _totals(df: pd.DataFrame, n_clusters: int, meta: dict,
     return '<div class="totals">' + "".join(pills) + "</div>"
 
 
-def _select(el_id: str, label: str, values) -> str:
+def _select(el_id: str, label: str, values, size: str = "md",
+            title: str = "") -> str:
+    """One filter control: its label and its select, as a SINGLE flex item.
+
+    The pair has to be wrapped. `.filters-row` wraps, and when the label and
+    the select are two separate flex items the break can land between them —
+    which is how "Transition:" ended up stranded on one line with its dropdown
+    on the next.
+
+    `size` tunes the width to the vocabulary the control actually holds, so
+    five filters fit on one row: Confidence is four short words, Verdict is
+    long but truncatable, Team and Component are free text.
+    """
     opts = "".join(f'<option value="{_esc(v)}">{_esc(v)}</option>'
                    for v in sorted({_text(x) for x in values if _text(x)}))
-    return (f'<label for="{el_id}">{_esc(label)}:</label>'
-            f'<select id="{el_id}"><option value="">All</option>{opts}</select>')
+    # The title sits on the wrapper so it fires over the label AND the select —
+    # a reader hovers whichever of the two they happen to be pointing at.
+    attr = f' title="{_esc(title)}"' if title else ""
+    return (f'<span class="filter-field ff-{_esc(size)}"{attr}>'
+            f'<label for="{el_id}">{_esc(label)}:</label>'
+            f'<select id="{el_id}"><option value="">All</option>{opts}</select>'
+            f'</span>')
 
 
 # Below this share of the target build, the comparison covers so little that
@@ -1395,6 +2223,31 @@ def render_run(run_dir, df: pd.DataFrame, meta: dict) -> Path:
         df = pd.DataFrame()
     df = df.reset_index(drop=True)
 
+    # Pre-existing failures come out of the main table and into their own
+    # section. They were never classified (prepare tags them PRE_EXISTING and
+    # keeps them out of the clustering), so mixing them into "Failures by root
+    # cause" would put rows under a heading that does not describe them. Split
+    # BEFORE the cluster index so grouping, ordering and the counts above are
+    # computed on the triaged set alone.
+    # Keyed on the TRANSITION, matching prepare's `is_report_only`: a
+    # same_failure row whose error matched an env pattern carries NO_ERROR
+    # rather than PRE_EXISTING, and keying on the tag would strand it in the
+    # main table with an auto verdict and no cause.
+    pre_df = df.iloc[0:0]
+    pre_transitions: list[str] = []
+    if len(df) and "transition" in df.columns:
+        mask = df["transition"].astype(str).str.strip() == "same_failure"
+        if mask.any():
+            pre_df = df[mask].reset_index(drop=True)
+            pre_transitions = [_text(x) for x in pre_df["transition"]]
+            df = df[~mask].reset_index(drop=True)
+    # Transition options are taken from the FULL frame: the pre-existing rows
+    # are on the page, so a control that omitted `same_failure` described the
+    # main table rather than the report. They carry the same data-* keys the
+    # filter reads (see _pre_existing_section), so selecting it acts on them.
+    all_transitions = list(pre_transitions) + [
+        _text(x) for x in df.get("transition", [])]
+
     # One derived column so the pills, the filter, the cluster rollups, the
     # sort rank and the row cells cannot disagree about what a row is called.
     if len(df):
@@ -1436,7 +2289,16 @@ def render_run(run_dir, df: pd.DataFrame, meta: dict) -> Path:
             summary_bits.append(f"{label}: <code>{_esc(v)}</code>")
     ha, hb = _text(meta.get("git_hash_a")), _text(meta.get("git_hash_b"))
     if ha and hb:
-        summary_bits.append(f"Hashes: <code>{_esc(ha[:9])}</code> &rarr; <code>{_esc(hb[:9])}</code>")
+        # The FULL hashes go in the URL even though the abbreviations are what
+        # is shown: 9 characters resolve today and collide eventually, and this
+        # link outlives the run that produced it.
+        compare = _GITHUB_COMPARE.format(a=ha, b=hb)
+        summary_bits.append(
+            f'Hashes: <a class="hash-link" href="{_esc(compare)}" '
+            f'target="_blank" rel="noopener" '
+            f'title="See every commit between these two builds on GitHub">'
+            f'<code>{_esc(ha[:9])}</code> &rarr; <code>{_esc(hb[:9])}</code>'
+            f'</a>')
     sig = _text(meta.get("signature_version")) or error_signature.SIGNATURE_VERSION
     summary_bits.append(f"Signatures: <code>{_esc(sig)}</code>")
 
@@ -1444,12 +2306,12 @@ def render_run(run_dir, df: pd.DataFrame, meta: dict) -> Path:
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>Triage report — {_esc(a_name)} → {_esc(b_name)}</title>
+<title>Analysis for: {_esc(a_name)} → {_esc(b_name)}</title>
 <style>{_CSS}</style>
 </head>
 <body>
 <main>
-  <h1>Triage report &mdash; {a_html} <span class="role">baseline</span> &rarr; {b_html} <span class="role">target</span></h1>
+  <h1>Analysis for: {a_html} <span class="role">baseline</span> &rarr; {b_html} <span class="role">target</span></h1>
   <p class="summary">{" &middot; ".join(summary_bits)}</p>
   {_banners(df, meta)}
 
@@ -1458,27 +2320,28 @@ def render_run(run_dir, df: pd.DataFrame, meta: dict) -> Path:
     {_totals(df, len(cluster_groups), meta, cluster_groups)}
   <div class="viewbar">
     <span class="viewbar-group">
-      <label class="viewbar-label" for="group-by">Group by:</label>
+      <label class="viewbar-label" for="group-by" title="Re-cuts the same rows into different groups. Nothing is re-classified.">Group by:</label>
       <select id="group-by">
         {"".join(f'<option value="{m}">{l}</option>' for m, l in _GROUP_MODES)}
       </select>
-      <span class="viewbar-note">re-cuts the same rows; nothing is re-classified</span>
     </span>
   </div>
 
   <div class="filters">
     <div class="filters-row">
-      {_select("team-filter", "Team", df.get("team_name", []))}
-      {_select("component-filter", "Component", df.get("component_name", []))}
-      {_select("verdict-filter", "Verdict", df.get("display_verdict", []))}
+      {_select("team-filter", "Team", df.get("team_name", []), "lg")}
+      {_select("component-filter", "Component", df.get("component_name", []), "lg")}
+      {_select("verdict-filter", "Verdict", df.get("display_verdict", []), "md",
+               "Show only rows the classifier gave this verdict.")}
       {_select("confidence-filter", "Confidence",
-               [_text(c).lower() for c in df.get("confidence", [])])}
-      {_select("transition-filter", "Transition", df.get("transition", []))}
+               [_text(c).lower() for c in df.get("confidence", [])], "sm",
+               "Show only rows at this confidence. \'auto\' means pre-classified, never sent to the model.")}
+      {_select("transition-filter", "Transition", all_transitions, "md")}
     </div>
     <div class="filters-row">
       <label for="search-filter">Search:</label>
       <input id="search-filter" type="search" autocomplete="off"
-             placeholder="filter by test, component, culprit file, reasoning… (Esc to clear)">
+             placeholder="filter by test, component, suspicious cause, reasoning… (Esc to clear)">
       <button type="button" class="cluster-btn" id="expand-clusters">Expand all</button>
       <button type="button" class="cluster-btn" id="collapse-clusters">Collapse all</button>
       <span class="visible-count" id="filter-count"></span>
@@ -1491,7 +2354,6 @@ def render_run(run_dir, df: pd.DataFrame, meta: dict) -> Path:
   </div>
 
   <h2>Failures by root cause</h2>
-  <p class="hint">{_HINT}</p>
   <table class="per-test-table clustered">
 <thead><tr>
 <th class="col-idx">#</th>
@@ -1499,17 +2361,20 @@ def render_run(run_dir, df: pd.DataFrame, meta: dict) -> Path:
 <th class="col-team">Team</th>
 <th class="col-comp">Component</th>
 <th class="col-status">Status</th>
-<th class="col-verdict">Verdict</th>
-<th class="col-confidence" title="Classifier confidence: high / medium / low / auto.">Confidence</th>
-<th class="col-culprit">Culprit file</th>
-<th class="col-reasoning">Reasoning</th>
-<th class="col-jira" title="Tickets already linked on the Testray case result. Creation is LPD-95849, not wired up.">Ticket</th>
+<th class="col-verdict" title="What the classifier concluded about the failure. A cluster header shows its most severe member's verdict.">Verdict</th>
+<th class="col-confidence" title="How sure the classifier was: high, medium or low. &quot;auto&quot; means the row was pre-classified and never sent to the model.">Confidence</th>
+<th class="col-culprit" title="The file the classifier blamed. When it would not narrow to one, the candidate tickets it named instead.">Suspicious cause</th>
+<th class="col-reasoning" title="Why the classifier reached this verdict, in its own words.">Reasoning</th>
+<th class="col-ticket" title="Whether a ticket already exists for this failure. Once this report runs against Testray prod, this column shows the tickets already linked to the case result, if any — it is not a place to file a new one (see Actions).">Existing Ticket</th>
+<th class="col-jira" title="What you can do about this row — file it, correct it, or ask for a test fix">Actions</th>
 </tr></thead>
 <tbody>
 {chr(10).join(headers)}
 {body}
 </tbody>
   </table>
+{_pre_existing_section(pre_df, meta)}
+{_verdict_legend()}
 </main>
 <script type="application/json" id="group-order">{json.dumps(order)}</script>
 <script>{_JS}</script>
