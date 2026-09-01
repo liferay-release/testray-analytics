@@ -244,16 +244,23 @@ def test_verdict_counts_use_the_display_label_not_the_raw_classification():
     payload = _run([
         _row(testray_case_id=1, classification="NEEDS_REVIEW", confidence="high"),
         _row(testray_case_id=2, classification="NEEDS_REVIEW", confidence="low"),
+        # No confidence means the row never reached the model — an auto label
+        # from submit._auto_label. Nothing failed to attribute it, so it stays
+        # NEEDS_REVIEW rather than claiming a failed attribution.
         _row(testray_case_id=3, classification="NEEDS_REVIEW", confidence=""),
-        _row(testray_case_id=4, classification="BUG", confidence="high"),
+        # Low confidence but it NAMED a candidate: it attributed something and
+        # could not choose, which is not the same as attributing nothing.
+        _row(testray_case_id=4, classification="NEEDS_REVIEW", confidence="low",
+             specific_change="LPD-103652 reworked the dropdown items"),
+        _row(testray_case_id=5, classification="BUG", confidence="high"),
     ])
     counts = json.loads(payload["verdictCounts"])
 
-    assert counts.get("NEEDS_REVIEW") == 1, counts
-    assert counts.get("NOT_ATTRIBUTABLE") == 2, counts
+    assert counts.get("NEEDS_REVIEW") == 3, counts
+    assert counts.get("NOT_ATTRIBUTABLE") == 1, counts
     assert counts.get("BUG") == 1, counts
     # The raw label must not leak an inflated figure alongside the split.
-    assert sum(counts.values()) == 4, counts
+    assert sum(counts.values()) == 5, counts
 
 
 def test_verdict_counts_reproduce_a_real_runs_rendered_totals():

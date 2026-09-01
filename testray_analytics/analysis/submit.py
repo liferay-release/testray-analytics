@@ -55,8 +55,9 @@ from .testray_writer import (
 _CLASSIFICATIONS = {"BUG", "POSSIBLE_BUG", "NEEDS_REVIEW", "FALSE_POSITIVE", "TEST_FIX"}
 _CONFIDENCES     = {"high", "medium", "low"}
 
-# Mirrors report._TICKET_RE and prepare._LPD_RE.
-_TICKET_RE = re.compile(r"\b((?:LPD|LPP|LPS)-\d+)\b")
+# The candidate-ticket pattern lives in verdicts.py, because the display
+# rule depends on it: three copies had already drifted apart in wording.
+_TICKET_RE = verdicts.CANDIDATE_RE
 
 MODE_PER_TEST   = "per-test"
 MODE_BY_SUBTASK = "by-subtask"
@@ -339,8 +340,16 @@ def _auto_reason(row) -> str:
     """
     pc = str(row.get("pre_classification") or "").strip().upper()
     if pc == _NO_BASELINE:
-        return ("no baseline result for this case — often a new test; "
-                "nothing to compare a signature against, so a human decides")
+        # Say what the reader should DO with it. "No baseline, a human decides"
+        # is true but reads as a shrug, and the commonest cause carries a clear
+        # expectation: a test added in this range is supposed to pass in the
+        # build that adds it, so one failing on its first run is unfinished
+        # work rather than an unknown.
+        return ("no baseline result for this case — most often a newly added "
+                "test. A new test is expected to pass on the build that "
+                "introduces it, so a failure on its first run means the test "
+                "or the change it covers is not finished. There is no earlier "
+                "signature to compare against, so a human decides")
     if pc == _PRE_EXISTING:
         streak = row.get("history_fail_streak")
         depth  = row.get("history_depth")

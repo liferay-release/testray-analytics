@@ -13,6 +13,8 @@ label. Any new consumer imports from here rather than restating the rule.
 order or the relabel rule, change it there too.
 """
 
+import re
+
 # Severity order. The index doubles as the sort rank, so the sequence is the
 # contract, not just documentation: it decides which verdict a mixed cluster
 # rolls up to, and what a "worst first" sort puts on top.
@@ -27,8 +29,27 @@ VERDICT_ORDER = ["BUG", "POSSIBLE_BUG", "NEEDS_REVIEW", "TEST_FIX",
 # misrepresents what was actually said. The stored classification stays
 # NEEDS_REVIEW, so the picklist, the writer's schema and the rubric are
 # untouched; only what a reader is shown changes.
+#
+# Two things the label must NOT swallow, both found on the U152 -> Acceptance
+# run where it relabelled all 56 NEEDS_REVIEW clusters and the report read as
+# "nothing to review":
+#
+#   * A row with NO confidence was never sent to the model at all — it carries
+#     an auto label from submit._auto_label (a no_baseline row, say, whose own
+#     reason reads "nothing to compare a signature against, so a human
+#     decides"). Nothing failed to attribute it; nothing was asked. Only a
+#     genuine `low` from the classifier relabels.
+#   * A low-confidence verdict that still NAMED candidate tickets did attribute
+#     something — it just could not choose between them. 50 of those 56
+#     clusters named at least one. Only a verdict naming nothing is honestly
+#     "not attributable".
 UNATTRIBUTED_FROM = "NEEDS_REVIEW"
-UNATTRIBUTED_AT = {"low", ""}
+UNATTRIBUTED_AT = {"low"}
+
+# Candidate tickets the classifier names in `specific_change` when it will not
+# commit to one file. Defined here because the display rule above depends on
+# it; report.py and submit.py import it rather than keeping their own copies.
+CANDIDATE_RE = re.compile(r"\b((?:LPD|LPP|LPS)-\d+)\b")
 
 
 # Liferay strips underscores from picklist entry keys, so a verdict written as
@@ -62,12 +83,20 @@ def text(value) -> str:
     return "" if s.lower() in ("nan", "none") else s
 
 
-def display_verdict(classification, confidence) -> str:
-    """The label to SHOW for a row. See UNATTRIBUTED_FROM above."""
+def display_verdict(classification, confidence, specific_change="") -> str:
+    """The label to SHOW for a row. See UNATTRIBUTED_FROM above.
+
+    `specific_change` is read, not just the confidence: a low-confidence
+    verdict that named candidate tickets is not unattributable.
+    """
     cls = canonical(classification)
-    if cls == UNATTRIBUTED_FROM and text(confidence).lower() in UNATTRIBUTED_AT:
-        return "NOT_ATTRIBUTABLE"
-    return cls
+    if cls != UNATTRIBUTED_FROM:
+        return cls
+    if text(confidence).lower() not in UNATTRIBUTED_AT:
+        return cls
+    if CANDIDATE_RE.search(text(specific_change)):
+        return cls
+    return "NOT_ATTRIBUTABLE"
 
 
 def rank(verdict) -> int:
@@ -104,7 +133,8 @@ def display_series(df) -> list[str]:
         return []
     n = len(df)
     return [
-        display_verdict(c, f)
-        for c, f in zip(df.get("classification", [""] * n),
-                        df.get("confidence", [""] * n))
+        display_verdict(c, f, s)
+        for c, f, s in zip(df.get("classification", [""] * n),
+                           df.get("confidence", [""] * n),
+                           df.get("specific_change", [""] * n))
     ]
