@@ -149,6 +149,29 @@ def _include(classification, confidence) -> bool:
     return True
 
 
+def _exclusion_reason(row) -> str | None:
+    """Why this row is not persisted, or None if it is. One place, so the batch
+    and the breakdown can never disagree about the policy.
+
+    The two row-level rules exist because those rows are now RENDERED but were
+    never classified — the report gained them, the store must not. A flaky row
+    carries a NEEDS_REVIEW label that nothing concluded (submit._FLAKY_REASON),
+    and a PRE_EXISTING row describes a failure that predates this diff. Writing
+    either would put verdicts in Testray that no classifier ever made.
+    """
+    if str(row.get("known_flaky") or "").strip().lower() in ("true", "1", "1.0", "yes"):
+        return "known flaky"
+    if str(row.get("pre_classification") or "").strip().upper() == "PRE_EXISTING":
+        return "pre-existing failure"
+    cls  = str(row.get("classification") or "").strip()
+    conf = str(row.get("confidence") or "").strip().lower()
+    if cls == "FALSE_POSITIVE" and conf == "high":
+        return "high-confidence FALSE_POSITIVE"
+    if cls in _AUTO_LABELS and not INCLUDE_AUTO_CLASSIFIED:
+        return cls
+    return None
+
+
 def build_batch(df: pd.DataFrame, meta: dict, classifier: str) -> list[dict]:
     """One TriageResult entry per classified case row. Rows without a
     testray_case_id are skipped — they can't be keyed to a CaseResult.
@@ -161,7 +184,7 @@ def build_batch(df: pd.DataFrame, meta: dict, classifier: str) -> list[dict]:
         cid = row.get("testray_case_id")
         if cid is None or pd.isna(cid):
             continue
-        if not _include(row.get("classification"), row.get("confidence")):
+        if _exclusion_reason(row) is not None:
             continue
 
         item = {
@@ -427,16 +450,9 @@ def excluded_breakdown(df: pd.DataFrame) -> "collections.Counter":
     for _, row in df.iterrows():
         if "testray_case_id" in df.columns and pd.isna(row.get("testray_case_id")):
             continue                       # not FK-eligible; counted elsewhere
-        cls  = str(row.get("classification") or "").strip()
-        conf = str(row.get("confidence") or "").strip().lower()
-        if _include(cls, conf):
-            continue
-        if cls == "FALSE_POSITIVE" and conf == "high":
-            reasons["high-confidence FALSE_POSITIVE"] += 1
-        elif cls in _AUTO_LABELS:
-            reasons[cls] += 1
-        else:
-            reasons["other"] += 1
+        why = _exclusion_reason(row)
+        if why is not None:
+            reasons[why] += 1
     return reasons
 
 

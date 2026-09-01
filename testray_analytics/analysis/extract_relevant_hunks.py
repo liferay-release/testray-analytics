@@ -147,7 +147,52 @@ def fuzzy_match(diff_path, fragment):
     return fragment.lower() in diff_path.lower()
 
 
-def build_matcher(mode, fragments, all_diff_paths, stats_sink):
+# A fuzzy fragment matching more than this many files is not narrowing
+# anything, so it is DROPPED rather than truncated: keeping an arbitrary 25 of
+# the 2,100 files "workspaces" matches yields 25 irrelevant files, while
+# dropping it yields none.
+#
+# Measured on the U152 -> Acceptance range (6,739 changed files): 217 of 232
+# fragments fell back to fuzzy and pulled in 5,646 files -- 81% of the diff --
+# led by bare path words (workspaces 2,100, headless 724, portal 719). At 25
+# that becomes 169 files, 3.0%, which is where the one-day runs already sit.
+#
+# The cap is on the MATCH COUNT, not the shape of the fragment, and that
+# distinction matters: `site-cms-site-initializer` is a bare word that matches
+# 328 files in a four-week diff and 5 in a one-day diff. Rejecting bare words
+# would have thrown away the evidence behind the best verdicts this tool has
+# produced. How discriminating a fragment is depends on the diff, so measure it
+# against the diff.
+DEFAULT_MAX_FUZZY_FILES = 25
+
+
+def _drop_undiscriminating(matched_by, candidates, limit, stats_sink):
+    """Return the candidates worth keeping, dropping the ones that match too
+    much of the diff to mean anything. Also clears their `matched_by` entry so
+    the reported file list matches what was actually used."""
+    if not limit:
+        return set(candidates)
+    kept, dropped = set(), []
+    for frag in candidates:
+        n = len(matched_by.get(frag, ()))
+        if n > limit:
+            dropped.append((n, frag))
+            matched_by[frag] = []
+        else:
+            kept.add(frag)
+    if dropped and stats_sink:
+        print(f"[CAP] {len(dropped)} fuzzy fragment(s) matched more than "
+              f"{limit} files and were dropped as non-discriminating:",
+              file=stats_sink)
+        for n, frag in sorted(dropped, reverse=True)[:10]:
+            print(f"       x  {frag}  ({n} files)", file=stats_sink)
+        if len(dropped) > 10:
+            print(f"       … and {len(dropped) - 10} more", file=stats_sink)
+    return kept
+
+
+def build_matcher(mode, fragments, all_diff_paths, stats_sink,
+                  max_fuzzy_files=DEFAULT_MAX_FUZZY_FILES):
     """
     Pre-scans all_diff_paths against each fragment under the chosen strategy.
     Returns:
@@ -171,8 +216,11 @@ def build_matcher(mode, fragments, all_diff_paths, stats_sink):
                 if fuzzy_match(dp, frag):
                     matched_by[frag].append(dp)
 
+        kept = _drop_undiscriminating(matched_by, fragments, max_fuzzy_files,
+                                      stats_sink)
+
         def check(dp):
-            return any(fuzzy_match(dp, f) for f in fragments)
+            return any(fuzzy_match(dp, f) for f in kept)
 
     else:  # --auto
         exact_hit = set()
@@ -189,6 +237,9 @@ def build_matcher(mode, fragments, all_diff_paths, stats_sink):
                 if fuzzy_match(dp, frag):
                     matched_by[frag].append(dp)
                     fuzzy_hit.add(frag)
+
+        fuzzy_hit = _drop_undiscriminating(matched_by, fuzzy_hit,
+                                           max_fuzzy_files, stats_sink)
 
         if fuzzy_hit and stats_sink:
             print(
@@ -292,6 +343,11 @@ def main():
                         help="List fragments that matched nothing (implies --stats)")
     parser.add_argument("--min-lines", type=int, default=1, metavar="N",
                         help="Only include files with >= N changed lines (default: 1)")
+    parser.add_argument("--max-fuzzy-files", type=int,
+                        default=DEFAULT_MAX_FUZZY_FILES, metavar="N",
+                        help="Drop a fuzzy fragment that matches more than N "
+                             "files — it is not narrowing anything (default: "
+                             f"{DEFAULT_MAX_FUZZY_FILES}; 0 disables the cap)")
 
     mode_group = parser.add_mutually_exclusive_group()
     mode_group.add_argument("--exact", dest="mode", action="store_const", const="exact",
@@ -345,7 +401,8 @@ def main():
         print(f"[INFO] Files in diff: {len(all_diff_paths):,}", file=sys.stderr)
 
     # Build matcher
-    check_fn, matched_by = build_matcher(args.mode, fragments, all_diff_paths, stats_sink)
+    check_fn, matched_by = build_matcher(args.mode, fragments, all_diff_paths, stats_sink,
+                                  max_fuzzy_files=args.max_fuzzy_files)
 
     # Extract
     results = list(extract_hunks(diff_lines, check_fn, args.min_lines))

@@ -16,8 +16,8 @@ from testray_analytics.analysis import error_signature as es
 from testray_analytics.analysis.prepare import (
     TRANSITION_AWARENESS, TRANSITION_BLOCKED, TRANSITION_CHANGED,
     TRANSITION_FIXED, TRANSITION_NEW, TRANSITION_NO_BASELINE,
-    TRANSITION_SAME_FAILURE, TRANSITION_TESTFIX, classify_transition,
-    compute_test_diff,
+    REPORTED_TRANSITIONS, TRANSITION_SAME_FAILURE, TRANSITION_TESTFIX,
+    TRIAGE_TRANSITIONS, classify_transition, compute_test_diff,
 )
 
 
@@ -128,11 +128,25 @@ def _frame(case_id, status, errors, **kw):
     return row
 
 
-def test_compute_test_diff_surfaces_new_and_changed_only():
+def test_triage_set_excludes_pre_existing_and_fixed():
+    """The classify set is TRIAGE_TRANSITIONS; the report set adds
+    same_failure and nothing else. compute_test_diff returns the REPORT set —
+    a same_failure row is carried so the report can account for it, and is
+    kept out of classification by its transition never being a triage
+    candidate (prepare tags it PRE_EXISTING downstream)."""
+    for t in (TRANSITION_SAME_FAILURE, TRANSITION_FIXED, TRANSITION_AWARENESS):
+        assert t not in TRIAGE_TRANSITIONS, f"{t} must never be classified"
+    assert TRANSITION_SAME_FAILURE in REPORTED_TRANSITIONS
+    assert TRANSITION_FIXED not in REPORTED_TRANSITIONS
+    assert TRANSITION_AWARENESS not in REPORTED_TRANSITIONS
+    assert TRIAGE_TRANSITIONS < REPORTED_TRANSITIONS
+
+
+def test_compute_test_diff_surfaces_new_changed_and_pre_existing():
     baseline = pd.DataFrame([
         _frame(1, "PASSED", ""),            # → new failure
         _frame(2, "FAILED", "NPE at A:1"),  # → changed (different error)
-        _frame(3, "FAILED", "NPE at A:1"),  # → same failure, filtered
+        _frame(3, "FAILED", "NPE at A:1"),  # → same failure, reported not triaged
         _frame(4, "FAILED", "boom"),        # → fixed, filtered
         _frame(5, "BLOCKED", ""),           # → blocked→failed
         _frame(6, "FAILED", "boom"),        # → awareness only, filtered
@@ -150,7 +164,10 @@ def test_compute_test_diff_surfaces_new_and_changed_only():
 
     got = dict(zip(df["testray_case_id"], df["transition"]))
     assert got == {1: TRANSITION_NEW, 2: TRANSITION_CHANGED,
-                   5: TRANSITION_BLOCKED}
+                   3: TRANSITION_SAME_FAILURE, 5: TRANSITION_BLOCKED}
+    # fixed and awareness stay out of the frame entirely — only same_failure
+    # was promoted from "counted" to "reported".
+    assert set(df["transition"]) <= REPORTED_TRANSITIONS
     assert counts[TRANSITION_SAME_FAILURE] == 1
     assert counts[TRANSITION_FIXED] == 1
     assert counts[TRANSITION_AWARENESS] == 1
@@ -180,7 +197,13 @@ def test_env_churn_is_not_a_changed_failure():
         1, "FAILED", "The build failed prior to running the test on agent-42")])
     df, counts = compute_test_diff(baseline, target)
     assert counts[TRANSITION_SAME_FAILURE] == 1
-    assert df.empty, "env churn must not reach the classifier"
+    # The row is REPORTED (so the page accounts for the failure) but its
+    # transition is not a triage candidate, which is what keeps env churn away
+    # from the classifier. Asserting df.empty used to stand in for this; the
+    # frame now carries pre-existing rows, so assert the guarantee directly.
+    assert set(df["transition"]) == {TRANSITION_SAME_FAILURE}
+    assert TRANSITION_SAME_FAILURE not in TRIAGE_TRANSITIONS, \
+        "env churn must not reach the classifier"
 
 
 def test_real_regression_still_surfaces_alongside_env_churn():

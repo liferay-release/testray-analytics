@@ -750,7 +750,28 @@ def fetch_build_metadata(build_id: int, cfg: dict) -> dict:
         "git_hash":   str(h).strip() if h and str(h).strip() else None,
         "routine_id": int(rid) if rid else None,
         "project_id": fetch_routine_project(int(rid), cfg) if rid else None,
+        "branch":     _portal_branch(body.get("description")),
     }
+
+
+# Testray records the branch a build was cut from in the Build description,
+# alongside a Jenkins link and sometimes a release name:
+#
+#   Portal Release: 7.4.13; <a href="…">Jenkins Report</a>; Portal Branch: master;
+#
+# This is per-build and authoritative, which config's `git.base_branch` is not:
+# that is one static value, so it reads "master" for a 2024.Q1 analysis whose
+# builds were actually cut from release-2024.q1. Terminated on `;` or `<`
+# because the field is HTML and the branch is not always last.
+_PORTAL_BRANCH_RE = re.compile(r"Portal\s+Branch:\s*([^;<]+)", re.IGNORECASE)
+
+
+def _portal_branch(description) -> str | None:
+    """The branch named in a Build description, or None when absent."""
+    if not description:
+        return None
+    m = _PORTAL_BRANCH_RE.search(str(description))
+    return m.group(1).strip() or None if m else None
 
 
 def fetch_routine_project(routine_id: int, cfg: dict) -> int | None:
@@ -866,6 +887,21 @@ TRIAGE_TRANSITIONS = frozenset({
     TRANSITION_NEW, TRANSITION_CHANGED, TRANSITION_BLOCKED, TRANSITION_TESTFIX,
     TRANSITION_NO_BASELINE,
 })
+
+# What reaches the REPORT, which is a wider set than what reaches the
+# classifier. `same_failure` is not a triage candidate — an identical signature
+# on both sides means the same reason, and this range did not cause it — but it
+# is the number that answers "is this build getting worse or is it the same
+# mess as yesterday", and dropping it at the diff left that question
+# unanswerable from the report alone.
+#
+# This is NOT the §12 "never filter on the transition label" rule, which is
+# about `changed` and is already honoured (changed IS in TRIAGE_TRANSITIONS).
+# It is a display decision: these rows are carried through enrichment, tagged
+# PRE_EXISTING, and then excluded from the classify set, the prompt, the
+# clustering and the Testray write. Cost and verdicts are unchanged; only the
+# report gains a section.
+REPORTED_TRANSITIONS = TRIAGE_TRANSITIONS | {TRANSITION_SAME_FAILURE}
 
 _FAILING = ("FAILED", "BLOCKED", "UNTESTED")
 
@@ -1186,7 +1222,7 @@ def compute_test_diff(baseline: pd.DataFrame, target: pd.DataFrame,
         matrix_out.update(matrix)
 
     counts = collections.Counter(merged["transition"])
-    diff = merged[merged["transition"].isin(TRIAGE_TRANSITIONS)].copy()
+    diff = merged[merged["transition"].isin(REPORTED_TRANSITIONS)].copy()
 
     if both_have_ids:
         case_id_col = "case_id"
@@ -1287,6 +1323,7 @@ def resolve_side_metadata(spec: SideSpec, cfg: dict) -> dict:
         "git_hash":   git_hash,
         "routine_id": build["routine_id"],
         "project_id": build.get("project_id"),
+        "branch":     build.get("branch"),
     }
 
 
@@ -1454,6 +1491,16 @@ def enrich_and_pre_classify(df: pd.DataFrame) -> pd.DataFrame:
         if no_base.any():
             df.loc[no_base, "pre_classification"] = NO_BASELINE_PRE
 
+        # same_failure rows ride along for the report only (see
+        # REPORTED_TRANSITIONS). PRE_EXISTING is what keeps them out of the
+        # classify set, the prompt, the clustering and the Testray write —
+        # the same mechanism the history feature's chronic rows use, so there
+        # is one exclusion path rather than two.
+        same_fail = ((df["transition"] == TRANSITION_SAME_FAILURE)
+                     & df["pre_classification"].isna())
+        if same_fail.any():
+            df.loc[same_fail, "pre_classification"] = PRE_EXISTING
+
     return df
 
 
@@ -1562,6 +1609,7 @@ def write_run_yml(run_dir: Path, *, run_id: str,
                   flaky_excluded: int, mode: str = DEFAULT_MODE,
                   project_id: int | None = None,
                   testray_url: str | None = None,
+                  base_branch: str | None = None,
                   transition_counts: dict | None = None,
                   baseline_rows: int | None = None,
                   target_rows: int | None = None,
@@ -1577,6 +1625,10 @@ def write_run_yml(run_dir: Path, *, run_id: str,
         "build_id_b":          build_b,
         "git_hash_a":          hash_a,
         "git_hash_b":          hash_b,
+        # Named so the report can describe the range to a human ("branch
+        # master, 81a4afb..b096242") without re-reading config.yml at render
+        # time. Absent on bundles written before this key existed.
+        "base_branch":         base_branch,
         "routine_id":          routine_id,
         # Recorded for the report's Testray deep-links only; nothing in the
         # pipeline branches on either value.
@@ -1637,6 +1689,7 @@ judge whether each failure is caused by a hunk in the diff.
 
 - **BUG** (confirmed) — only when confidence is **`high`** AND a hunk in the diff (direct or via imports/lifecycle) clearly caused the failure, **and the production change is a genuine defect** (not an intentional change the test merely failed to keep up with — that is TEST_FIX). **MUST name a `culprit_file`.** A linked Jira ticket confirming the regression also qualifies. BUG and POSSIBLE_BUG `culprit_file`s are the labeled defect-attribution training data — only use BUG when you have actually verified the culprit.
 - **POSSIBLE_BUG** — exactly **one** plausible diff-caused theory at **`medium`** confidence that you cannot verify to `high` from this prompt: a single changed file (or single ticket cluster) that most likely caused the failure, and it looks like a defect rather than an intentional change. **Name the single candidate in `culprit_file`** (this is what separates POSSIBLE_BUG from NEEDS_REVIEW — a concrete, single attribution). If you have **two or more** competing candidates, that is NEEDS_REVIEW (multi-cause), not POSSIBLE_BUG. If you cannot name any concrete file, that is NEEDS_REVIEW (transitive/low). POSSIBLE_BUG is the "likely a bug, needs a human to confirm the one culprit" tier.
+- **One candidate, intentional-vs-defect unresolved** — when you have exactly **one** concrete candidate but cannot tell whether the production change was a defect (POSSIBLE_BUG) or deliberate with the test lagging (TEST_FIX), still classify **POSSIBLE_BUG** at `medium` and say so in `specific_change` ("cannot tell intentional vs regression"). Do **not** fall back to NEEDS_REVIEW: NEEDS_REVIEW means you could not narrow the CAUSE, and here you have. Naming one candidate and flagging the open question is far more useful to a reviewer than withholding the candidate entirely.
 - **TEST_FIX** — the failure **is** caused by the diff, but the production change was **intentional and correct** and only a stale test lags behind it. Tells:
   - the test asserts on a UI label / selector / element / API shape that the diff deliberately changed (e.g. a control changed from a button to a combobox, a label was renamed, an endpoint signature changed),
   - the diff migrated one test layer to the new behavior but left another stale (classic: Playwright updated, legacy Poshi/Selenium selector not), or
@@ -1747,6 +1800,7 @@ Same rubric as per-test mode, applied at the subtask level — write one verdict
 
 - **BUG** (confirmed) — only when confidence is **`high`** AND a hunk in the diff (direct or via imports/lifecycle) clearly caused the *shared* error across all members **and the production change is a genuine defect** (not an intentional change the tests merely lag behind — that is TEST_FIX). **MUST name a `culprit_file`.** BUG and POSSIBLE_BUG culprit_files feed defect-attribution training data — only use BUG when the culprit is actually verified.
 - **POSSIBLE_BUG** — exactly **one** plausible diff-caused theory at **`medium`** confidence for the shared error that you cannot verify to `high`: a single changed file (or single ticket cluster) that most likely caused it, looking like a defect rather than an intentional change. **Name the single candidate in `culprit_file`.** Two or more competing candidates → NEEDS_REVIEW (multi-cause). No concrete file → NEEDS_REVIEW (transitive/low).
+- **One candidate, intentional-vs-defect unresolved** — when you have exactly **one** concrete candidate but cannot tell whether the production change was a defect (POSSIBLE_BUG) or deliberate with the test lagging (TEST_FIX), still classify **POSSIBLE_BUG** at `medium` and say so in `specific_change` ("cannot tell intentional vs regression"). Do **not** fall back to NEEDS_REVIEW: NEEDS_REVIEW means you could not narrow the CAUSE, and here you have. Naming one candidate and flagging the open question is far more useful to a reviewer than withholding the candidate entirely.
 - **TEST_FIX** — the shared failure **is** diff-caused, but the production change was **intentional and correct** and the member tests simply assert on the old behavior (renamed label, changed selector/element/API the diff deliberately changed; or one test layer was migrated and a legacy one left stale). The fix is to update the tests, not production. Do **NOT** name the production file as `culprit_file` (that mislabels a correct change as a defect); leave it null or name the stale test, and describe the test change in `specific_change`.
 - **NEEDS_REVIEW** — the safe default when you can't narrow to a single culprit. Any of:
   - **Two or more candidate causes** — multiple changed files / ticket clusters (LPD/LPP/LPS-XXXXX) plausibly affect this group's space — list ALL candidates separated by `; ` in `specific_change`. (A *single* candidate at medium confidence is POSSIBLE_BUG.)
@@ -2645,6 +2699,7 @@ def _finalize_bundle(
     testray_cfg: dict | None = None,
     history_depth: int = HISTORY_DEPTH_DEFAULT,
     history_streak: int = HISTORY_STREAK_DEFAULT,
+    base_branch: str | None = None,
 ) -> Path:
     print(f"→ Step 3/6 git diff …")
     diff_path = run_dir / "git_diff_full.diff"
@@ -2716,13 +2771,28 @@ def _finalize_bundle(
             print(f"   WARNING: history unavailable for {len(hist) - got} case(s); "
                   f"they stay in the classify set.", file=sys.stderr)
 
-    df_flaky    = df[df["known_flaky"].fillna(False)].copy()
-    df_nonflaky = df[~df["known_flaky"].fillna(False)].copy()
+    # Report-only rows are identified by their TRANSITION, not by the
+    # PRE_EXISTING tag. A same_failure row whose error text matches an
+    # env/infra pattern is tagged NO_ERROR/BATCH_FAILURE before the
+    # PRE_EXISTING fill can reach it (that fill is .isna()-gated on purpose,
+    # so the more specific pattern wins), and keying on the tag let exactly
+    # those rows leak back into the grouping and change the prompt.
+    is_report_only = df["transition"] == TRANSITION_SAME_FAILURE
+    is_flaky       = df["known_flaky"].fillna(False)
+
+    # The buckets below describe the CLASSIFY population, so report-only rows
+    # are taken out of all of them first and counted on their own. Folding them
+    # into df_flaky instead made the prompt preamble claim "3 known-flaky
+    # excluded" for a run where only one flaky row was ever a candidate.
+    df_pre_ex   = df[is_report_only].copy()
+    df_cand     = df[~is_report_only]
+    df_flaky    = df_cand[df_cand["known_flaky"].fillna(False)].copy()
+    df_nonflaky = df_cand[~df_cand["known_flaky"].fillna(False)].copy()
     df_auto     = df_nonflaky[df_nonflaky["pre_classification"].notna()].copy()
     df_to_cls   = df_nonflaky[df_nonflaky["pre_classification"].isna()].copy()
     print(f"   {len(df)} unique cases: "
           f"{len(df_to_cls)} to classify, {len(df_auto)} auto, "
-          f"{len(df_flaky)} flaky (excluded)")
+          f"{len(df_pre_ex)} pre-existing, {len(df_flaky)} flaky (excluded)")
 
     diff_list_cols = [
         "testray_case_id", "test_case", "component_name", "team_name",
@@ -2760,7 +2830,11 @@ def _finalize_bundle(
         # A subtask with a mix of classifiable + auto members lands in the
         # classifiable bucket; submit.py and assemble_dataframe_subtask
         # handle the per-member differentiation.
-        all_groups      = compute_subtask_groups(df, mode=mode)
+        # Group WITHOUT the pre-existing rows. They are report-only, so the
+        # clusters, the prompt and its token cost stay bit-identical to a run
+        # that never carried them; diff_list.csv (written above) still has them
+        # and report.py renders them in their own section.
+        all_groups      = compute_subtask_groups(df[~is_report_only], mode=mode)
         groups_to_cls:  list[dict] = []
         groups_auto:    list[dict] = []
         groups_flaky:   list[dict] = []
@@ -2824,6 +2898,7 @@ def _finalize_bundle(
         mode=mode,
         project_id=project_id,
         testray_url=testray_url,
+        base_branch=base_branch,
         transition_counts=transition_counts,
         baseline_rows=baseline_rows,
         target_rows=target_rows,
@@ -2987,6 +3062,11 @@ def prepare(baseline: SideSpec, target: SideSpec, classifier: str,
         testray_cfg=cfg["testray"],
         history_depth=history_depth,
         history_streak=history_streak,
+        # The TARGET build's own branch, which is what the range is on.
+        # config's git.base_branch is one static value and would read
+        # "master" for a 2024.Q1 analysis, so it is only the fallback.
+        base_branch=(meta_b.get("branch")
+                     or (cfg.get("git") or {}).get("base_branch")),
         git_repo=git_repo,
         mode=mode,
         fetch_specs=fetch_specs,

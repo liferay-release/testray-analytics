@@ -30,6 +30,7 @@ Usage:
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -53,6 +54,9 @@ from .testray_writer import (
 
 _CLASSIFICATIONS = {"BUG", "POSSIBLE_BUG", "NEEDS_REVIEW", "FALSE_POSITIVE", "TEST_FIX"}
 _CONFIDENCES     = {"high", "medium", "low"}
+
+# Mirrors report._TICKET_RE and prepare._LPD_RE.
+_TICKET_RE = re.compile(r"\b((?:LPD|LPP|LPS)-\d+)\b")
 
 MODE_PER_TEST   = "per-test"
 MODE_BY_SUBTASK = "by-subtask"
@@ -302,6 +306,28 @@ def _auto_label(pre_classification) -> str:
     return "DID_NOT_RUN" if pc in _DID_NOT_RUN else "ENV_FAILURE"
 
 
+# A known-flaky row is never sent to the classifier, so it has no verdict of
+# its own. It still belongs on the report: a failure the reader cannot see is
+# a failure they cannot judge, and the header count already includes it (the
+# status matrix is built before this filter), so dropping the row left a number
+# on the page that no row explained.
+#
+# NEEDS_REVIEW is the honest label — nothing was asked of the classifier, so
+# nothing was concluded. Flakiness rides alongside as `known_flaky`, which
+# report.py renders as a badge next to the pill: the verdict says what the
+# failure is, the badge says how much to trust the signal. They are different
+# questions and neither answer should overwrite the other.
+_FLAKY_REASON = ("marked flaky on the Testray case — excluded from "
+                 "classification, shown for awareness")
+
+
+def _is_flaky(row) -> bool:
+    v = row.get("known_flaky")
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return False
+    return str(v).strip().lower() in ("true", "1", "1.0", "yes")
+
+
 def _auto_reason(row) -> str:
     """Why an auto-classified row got its label.
 
@@ -323,22 +349,37 @@ def _auto_reason(row) -> str:
                     f"consecutive result(s)"
                     + (f" of {int(depth)} read" if pd.notna(depth) else "")
                     + " — failing before this diff")
+        # The transition-derived case (prepare.REPORTED_TRANSITIONS): no
+        # history was read, but an identical signature on both sides is
+        # evidence enough on its own.
+        if str(row.get("transition") or "").strip() == "same_failure":
+            return ("failed with the same error on the baseline — pre-existing, "
+                    "not caused by this range")
     return f"pre_classification={row.get('pre_classification')}"
 
 
 def assemble_dataframe(diff_list: pd.DataFrame, results: list[dict]) -> pd.DataFrame:
     """
     Merge classifier results back into the diff_list. Auto-classified rows
-    become classification=AUTO_CLASSIFIED; known-flaky rows are dropped
-    (already excluded from what the classifier saw).
+    become classification=AUTO_CLASSIFIED; known-flaky rows are kept and
+    labelled NEEDS_REVIEW (see _FLAKY_REASON) rather than dropped — they are
+    still excluded from the Testray write by testray_writer._include.
     """
     results_by_id = {r["testray_case_id"]: r for r in results}
 
-    # Drop flaky rows — not persisted
-    df = diff_list[~diff_list["known_flaky"].fillna(False)].copy()
+    df = diff_list.copy()
 
     def _row(row):
         cid = row["testray_case_id"]
+        if _is_flaky(row) and pd.isna(row.get("pre_classification")):
+            return pd.Series({
+                "classification":  "NEEDS_REVIEW",
+                "confidence":      None,
+                "culprit_file":    None,
+                "specific_change": None,
+                "reason":          _FLAKY_REASON,
+                "match_strategy":  "flaky",
+            })
         if pd.notna(row.get("pre_classification")):
             return pd.Series({
                 "classification":  _auto_label(row.get("pre_classification")),
@@ -417,11 +458,19 @@ def assemble_dataframe_subtask(
             if isinstance(sid, int):
                 subtask_by_case[int(cid)] = sid
 
-    # Drop flaky rows — not persisted
-    df = diff_list[~diff_list["known_flaky"].fillna(False)].copy()
+    df = diff_list.copy()
 
     def _row(row):
         cid = int(row["testray_case_id"])
+        if _is_flaky(row) and pd.isna(row.get("pre_classification")):
+            return pd.Series({
+                "classification":  "NEEDS_REVIEW",
+                "confidence":      None,
+                "culprit_file":    None,
+                "specific_change": None,
+                "reason":          _FLAKY_REASON,
+                "match_strategy":  "flaky",
+            })
         if pd.notna(row.get("pre_classification")):
             return pd.Series({
                 "classification":  _auto_label(row.get("pre_classification")),
@@ -632,6 +681,23 @@ def main() -> None:
     if len(pbug_rows):
         print(f"POSSIBLE_BUG candidate-culprit coverage: {pbug_hits}/{len(pbug_rows)} "
               f"({100 * pbug_hits / len(pbug_rows):.0f}%) — feeds training with BUG")
+
+    # Rubric drift, not a data error: the rubric routes exactly ONE candidate at
+    # medium confidence to POSSIBLE_BUG, and two or more to NEEDS_REVIEW. A
+    # medium NEEDS_REVIEW naming a single ticket is therefore a verdict the
+    # rubric says should have been POSSIBLE_BUG. Report it rather than rewrite
+    # it — silently promoting a verdict would put words in the classifier's
+    # mouth, and the number is the signal that the prompt needs work.
+    _demotable = [
+        r for _, r in df.iterrows()
+        if verdicts.canonical(r.get("classification")) == "NEEDS_REVIEW"
+        and str(r.get("confidence") or "").strip().lower() == "medium"
+        and len(set(_TICKET_RE.findall(str(r.get("specific_change") or "")))) == 1
+    ]
+    if _demotable:
+        print(f"NOTE: {len(_demotable)} NEEDS_REVIEW row(s) name exactly one "
+              f"candidate at medium confidence — the rubric routes those to "
+              f"POSSIBLE_BUG. Left as classified; this counts prompt drift.")
     if mode in GROUPED_MODES:
         n_subtasks = len(payload["results"])
         n_with_sid = int(df["subtask_id"].notna().sum())

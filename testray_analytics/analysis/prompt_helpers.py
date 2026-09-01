@@ -99,6 +99,14 @@ DEFAULT_AUTO_CLASSIFY = {
         # target failure look like a *changed* one (see
         # _BASELINE_RAN_NOTHING in prepare.py).
         r"was not executed\. Please check the logs",
+        # CI orchestration, not a test outcome: the test never executed, so
+        # there is nothing for a classifier to reason about and no health
+        # signal for the test. Measured on the U152 -> Acceptance range: 117
+        # rows carried one of these two messages, 26 of which reached the
+        # model and came back — correctly but expensively — as "generic CI
+        # failure across unrelated components".
+        r"^Failed to run test on CI",
+        r"^Test run skipped on CI",
     ],
     "ENV_CHROME": [
         "chrome=100.0",

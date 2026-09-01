@@ -553,10 +553,27 @@ def call_claude_code(
     )
 
     env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
+    # Strip the tools that let the child ACT instead of ANSWER. This call is a
+    # pure text transformation: the batch goes in, one JSON object comes back.
+    # Left with a full toolset, a large batch made the child decide to Write
+    # results.json rather than reply with it — the write was declined (nothing
+    # can approve a permission prompt in print mode), so it narrated prose and
+    # the parse failed, losing a 5-minute call. Small batches never hit this,
+    # which is why it only appeared on a 56-cluster run.
+    #
+    # Bash goes too — it is the other way to write a file, and nothing in
+    # the rubric needs a shell. Read/Glob/Grep stay: the rubric tells the
+    # classifier to consult git_diff_full.diff when the filtered hunks look
+    # too narrow, and Read is how it does that.
     cmd = ["claude", "-p", "--output-format", "json"]
     model = cfg.get("model")
     if model:
         cmd += ["--model", model]
+    # Variadic, so it goes LAST and is terminated by `--`: appended before
+    # --model it swallowed the model name as a tool.  The prompt itself rides
+    # on stdin, so there is no positional argument after the terminator.
+    cmd += ["--disallowedTools", "Write", "Edit", "NotebookEdit", "Task",
+            "Bash", "--"]
 
     # The CLI prints nothing until it returns, and a 100k-token batch runs for
     # minutes — silence long enough that the natural reaction is to Ctrl-C a
