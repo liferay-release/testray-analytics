@@ -628,7 +628,14 @@ def main() -> None:
     if mode in GROUPED_MODES:
         st_path = run_dir / "diff_list_subtasks.csv"
         if st_path.exists():
-            st_df = pd.read_csv(st_path)
+            try:
+                st_df = pd.read_csv(st_path)
+            except pd.errors.EmptyDataError:
+                # A run with no groups at all — every failure pre-existing or
+                # flaky, so prepare wrote a headerless empty frame. That is a
+                # clean build, not a broken bundle: there is simply no
+                # membership to resolve.
+                st_df = pd.DataFrame()
             for _, row in st_df.iterrows():
                 # group_id is the identifier for by-cluster and for any
                 # bundle written since it was introduced; fall back to
