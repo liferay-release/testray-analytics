@@ -1627,6 +1627,92 @@ def _verdict_legend() -> str:
   </details>"""
 
 
+# A fully-qualified Java exception inside a shard-level error. This is the
+# routing signal a BATCH_FAILURE row otherwise throws away: the row's own
+# component is "Batch" and its team "Shared", but
+# `com.liferay.depot.internal.service.DepotRoleLocalServiceImpl` names an owner.
+_JAVA_EXC_RE = re.compile(
+    r"\b((?:[a-z][a-z0-9_]*\.){2,}[A-Z][A-Za-z0-9_]*(?:Exception|Error))\b")
+
+
+def _error_signal(error) -> str:
+    """The most identifying thing in a shard-level error, or "" if there is none.
+
+    Prefers a fully-qualified exception; falls back to a bare one. Nine
+    PortalLogAssertorTest shards all read
+    `PortalLogAssertorTest#testScanXMLLog: …` — the part worth reading is what
+    comes after, and it differs every time.
+    """
+    text = _text(error)
+    if not text:
+        return ""
+    m = _JAVA_EXC_RE.search(text)
+    if m:
+        return m.group(1)
+    m = re.search(r"\b([A-Z][A-Za-z0-9_]*(?:Exception|Error))\b", text)
+    return m.group(1) if m else ""
+
+
+def _batch_section(batch_df, meta: dict) -> str:
+    """Shard-level failures, with the product error inside each one surfaced.
+
+    These rows are not attributable to a test — the name is a batch axis and a
+    shard index (`…-postgresql163/0/15`), so there is no single test to blame
+    and prepare labels them BATCH_FAILURE. But the ERROR is often a real
+    product defect: across one run these nine shards hid a TemplateException, a
+    RoleSubtypeException in com.liferay.depot, a LayoutPageTemplate exception, a
+    missing FragmentEntry and a heap exhaustion — all rendered identically as
+    `pre_classification=BATCH_FAILURE` in the main table, which is why nobody
+    read them.
+
+    Rows carrying an identifiable exception sort first: they are the ones worth
+    a person's time, and a shard that merely could not run is not.
+    """
+    if batch_df is None or not len(batch_df):
+        return ""
+    recs = batch_df.to_dict("records")
+    for r in recs:
+        r["_signal"] = _error_signal(r.get("error_message"))
+    recs.sort(key=lambda r: (not r["_signal"], _text(r.get("test_case"))))
+    n_signal = sum(1 for r in recs if r["_signal"])
+
+    rows = []
+    for i, r in enumerate(recs):
+        url = _case_url(meta, r.get("caseresult_id"))
+        name = _text(r.get("test_case")) or "(unnamed)"
+        cell = (f'<a class="test-link" href="{_esc(url)}" target="_blank" '
+                f'rel="noopener">{_esc(name)}</a>' if url else _esc(name))
+        sig = (f'<code>{_esc(r["_signal"])}</code>' if r["_signal"]
+               else '<span class="ticket-none">&mdash;</span>')
+        rows.append(
+            f'<tr><td class="col-idx col-num">{i + 1}</td>'
+            f'<td class="col-test">{cell}</td>'
+            f'<td class="col-team">{_esc(_text(r.get("team_name"))) or "—"}</td>'
+            f'<td class="col-comp">{_esc(_text(r.get("component_name"))) or "—"}</td>'
+            f'<td class="col-culprit">{sig}</td>'
+            f'<td class="col-reasoning"><pre class="error">'
+            f'{_esc(_truncate(_text(r.get("error_message"))))}</pre></td></tr>')
+
+    carried = (f"{n_signal} of them name an exception" if n_signal
+               else "none of them name an exception")
+    return f"""
+  <details class="pre-existing">
+    <summary><strong>Shard-level failures ({len(recs)})</strong>
+      <span class="hint">Not attributable to a test &mdash; the name is a batch
+      axis and shard index, so no single test can be blamed. The error inside
+      often is a real product defect though, and {carried}.</span></summary>
+    <table class="per-test-table">
+<thead><tr><th class="col-idx">#</th><th class="col-test">Shard</th>
+<th class="col-team">Team</th><th class="col-comp">Component</th>
+<th class="col-culprit">Error signal</th>
+<th class="col-reasoning">Error</th></tr></thead>
+<tbody>
+{chr(10).join(rows)}
+</tbody>
+    </table>
+  </details>"""
+
+
 def _pre_existing_section(pre_df, meta: dict) -> str:
     """Collapsed table of failures that were already failing on the baseline.
 
@@ -2234,6 +2320,7 @@ def render_run(run_dir, df: pd.DataFrame, meta: dict) -> Path:
     # rather than PRE_EXISTING, and keying on the tag would strand it in the
     # main table with an auto verdict and no cause.
     pre_df = df.iloc[0:0]
+    batch_df = df.iloc[0:0]
     pre_transitions: list[str] = []
     if len(df) and "transition" in df.columns:
         mask = df["transition"].astype(str).str.strip() == "same_failure"
@@ -2247,6 +2334,17 @@ def render_run(run_dir, df: pd.DataFrame, meta: dict) -> Path:
     # filter reads (see _pre_existing_section), so selecting it acts on them.
     all_transitions = list(pre_transitions) + [
         _text(x) for x in df.get("transition", [])]
+
+    # Shard-level failures get their own section too, for the same reason as
+    # pre-existing ones: rendered in the main table they are identical grey
+    # DID_NOT_RUN rows reading `pre_classification=BATCH_FAILURE`, which hides
+    # the product error each one actually carries.
+    if len(df) and "pre_classification" in df.columns:
+        bmask = (df["pre_classification"].astype(str).str.strip().str.upper()
+                 == "BATCH_FAILURE")
+        if bmask.any():
+            batch_df = df[bmask].reset_index(drop=True)
+            df = df[~bmask].reset_index(drop=True)
 
     # One derived column so the pills, the filter, the cluster rollups, the
     # sort rank and the row cells cannot disagree about what a row is called.
@@ -2373,6 +2471,7 @@ def render_run(run_dir, df: pd.DataFrame, meta: dict) -> Path:
 {body}
 </tbody>
   </table>
+{_batch_section(batch_df, meta)}
 {_pre_existing_section(pre_df, meta)}
 {_verdict_legend()}
 </main>
