@@ -1409,6 +1409,16 @@ def derive_test_fragments(df: pd.DataFrame) -> set[str]:
                         and len(part) > 4:
                     fragments.add(part)
                     break
+        elif name.startswith(":") and ":" in name[1:]:
+            # A Gradle task path, which is how Stable names its tests:
+            #   :apps:translation:translation-web:packageRunTest
+            # Handled because without it these produce NO fragment at all, and
+            # prepare then copies the WHOLE diff into hunks.txt as "relevant
+            # evidence" — 1.1 MB of it for a single failure on a 308-file range.
+            # The module segment is the last one before the task name.
+            segs = [seg for seg in name.split(":") if seg]
+            if len(segs) >= 2:
+                fragments.add(segs[-2])
         elif name.startswith("LocalFile."):
             module = name.replace("LocalFile.", "").split("#")[0]
             fragments.add(module.lower())
