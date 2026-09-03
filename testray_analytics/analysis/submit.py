@@ -59,6 +59,14 @@ _CONFIDENCES     = {"high", "medium", "low"}
 # rule depends on it: three copies had already drifted apart in wording.
 _TICKET_RE = verdicts.CANDIDATE_RE
 
+# Phrases that assert the PRODUCT misbehaved, as opposed to a test being flaky.
+# Deliberately narrow: a false positive here understates a real drift signal,
+# and this only ever prints a NOTE, never changes a verdict.
+_MISBEHAVIOUR_RE = re.compile(
+    r"\b(?:HTTP\s*5\d\d|\b5\d\d\s+(?:error|response)|probably a defect|"
+    r"is a defect|never shows|no longer shows|not reflected|should (?:be|exist|show)|"
+    r"incorrect|wrong value|returns? (?:an? )?error|stack trace)\b", re.I)
+
 MODE_PER_TEST   = "per-test"
 MODE_BY_SUBTASK = "by-subtask"
 MODE_BY_CLUSTER = "by-cluster"
@@ -695,25 +703,38 @@ def main() -> None:
     print(f"BUG culprit_file coverage: {culprit_hits}/{len(bug_rows)} "
           f"({culprit_pct:.0f}%; target ≥85%)")
     if len(pbug_rows):
-        print(f"POSSIBLE_BUG candidate-culprit coverage: {pbug_hits}/{len(pbug_rows)} "
-              f"({100 * pbug_hits / len(pbug_rows):.0f}%) — feeds training with BUG")
+        # No longer expected to be 100%. POSSIBLE_BUG is a claim about the
+        # FAILURE ("probably a defect"), not about attribution precision, so a
+        # row with several candidates leaves culprit_file null on purpose and
+        # lists them in specific_change. What this now measures is how many
+        # POSSIBLE_BUGs pinned a single culprit — i.e. how many feed the
+        # attribution training set, which filters on culprit_file anyway.
+        print(f"POSSIBLE_BUG with a single named culprit: {pbug_hits}/{len(pbug_rows)} "
+              f"({100 * pbug_hits / len(pbug_rows):.0f}%) — only these feed "
+              f"attribution training with BUG; the rest list candidates instead")
 
-    # Rubric drift, not a data error: the rubric routes exactly ONE candidate at
-    # medium confidence to POSSIBLE_BUG, and two or more to NEEDS_REVIEW. A
-    # medium NEEDS_REVIEW naming a single ticket is therefore a verdict the
-    # rubric says should have been POSSIBLE_BUG. Report it rather than rewrite
-    # it — silently promoting a verdict would put words in the classifier's
-    # mouth, and the number is the signal that the prompt needs work.
+    # Rubric drift, not a data error. NEEDS_REVIEW now means "cannot tell a
+    # defect from an intentional change" — the candidate COUNT no longer routes
+    # a verdict, so a medium NEEDS_REVIEW naming candidates is a verdict the
+    # rubric would rather have seen as POSSIBLE_BUG. Report it rather than
+    # rewrite it: silently promoting a verdict would put words in the
+    # classifier's mouth, and the count is the signal the prompt needs work.
+    # Only rows whose own text says the PRODUCT misbehaved. The previous form
+    # counted every multi-candidate NEEDS_REVIEW and reported 91 on one run,
+    # which is not an alarm — it is wallpaper. The rubric's misbehaviour
+    # trigger routes exactly these to POSSIBLE_BUG, so a non-zero count here
+    # means the prompt is not landing.
     _demotable = [
         r for _, r in df.iterrows()
         if verdicts.canonical(r.get("classification")) == "NEEDS_REVIEW"
-        and str(r.get("confidence") or "").strip().lower() == "medium"
-        and len(set(_TICKET_RE.findall(str(r.get("specific_change") or "")))) == 1
+        and _TICKET_RE.search(str(r.get("specific_change") or ""))
+        and _MISBEHAVIOUR_RE.search(
+            f"{r.get('reason') or ''} {r.get('specific_change') or ''}")
     ]
     if _demotable:
-        print(f"NOTE: {len(_demotable)} NEEDS_REVIEW row(s) name exactly one "
-              f"candidate at medium confidence — the rubric routes those to "
-              f"POSSIBLE_BUG. Left as classified; this counts prompt drift.")
+        print(f"NOTE: {len(_demotable)} NEEDS_REVIEW row(s) describe the product "
+              f"misbehaving AND name a candidate — the rubric's misbehaviour "
+              f"trigger routes those to POSSIBLE_BUG. Left as classified.")
     if mode in GROUPED_MODES:
         n_subtasks = len(payload["results"])
         n_with_sid = int(df["subtask_id"].notna().sum())

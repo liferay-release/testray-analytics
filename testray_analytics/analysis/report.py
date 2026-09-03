@@ -517,6 +517,14 @@ _CSS += """
     font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     font-size: 11.5px; line-height: 1.45; white-space: pre-wrap;
   }
+  /* Sits at the end of the totals row. Deliberately not a pill — the pills are
+     counts, this is a way out of the page. */
+  a.rubric-link {
+    align-self: center; margin-left: auto; font-size: 12px;
+    color: #0747a6; text-decoration: none; white-space: nowrap;
+    border-bottom: 1px solid rgba(7, 71, 166, .35);
+  }
+  a.rubric-link:hover { border-bottom-color: #0747a6; }
   .pre-count { color: var(--c-muted); font-weight: 400; margin-left: 8px;
     font-size: 12px; }
   details.verdict-legend { margin-top: 14px; }
@@ -527,12 +535,79 @@ _CSS += """
   details.verdict-legend > summary .hint {
     display: block; font-weight: 400; margin-top: 2px;
   }
-  .legend-grid {
-    display: grid; grid-template-columns: max-content 1fr;
-    gap: 8px 14px; align-items: baseline; margin: 12px 4px 4px;
+  /* The rubric matrix. Verdict pills are the real ones from the table, so a
+     cell here reads the same as a row there; the cell WASH is a tint of the
+     same token rather than a second palette. */
+  /* Capped rather than stretched to main's 1640px: five columns of prose spread
+     that wide stop reading as a grid. Still scrolls if the viewport is narrower. */
+  .mx-scroll { overflow-x: auto; margin: 12px auto 0; max-width: 1000px; }
+  table.mx {
+    border-collapse: collapse; width: 100%; min-width: 760px; max-width: 1000px;
   }
-  .legend-item { display: contents; }
-  .legend-text { color: var(--c-fg); font-size: 12.5px; line-height: 1.5; }
+  table.mx th, table.mx td {
+    border: 1px solid var(--c-border); vertical-align: top; text-align: left;
+  }
+  table.mx thead th {
+    background: var(--c-row); padding: 8px 10px;
+    font-size: 11.5px; font-weight: 600; position: static;
+  }
+  /* The two axis labels. Without them D1/E1 are opaque codes — the matrix has
+     to say what D and E stand for and which question each axis asks. */
+  table.mx thead th.mx-corner,
+  table.mx thead th.mx-axis-band {
+    background: var(--c-code-bg); vertical-align: top;
+  }
+  .mx-axis-name {
+    display: block; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11px; font-weight: 700; letter-spacing: .06em;
+    text-transform: uppercase; color: var(--c-fg);
+  }
+  .mx-axis-q {
+    display: block; font-weight: 400; font-size: 11px; color: var(--c-muted);
+    line-height: 1.35; margin-top: 3px;
+  }
+  table.mx tbody th {
+    background: var(--c-row); padding: 9px 10px; width: 150px; min-width: 140px;
+    font-size: 11.5px; font-weight: 600;
+  }
+  .mx-axis {
+    display: block; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 10.5px; font-weight: 600; color: var(--c-muted);
+    letter-spacing: .06em; margin-bottom: 2px;
+  }
+  .mx-desc {
+    display: block; font-weight: 400; font-size: 10.5px; color: var(--c-muted);
+    line-height: 1.35; margin-top: 3px;
+  }
+  table.mx td { padding: 9px 10px; }
+  .mx-conf {
+    display: block; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 10.5px; color: var(--c-muted); margin-top: 4px;
+  }
+  .mx-note {
+    display: block; font-size: 10.5px; color: var(--c-muted); line-height: 1.4;
+    margin-top: 5px;
+  }
+  td.mx-bug     { background: #fdeceb; }
+  td.mx-pbug    { background: #fdf0ef; }
+  td.mx-needs   { background: #fdf4e3; }
+  td.mx-testfix { background: #eaf2f8; }
+  td.mx-fp      { background: #f1f3f5; }
+  /* The labels the grid cannot hold — a gate checked before it, a display
+     label derived after it, and the rows that never reach a classifier. */
+  .mx-rule {
+    max-width: 1000px; margin: 12px auto 0; font-size: 11.5px;
+    color: var(--c-muted); line-height: 1.5;
+  }
+  .mx-cards { display: grid; gap: 8px; margin: 14px auto 4px; max-width: 1000px; }
+  .mx-card {
+    display: grid; grid-template-columns: max-content 1fr; gap: 12px;
+    align-items: baseline; padding: 10px 12px;
+    border: 1px solid var(--c-border); border-radius: 4px;
+    background: var(--c-row);
+  }
+  .mx-card-text { font-size: 12.5px; color: var(--c-muted); line-height: 1.5; }
+  .mx-card-text strong { color: var(--c-fg); }
 
   /* Candidate tickets, shown when the classifier named causes but no file. */
   .cause-tickets { display: flex; flex-wrap: wrap; gap: 4px; }
@@ -641,6 +716,19 @@ _JS = """
     });
     applyFilters();
   }
+
+  // ---- rubric link -----------------------------------------------------
+  // The anchor names the <details> itself, so the browser will scroll to a
+  // collapsed box and show nothing. Open it first, then let the jump happen.
+  document.addEventListener('click', function (e) {
+    var link = e.target.closest('a.rubric-link');
+    if (!link) return;
+    var box = document.getElementById('verdict-rubric');
+    if (!box) return;
+    e.preventDefault();
+    box.open = true;
+    box.scrollIntoView({behavior: 'smooth', block: 'start'});
+  });
 
   // ---- handoff prompt ---------------------------------------------------
   // Selects the text as the fallback rather than reporting failure: in a
@@ -1552,78 +1640,138 @@ def _flaky_badge(members) -> str:
             f'{label}</span>')
 
 
-# What each verdict MEANS, for a reader who did not write the rubric. Wording
-# tracks the classify prompt and submit._auto_label — if the rubric moves, these
-# move with it, because a legend that disagrees with the classifier is worse
-# than no legend.
-_VERDICT_LEGEND = {
-    "BUG":
-        "A change in this range caused the failure, and that change is a real "
-        "defect. Suspicious cause always names the file, with the ticket and "
-        "commits that touched it.",
-    "POSSIBLE_BUG":
-        "A single plausible cause in the diff that could not be confirmed. "
-        "Suspicious cause names that one candidate file.",
-    "NEEDS_REVIEW":
-        "Could not be narrowed to one cause \u2014 several changes could explain "
-        "it, or nothing concrete could be tied to it. Suspicious cause lists "
-        "the candidate tickets instead of a file. A human decides.",
-    "TEST_FIX":
-        "The diff did cause this, but the production change was intentional "
-        "and correct \u2014 the test asserts the old behaviour. Fix the test, not "
-        "production. Suspicious cause names the ticket behind the change, or "
-        "the stale test, never the production file.",
-    "NOT_ATTRIBUTABLE":
-        "A NEEDS_REVIEW the classifier had low confidence in \u2014 it could not "
-        "attribute the failure at all. Not a claim that a person must review "
-        "every one.",
-    "FALSE_POSITIVE":
-        "A real failure, but nothing in this range caused it \u2014 a flake, or a "
-        "failure that predates the change.",
-    "ENV_FAILURE":
-        "Infrastructure or environment, not the product.",
-    "DID_NOT_RUN":
-        "The test produced no result to compare \u2014 the build or batch failed, "
-        "or no error text was recorded. Nothing was analysed, so someone "
-        "should check why it did not run: a real failure can hide behind one "
-        "of these.",
-    "AUTO_CLASSIFIED":
-        "Labelled upstream by pattern, never sent to the model.",
-    "PENDING":
-        "Not yet classified.",
+# The rubric as a matrix. Two questions decide every verdict — how well the
+# cause is pinned, and what the diff shows the change to be — so the rubric is
+# genuinely two-dimensional and reads better as a grid than as five paragraphs.
+#
+# Confidence is deliberately NOT an axis: the rubric assigns it FROM the first
+# question (high = a verified hunk, medium = one unverified candidate, low =
+# could not narrow), so a confidence axis would be near-collinear with the
+# columns and most of its cells impossible. It rides in the cells instead.
+#
+# Transcribed from the rubric in prepare.py's prompt text. That text is the
+# authority; if it moves, this moves with it.
+_MATRIX_COLS = [
+    ("E1", "Nothing named",      "no candidate"),
+    ("E2", "Transitive only",    "no concrete file"),
+    ("E3", "Two or more",        "several candidates"),
+    ("E4", "Exactly one",        "one, unverified"),
+    ("E5", "Verified",           "hunk proven"),
+]
+
+_MATRIX_ROWS = [
+    ("D1", "Can't tell which",       "defect or deliberate?"),
+    ("D2", "Intentional and correct", "the tests lag behind"),
+    ("D3", "A genuine defect",        "production is wrong"),
+]
+
+# (row, col) -> (verdict, confidence, note). Notes are for the FOUR cells whose
+# behaviour is not obvious from the axes; everywhere else the pill says it. The
+# field rules live in one line under the grid rather than repeated per cell.
+_MATRIX_CELLS = {
+    ("D1", "E1"): ("NEEDS_REVIEW", "low",    ""),
+    ("D1", "E2"): ("NEEDS_REVIEW", "low",    ""),
+    ("D1", "E3"): ("NEEDS_REVIEW", "any",    ""),
+    ("D1", "E4"): ("POSSIBLE_BUG", "medium", "Say \u201ccannot tell intentional vs regression\u201d."),
+    ("D1", "E5"): ("POSSIBLE_BUG", "medium", ""),
+    ("D2", "E1"): ("NEEDS_REVIEW", "low",    ""),
+    ("D2", "E2"): ("NEEDS_REVIEW", "low",    ""),
+    ("D2", "E3"): ("NEEDS_REVIEW", "any",    "Rare: intent belongs to a specific change."),
+    ("D2", "E4"): ("TEST_FIX",     "medium", ""),
+    ("D2", "E5"): ("TEST_FIX",     "high",   ""),
+    ("D3", "E1"): ("NEEDS_REVIEW", "low",    ""),
+    ("D3", "E2"): ("NEEDS_REVIEW", "low",    ""),
+    ("D3", "E3"): ("POSSIBLE_BUG", "medium", "A 500 with three suspects is still probably a bug."),
+    ("D3", "E4"): ("POSSIBLE_BUG", "medium", ""),
+    ("D3", "E5"): ("BUG",          "high",   ""),
 }
 
+# One line, not fifteen cell notes.
+_MATRIX_FIELD_RULE = (
+    "<code>culprit_file</code> &mdash; BUG must name one. POSSIBLE_BUG names one "
+    "when there is exactly one, otherwise stays null with the candidates listed "
+    "in <code>specific_change</code>. TEST_FIX never names the production file: "
+    "that would mislabel a correct change as a defect."
+)
 
-# The verdicts the guide documents, in severity order. STATIC — the same six on
-# every report, whether or not a given run used them. A key that changed shape
-# per run would not be a reference: a reader who learned it on one report would
-# find a different guide on the next, and could not look up a verdict they had
-# seen last week. Sourced from verdicts.VERDICT_ORDER, so the guide is ordered
-# the way the table sorts.
-_LEGEND_VERDICTS = ("BUG", "POSSIBLE_BUG", "NEEDS_REVIEW", "TEST_FIX",
-                    "NOT_ATTRIBUTABLE", "FALSE_POSITIVE", "ENV_FAILURE",
-                    "DID_NOT_RUN")
+_MATRIX_NOTES = [
+    ("FALSE_POSITIVE", "fp",
+     "Checked before the grid and it ends the decision \u2014 clearly environmental "
+     "or unrelated. May be <code>high</code>."),
+    ("NOT_ATTRIBUTABLE", "unattr",
+     "Display label only: cell <strong>D1&times;E1</strong> at <code>low</code> "
+     "confidence. Named candidates keep it NEEDS_REVIEW."),
+    ("DID_NOT_RUN", "auto",
+     "Never reaches the grid. Nothing was analysed, so someone should check why "
+     "it did not run \u2014 a real failure can hide behind one."),
+    ("ENV_FAILURE", "auto",
+     "Never reaches the grid either: a known environment pattern. Infrastructure, "
+     "not the product \u2014 but still glance at the tests. A product failure can "
+     "match an env pattern by coincidence, and an env problem that keeps "
+     "recurring is a problem of its own."),
+]
 
 
-def _verdict_legend() -> str:
-    """The standing guide to the verdict vocabulary.
+def _verdict_matrix() -> str:
+    """The standing rubric guide: a verdict grid plus the labels outside it.
 
-    Takes no run data on purpose — see _LEGEND_VERDICTS. This report is read by
-    people who did not write the rubric, so the vocabulary has to be legible
-    from the page itself rather than from the prompt.
+    Takes no run data — the same on every report, so a reader who learns it on
+    one can look a verdict up on the next.
     """
-    shown = [v for v in verdicts.VERDICT_ORDER if v in _LEGEND_VERDICTS]
-    items = "".join(
-        f'<div class="legend-item">{_verdict_span(v)}'
-        f'<span class="legend-text">{_esc(_VERDICT_LEGEND[v])}</span></div>'
-        for v in shown)
+    # Both axes are NAMED on the page. Bare D1/E1 codes told a reader nothing —
+    # the risk matrices this borrows from print "SEVERITY" and "LIKELIHOOD"
+    # right on the axes, with the question each one asks.
+    head = "".join(
+        f'<th><span class="mx-axis">{_esc(code)}</span>{_esc(title)}'
+        f'<span class="mx-desc">{_esc(desc)}</span></th>'
+        for code, title, desc in _MATRIX_COLS)
+
+    body = []
+    for rcode, rtitle, rdesc in _MATRIX_ROWS:
+        cells = []
+        for ccode, _t, _d in _MATRIX_COLS:
+            verdict, conf, note = _MATRIX_CELLS[(rcode, ccode)]
+            cells.append(
+                f'<td class="mx-{_vclass(verdict)}">{_verdict_span(verdict)}'
+                f'<span class="mx-conf">{_esc(conf)}</span>'
+                + (f'<span class="mx-note">{note}</span>' if note else "")
+                + "</td>")
+        body.append(
+            f'<tr><th><span class="mx-axis">{_esc(rcode)}</span>{_esc(rtitle)}'
+            f'<span class="mx-desc">{_esc(rdesc)}</span></th>'
+            + "".join(cells) + "</tr>")
+
+    notes = "".join(
+        f'<div class="mx-card">{_verdict_span(v)}'
+        f'<span class="mx-card-text">{text}</span></div>'
+        for v, _cls, text in _MATRIX_NOTES)
+
     return f"""
-  <details class="verdict-legend">
-    <summary><strong>What the verdicts mean</strong>
-      <span class="hint">A guide to the verdict vocabulary, most severe first.
-      The same on every report &mdash; a run will not use all of
-      them.</span></summary>
-    <div class="legend-grid">{items}</div>
+  <details class="verdict-legend" id="verdict-rubric">
+    <summary><strong>How a verdict is decided</strong>
+      <span class="hint">Two questions settle it, and confidence follows from
+      the first rather than being a third.</span></summary>
+    <div class="mx-scroll">
+      <table class="mx">
+        <thead>
+          <tr>
+            <th class="mx-corner" rowspan="2">
+              <span class="mx-axis-name">D &middot; Diff</span>
+              <span class="mx-axis-q">What does the diff show the change to be?
+              &nbsp;&darr;</span>
+            </th>
+            <th class="mx-axis-band" colspan="{len(_MATRIX_COLS)}">
+              <span class="mx-axis-name">E &middot; Evidence</span>
+              <span class="mx-axis-q">How well is the cause pinned? &nbsp;&rarr;</span>
+            </th>
+          </tr>
+          <tr>{head}</tr>
+        </thead>
+        <tbody>{"".join(body)}</tbody>
+      </table>
+    </div>
+    <p class="mx-rule">{_MATRIX_FIELD_RULE}</p>
+    <div class="mx-cards">{notes}</div>
   </details>"""
 
 
@@ -2193,6 +2341,12 @@ def _totals(df: pd.DataFrame, n_clusters: int, meta: dict,
                  'per normalized error signature (ARCHITECTURE §7)."><strong>'
                  f'Root-cause clusters:</strong> <span class="n" '
                  f'data-pill-clusters="1">{n_clusters}</span></span>')
+    # A way IN to the rubric, not just a note that one exists. Every verdict in
+    # the table below is a cell in that grid, and a reader meeting
+    # NOT_ATTRIBUTABLE for the first time has no other route to the meaning.
+    pills.append('<a class="rubric-link" href="#verdict-rubric" '
+                 'title="Jump to the rubric matrix at the foot of the page and '
+                 'open it">How a verdict is decided &darr;</a>')
     return '<div class="totals">' + "".join(pills) + "</div>"
 
 
@@ -2459,7 +2613,7 @@ def render_run(run_dir, df: pd.DataFrame, meta: dict) -> Path:
 <th class="col-team">Team</th>
 <th class="col-comp">Component</th>
 <th class="col-status">Status</th>
-<th class="col-verdict" title="What the classifier concluded about the failure. A cluster header shows its most severe member's verdict.">Verdict</th>
+<th class="col-verdict" title="What the classifier concluded about the failure. A cluster header shows its most severe member's verdict. How each verdict is decided is in the rubric matrix at the foot of this page.">Verdict</th>
 <th class="col-confidence" title="How sure the classifier was: high, medium or low. &quot;auto&quot; means the row was pre-classified and never sent to the model.">Confidence</th>
 <th class="col-culprit" title="The file the classifier blamed. When it would not narrow to one, the candidate tickets it named instead.">Suspicious cause</th>
 <th class="col-reasoning" title="Why the classifier reached this verdict, in its own words.">Reasoning</th>
@@ -2473,7 +2627,7 @@ def render_run(run_dir, df: pd.DataFrame, meta: dict) -> Path:
   </table>
 {_batch_section(batch_df, meta)}
 {_pre_existing_section(pre_df, meta)}
-{_verdict_legend()}
+{_verdict_matrix()}
 </main>
 <script type="application/json" id="group-order">{json.dumps(order)}</script>
 <script>{_JS}</script>
