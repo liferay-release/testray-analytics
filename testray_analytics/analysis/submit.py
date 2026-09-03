@@ -692,6 +692,19 @@ def main() -> None:
     # (classification IN ('BUG','POSSIBLE_BUG')) — report its coverage too.
     pbug_rows = df[df["classification"] == "POSSIBLE_BUG"]
     pbug_hits = int(pbug_rows["culprit_file"].notna().sum()) if len(pbug_rows) else 0
+    # Ticket-grain attribution, counted separately from file-grain. A
+    # POSSIBLE_BUG with no culprit_file is NOT unattributed: the rubric sends
+    # its candidates to specific_change as LPD/LPP/LPS ids, and the report
+    # renders those as chips. Reporting only the file-grain number made a run
+    # where every row named a ticket read as 14% attributed, which understates
+    # what a reviewer actually gets. `_single` is the useful sub-count — one
+    # candidate ticket is a reviewer opening one ticket, and it is also the
+    # cheapest population to promote to file-grain later.
+    def _tickets(row) -> set[str]:
+        return set(_TICKET_RE.findall(str(row.get("specific_change") or "")))
+    _pbug_tk  = [_tickets(r) for _, r in pbug_rows.iterrows()]
+    pbug_tkt  = sum(1 for t in _pbug_tk if t)
+    pbug_one  = sum(1 for t in _pbug_tk if len(t) == 1)
 
     print(f"\nRun:        {meta['run_id']}")
     print(f"Classifier: {payload['classifier']}")
@@ -703,15 +716,21 @@ def main() -> None:
     print(f"BUG culprit_file coverage: {culprit_hits}/{len(bug_rows)} "
           f"({culprit_pct:.0f}%; target ≥85%)")
     if len(pbug_rows):
-        # No longer expected to be 100%. POSSIBLE_BUG is a claim about the
-        # FAILURE ("probably a defect"), not about attribution precision, so a
-        # row with several candidates leaves culprit_file null on purpose and
-        # lists them in specific_change. What this now measures is how many
-        # POSSIBLE_BUGs pinned a single culprit — i.e. how many feed the
-        # attribution training set, which filters on culprit_file anyway.
-        print(f"POSSIBLE_BUG with a single named culprit: {pbug_hits}/{len(pbug_rows)} "
-              f"({100 * pbug_hits / len(pbug_rows):.0f}%) — only these feed "
-              f"attribution training with BUG; the rest list candidates instead")
+        # Two grains, because they answer different questions: file-grain is
+        # what the attribution training set can consume, ticket-grain is what a
+        # reviewer can act on. A row can be strong on the second and empty on
+        # the first entirely by design.
+        n_pbug = len(pbug_rows)
+        print(f"POSSIBLE_BUG attribution: {pbug_hits}/{n_pbug} file-grain "
+              f"({100 * pbug_hits / n_pbug:.0f}%; feeds training with BUG), "
+              f"{pbug_tkt}/{n_pbug} ticket-grain "
+              f"({pbug_one} narrowed to a single ticket)")
+        if pbug_tkt < n_pbug:
+            # The one shape that is a real gap: probably-a-defect with nothing
+            # to open. Silent when it does not happen, which is the point.
+            print(f"  WARN: {n_pbug - pbug_tkt} POSSIBLE_BUG row(s) name neither "
+                  f"a culprit_file nor a candidate ticket — nothing for a "
+                  f"reviewer to open")
 
     # Rubric drift, not a data error. NEEDS_REVIEW now means "cannot tell a
     # defect from an intentional change" — the candidate COUNT no longer routes
