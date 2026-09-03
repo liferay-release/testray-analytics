@@ -78,13 +78,13 @@ def test_novelty_never_reaches_the_prompt(tmp_path):
     """Regression guard for the 2026-08-26 revert. The count is a diagnostic;
     the classifier must not see it, and must not be given a rubric that
     branches on novel vs chronic."""
-    from testray_analytics.analysis.prepare import write_prompt_subtask
+    from testray_analytics.analysis.prepare import write_prompt_grouped
 
     groups = compute_subtask_groups(_rows([0, 12]), mode=MODE_BY_CLUSTER)
     (tmp_path / "hunks.txt").write_text("no hunks")
     (tmp_path / "git_diff_full.diff").write_text("")
 
-    write_prompt_subtask(
+    write_prompt_grouped(
         tmp_path, run_id="r_test", classifier="agent:test",
         build_a=1, build_b=2, hash_a="a" * 40, hash_b="b" * 40,
         routine_id=None, build_a_name="A", build_b_name="B",

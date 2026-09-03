@@ -1782,12 +1782,11 @@ Add `--no-write` to inspect the validated summary without writing the Testray ba
 
 _FAILURES_HEADER = "\n---\n\n## Failures to classify\n\n"
 
-PROMPT_HEADER_SUBTASK = """# Triage run `{run_id}` — subtask mode
+PROMPT_HEADER_GROUPED = """# Triage run `{run_id}` — {unit} mode
 
 Classify PASSED→FAILED/BLOCKED/UNTESTED test regressions between two builds.
-**Unit of analysis: Testray Subtask.** Each block below groups N case results
-that share a single error fingerprint (Testray's testflow algorithm); you
-write **one verdict per subtask**, and `submit.py` fans the verdict out to
+{unit_definition} you
+write **one verdict per {unit}**, and `submit.py` fans the verdict out to
 every member case-row in `fact_triage_results`.
 
 ## Context
@@ -1796,7 +1795,7 @@ every member case-row in `fact_triage_results`.
 - **Target   (B):** {build_b} — `{hash_b_short}` — {build_b_name}
 - **Routine:** {routine_id}
 - **Classifier:** `{classifier}`
-- **Subtasks to classify:** {n_subtasks}  (covering {n_member_cases} case results;
+- **{units_title} to classify:** {n_subtasks}  (covering {n_member_cases} case results;
   + {n_auto} auto-classified, + {n_flaky} known-flaky excluded)
 
 ## Files in this run
@@ -1804,14 +1803,14 @@ every member case-row in `fact_triage_results`.
 | File | What it is |
 |---|---|
 | `diff_list.csv` | One row per failure (case-grain) — same as per-test mode |
-| `diff_list_subtasks.csv` | One row per subtask group — `subtask_id`, `case_count`, `member_case_ids`, shared `error`, `pre_classification` if every member auto-classified |
+| `diff_list_subtasks.csv` | One row per {unit} — `group_id`, `subtask_id`, `case_count`, `member_case_ids`, shared `error`, `pre_classification` if every member auto-classified |
 | `hunks.txt` | Git diff filtered to files matching failing tests — your primary evidence |
 | `git_diff_full.diff` | Full unfiltered diff — consult if `hunks.txt` looks too narrow |
-| `results.schema.json` | JSON schema for the `results.json` you will write (subtask-mode shape) |
+| `results.schema.json` | JSON schema for the `results.json` you will write (grouped-mode shape) |
 
 ## Rubric
 
-Same rubric as per-test mode, applied at the subtask level — write one verdict per group:
+Same rubric as per-test mode, applied at the {unit} level — write one verdict per group:
 
 - **BUG** (confirmed) — only when confidence is **`high`** AND a hunk in the diff (direct or via imports/lifecycle) clearly caused the *shared* error across all members **and the production change is a genuine defect** (not an intentional change the tests merely lag behind — that is TEST_FIX). **MUST name a `culprit_file`.** BUG and POSSIBLE_BUG culprit_files feed defect-attribution training data — only use BUG when the culprit is actually verified.
 - **POSSIBLE_BUG** — probably a genuine defect, diff-caused, at **`medium`** confidence you cannot verify to `high`. **The claim is about the FAILURE, not about how precisely you can attribute it**: a server 500 with three candidate causes is still probably a bug. **Name the single candidate in `culprit_file` when there is exactly one; with two or more, leave `culprit_file` null and list them all in `specific_change`, `; `-separated.** No candidate at all, or cannot tell defect from intentional → NEEDS_REVIEW.
@@ -1831,17 +1830,17 @@ Same rubric as per-test mode, applied at the subtask level — write one verdict
 
 ### Transitive dependencies — do not dismiss without verification
 
-A subtask can fail because a file the member tests _import_ changed, even if no member test's file has a direct hunk in the diff. When members plausibly import, extend, or depend on code in another changed module, default to NEEDS_REVIEW. Note the suspected file in `specific_change`.
+A {unit} can fail because a file the member tests _import_ changed, even if no member test's file has a direct hunk in the diff. When members plausibly import, extend, or depend on code in another changed module, default to NEEDS_REVIEW. Note the suspected file in `specific_change`.
 
 ### Multiple candidate causes — list, don't pick
 
 If two or more ticket clusters in the diff plausibly affect the group's space, list ALL candidates in `specific_change`, separated by `; `, and leave `culprit_file` null. **The count does not decide the verdict** — probably a defect is POSSIBLE_BUG with the candidates listed; only being unable to tell a defect from an intentional change makes it NEEDS_REVIEW.
 
-Subtasks where every member already has `pre_classification` set are auto-classified upstream and **must not** appear in `results.json` — they are listed in this prompt for traceability only.
+{units_title} where every member already has `pre_classification` set are auto-classified upstream and **must not** appear in `results.json` — they are listed in this prompt for traceability only.
 
-## How to classify, per subtask
+## How to classify, per {unit}
 
-1. Read the **shared error** at the top of the subtask block — it's the same error string Testray clustered all member case-results under.
+1. Read the **shared error** at the top of the {unit} block — {shared_error_origin}
 2. Scan `hunks.txt` for files whose path contains tokens from any member's `test_case` or `component_name`. The matched hunks for representative members are embedded inline.
 3. Hunk plausibly causes the *shared* error as a genuine defect → **BUG**, name `culprit_file` = the specific file path from the diff.
 4. Hunk shows the production change was **intentional** and the tests assert on old behavior → **TEST_FIX** (culprit_file null or the stale test; describe the test change in `specific_change`).
@@ -2471,7 +2470,7 @@ def write_diff_list_subtasks(run_dir: Path, groups: list[dict]) -> None:
     pd.DataFrame(rows).to_csv(run_dir / "diff_list_subtasks.csv", index=False)
 
 
-def write_prompt_subtask(run_dir: Path, *, run_id: str, classifier: str,
+def write_prompt_grouped(run_dir: Path, *, run_id: str, classifier: str,
                           build_a: int, build_b: int, hash_a: str, hash_b: str,
                           routine_id: int | None, build_a_name: str, build_b_name: str,
                  project_id: int | None = None, testray_url: str | None = None,
@@ -2481,9 +2480,39 @@ def write_prompt_subtask(run_dir: Path, *, run_id: str, classifier: str,
                           n_member_cases: int,
                           n_auto_cases: int, n_flaky_cases: int,
                           hunks_path: Path,
-                          full_diff_path: Path, git_repo: Path) -> None:
-    """Subtask-mode prompt. Same chrome / manifest / commits sections as
-    write_prompt; per-failure body is one block per subtask group."""
+                          full_diff_path: Path, git_repo: Path,
+                          mode: str = MODE_BY_SUBTASK) -> None:
+    """Grouped-mode prompt (by-cluster or by-subtask). Same chrome / manifest /
+    commits sections as write_prompt; the per-failure body is one block per
+    group.
+
+    The unit noun is taken from `mode` rather than hardcoded. Both modes share
+    this renderer, so a by-cluster run used to tell the model its unit was a
+    Testray Subtask — which it is not: by-cluster groups on our normalized
+    error signature (`cluster_key`), and Testray's testflow had no part in it.
+    Naming the wrong unit in the prompt invites the model to reason about a
+    grouping that does not exist."""
+
+    is_cluster = mode == MODE_BY_CLUSTER
+    unit        = "cluster"  if is_cluster else "subtask"
+    units       = "clusters" if is_cluster else "subtasks"
+    units_title = units.capitalize()
+    unit_definition = (
+        "**Unit of analysis: error-signature cluster.** Each block below groups "
+        "N case results that share one normalized error signature (our "
+        "`cluster_key`, not a Testray grouping);"
+        if is_cluster else
+        "**Unit of analysis: Testray Subtask.** Each block below groups N case "
+        "results that share a single error fingerprint (Testray's testflow "
+        "algorithm);"
+    )
+    shared_error_origin = (
+        "it is the normalized error signature every member case-result was "
+        "grouped under."
+        if is_cluster else
+        "it's the same error string Testray clustered all member case-results "
+        "under."
+    )
 
     try:
         diff_blocks = prompt_helpers.parse_diff_blocks(hunks_path)
@@ -2499,7 +2528,7 @@ def write_prompt_subtask(run_dir: Path, *, run_id: str, classifier: str,
         chrome_lines.append(
             "Files changed in shared layout / navigation / taglib / theme "
             "paths — these can break UI tests in *other* components. Cross-"
-            "reference against per-subtask sections below when the shared "
+            "reference against per-" + unit + " sections below when the shared "
             "error is UI-shaped (strict mode violation, element-not-found, "
             "visibility timeout, getByText not found)."
         )
@@ -2553,7 +2582,7 @@ def write_prompt_subtask(run_dir: Path, *, run_id: str, classifier: str,
         if kind == "auto":
             body_lines.append(f"_All members already auto-classified upstream "
                               f"({', '.join(sorted(g['pre_classifications']))}). "
-                              f"Listed for traceability — do NOT write a results.json entry for this subtask._")
+                              f"Listed for traceability — do NOT write a results.json entry for this {unit}._")
             body_lines.append("")
             body_lines.append("---")
             body_lines.append("")
@@ -2561,7 +2590,7 @@ def write_prompt_subtask(run_dir: Path, *, run_id: str, classifier: str,
         if kind == "flaky":
             body_lines.append(f"_All members marked known_flaky upstream and "
                               f"will be excluded from fact_triage_results. "
-                              f"Listed for traceability — do NOT write a results.json entry for this subtask._")
+                              f"Listed for traceability — do NOT write a results.json entry for this {unit}._")
             body_lines.append("")
             body_lines.append("---")
             body_lines.append("")
@@ -2638,18 +2667,21 @@ def write_prompt_subtask(run_dir: Path, *, run_id: str, classifier: str,
         render_group(idx, g, kind="classify")
 
     if groups_auto:
-        body_lines.append("\n## Auto-classified subtasks (do NOT write results.json entries)\n")
+        body_lines.append(f"\n## Auto-classified {units} (do NOT write results.json entries)\n")
         for g in groups_auto:
             idx += 1
             render_group(idx, g, kind="auto")
 
     if groups_flaky:
-        body_lines.append("\n## Flaky-only subtasks (excluded from fact_triage_results)\n")
+        body_lines.append(f"\n## Flaky-only {units} (excluded from fact_triage_results)\n")
         for g in groups_flaky:
             idx += 1
             render_group(idx, g, kind="flaky")
 
-    header = PROMPT_HEADER_SUBTASK.format(
+    header = PROMPT_HEADER_GROUPED.format(
+        unit=unit, units=units, units_title=units_title,
+        unit_definition=unit_definition,
+        shared_error_origin=shared_error_origin,
         run_id=run_id,
         classifier=classifier,
         build_a=build_a, build_b=build_b,
@@ -2867,8 +2899,9 @@ def _finalize_bundle(
                 groups_to_cls.append(g)
         write_diff_list_subtasks(run_dir, all_groups)
         write_results_schema_subtask(run_dir)
-        write_prompt_subtask(
+        write_prompt_grouped(
             run_dir,
+            mode=mode,
             run_id=run_id, classifier=classifier,
             build_a=build_a, build_b=build_b,
             hash_a=hash_a, hash_b=hash_b,

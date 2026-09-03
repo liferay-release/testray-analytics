@@ -442,19 +442,23 @@ _SYSTEM_INSTRUCTIONS = (
     "preferred over explicit dismissal."
 )
 
-_SYSTEM_INSTRUCTIONS_SUBTASK = (
+# Template: `{unit}` / `{units}` are filled from the run mode by
+# `grouped_instructions()`. Both grouped modes share this text, and a
+# by-cluster run must not be told its unit is a Testray Subtask — it groups
+# on our normalized error signature, which Testray had no part in.
+_SYSTEM_INSTRUCTIONS_GROUPED = (
     "You are a developer at Liferay triaging test regressions between two "
-    "builds. **Unit of analysis: Testray Subtask** — each subtask groups N "
+    "builds. **Unit of analysis: {unit_definition}** — each {unit} groups N "
     "case-results that share a single error fingerprint. You write ONE "
-    "verdict per subtask (BUG, POSSIBLE_BUG, TEST_FIX, NEEDS_REVIEW, or "
+    "verdict per {unit} (BUG, POSSIBLE_BUG, TEST_FIX, NEEDS_REVIEW, or "
     "FALSE_POSITIVE), and the verdict fans out to every member case_id in the "
     "group when the bundle is submitted.\n\n"
-    "Output format: one entry per subtask. Each entry MUST include "
+    "Output format: one entry per {unit}. Each entry MUST include "
     "`subtask_id` (integer or null), `case_ids` (non-empty array of every "
-    "member case_id you saw in that subtask block — do not invent or omit), "
+    "member case_id you saw in that {unit} block — do not invent or omit), "
     "`classification`, `confidence`, and `reason`. culprit_file is required for "
     "BUG and expected for POSSIBLE_BUG (the single candidate), null otherwise.\n\n"
-    "The exact same rubric applies as in per-test mode, only at the subtask "
+    "The exact same rubric applies as in per-test mode, only at the {unit} "
     "level. Confidence is structural and gates the tier: BUG (confirmed) "
     "requires `high` confidence on a VERIFIED culprit for the *shared* error. "
     "POSSIBLE_BUG is `medium` confidence with EXACTLY ONE plausible diff-caused "
@@ -476,11 +480,22 @@ _SYSTEM_INSTRUCTIONS_SUBTASK = (
     "many member tests does not change the rubric — a flake pattern is still "
     "a flake pattern when 30 tests share it. For borderline transitive "
     "cases prefer NEEDS_REVIEW over dismissal.\n\n"
-    "Do not write entries for subtasks listed under '## Auto-classified' or "
+    "Do not write entries for {units} listed under '## Auto-classified' or "
     "'## Flaky-only' headers — those are traceability-only and submit.py "
-    "handles them directly. Only classifiable subtasks (those above those "
+    "handles them directly. Only classifiable {units} (those above those "
     "section headers) need an entry."
 )
+
+
+def grouped_instructions(mode: str) -> str:
+    """`_SYSTEM_INSTRUCTIONS_GROUPED` with the unit noun bound to the mode."""
+    is_cluster = mode == "by-cluster"
+    return _SYSTEM_INSTRUCTIONS_GROUPED.format(
+        unit="cluster" if is_cluster else "subtask",
+        units="clusters" if is_cluster else "subtasks",
+        unit_definition=("error-signature cluster" if is_cluster
+                         else "Testray Subtask"),
+    )
 
 
 def _build_user_text(
@@ -493,7 +508,7 @@ def _build_user_text(
     expects `testray_case_id` per entry, subtask mode expects
     `subtask_id` + `case_ids` array per entry."""
     if _is_grouped(mode):
-        unit = "cluster" if mode == "by-cluster" else "Subtask"
+        unit = "cluster" if mode == "by-cluster" else "subtask"
         instructions = (
             f"\n\nPopulate run_id=\"{run_id}\" and classifier=\"{classifier}\" in "
             f"the output. Include exactly one result per {unit} shown above. "
@@ -687,7 +702,7 @@ def call_api(
         batch, batch_number, total_batches, classifier, run_id, mode=mode,
     )
 
-    instructions = (_SYSTEM_INSTRUCTIONS_SUBTASK if _is_grouped(mode)
+    instructions = (grouped_instructions(mode) if _is_grouped(mode)
                     else _SYSTEM_INSTRUCTIONS)
 
     request_args = dict(
@@ -824,7 +839,7 @@ def classify(run_dir: Path, classifier: str, dry_run: bool,
     if dry_run:
         batches_dir = run_dir / "batches"
         batches_dir.mkdir(exist_ok=True)
-        active_instructions = (_SYSTEM_INSTRUCTIONS_SUBTASK if _is_grouped(mode)
+        active_instructions = (grouped_instructions(mode) if _is_grouped(mode)
                                 else _SYSTEM_INSTRUCTIONS)
         for i, b in enumerate(batches, 1):
             total = sum(len(s.text) for s in b)
