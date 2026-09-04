@@ -1476,11 +1476,18 @@ def run_git_diff(git_repo: Path, hash_a: str, hash_b: str, out_path: Path,
                         "--no-tags", src, ref],
                        check=False)
 
-    # 2. Anything still missing → try origin (gets any official branch).
+    # 2. Anything still missing → fetch the routine's own remote, then origin.
+    #    Order matters: Stable's SHAs live on the control repo and are never on
+    #    a personal fork, so trying origin first is a wasted network round trip
+    #    that still leaves the commit missing.
     if not (_have(hash_a) and _have(hash_b)):
-        print("Fetching from origin …", file=sys.stderr)
-        subprocess.run(["git", "-C", str(git_dir), "fetch", "--quiet", "origin"],
-                       check=False)
+        for src in ([remote] if remote else []) + ["origin"]:
+            if _have(hash_a) and _have(hash_b):
+                break
+            print(f"Fetching from {src} …", file=sys.stderr)
+            subprocess.run(["git", "-C", str(git_dir), "fetch", "--quiet",
+                            "--no-tags", src],
+                           check=False)
 
     # 3. Still missing → fail with actionable guidance rather than a cryptic
     #    "fatal: bad object" from git diff.
@@ -1489,8 +1496,11 @@ def run_git_diff(git_repo: Path, hash_a: str, hash_b: str, out_path: Path,
         raise SystemExit(
             f"Commit(s) not found in {git_dir} after fetching: "
             f"{', '.join(h[:12] for h in missing)}.\n"
-            f"If a build ran on a temp/fork branch not on origin, pass "
-            f"--fetch-ref <remote-or-url> <branch> so prepare can fetch it."
+            f"Tried: {', '.join(([remote] if remote else []) + ['origin'])}.\n"
+            f"If this routine's builds are cut from another repo, set "
+            f"git.routine_remotes in config.yml (Stable runs on the control "
+            f"repo, brianchandotcom/liferay-portal). For a one-off temp or "
+            f"fork branch, pass --fetch-ref <remote-or-url> <branch>."
         )
 
     cmd = ["git", "-C", str(git_dir), "diff", hash_a, hash_b, "--"] + GIT_DIFF_EXCLUDES
@@ -1709,6 +1719,38 @@ RESULTS_SCHEMA = {
                     "culprit_file":    {"type": ["string", "null"]},
                     "specific_change": {"type": ["string", "null"]},
                     "reason":          {"type": "string"},
+                    # Ranked commits worth suspecting, best first. Separate from
+                    # `culprit_file` on purpose: that field asserts a cause and
+                    # is null whenever the evidence does not support one. This
+                    # asserts only "these are the changes in range that could
+                    # bear on it, in order" — which stays answerable when the
+                    # verdict is NEEDS_REVIEW.
+                    #
+                    # It exists because a NEEDS_REVIEW naming nobody is not an
+                    # outcome anyone can act on. On the stable routine that is
+                    # acute: a failure there blocks the sync from the control
+                    # repo to upstream, so every failure has to reach a person,
+                    # and the person is whoever wrote the commit.
+                    #
+                    # `explains` is what keeps it honest. A candidate that does
+                    # NOT account for the failure is still worth listing — it
+                    # may be the only thing that touched the module — and
+                    # saying so beats both silence and a forced culprit.
+                    "candidates": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["commit", "why", "explains"],
+                            "additionalProperties": False,
+                            "properties": {
+                                "commit":   {"type": "string"},
+                                "ticket":   {"type": ["string", "null"]},
+                                "author":   {"type": ["string", "null"]},
+                                "why":      {"type": "string"},
+                                "explains": {"type": "boolean"},
+                            },
+                        },
+                    },
                 },
                 "if":   {"properties": {"classification": {"const": "BUG"}}},
                 "then": {"required": ["culprit_file"],
@@ -1763,6 +1805,38 @@ RESULTS_SCHEMA_SUBTASK = {
                     "culprit_file":    {"type": ["string", "null"]},
                     "specific_change": {"type": ["string", "null"]},
                     "reason":          {"type": "string"},
+                    # Ranked commits worth suspecting, best first. Separate from
+                    # `culprit_file` on purpose: that field asserts a cause and
+                    # is null whenever the evidence does not support one. This
+                    # asserts only "these are the changes in range that could
+                    # bear on it, in order" — which stays answerable when the
+                    # verdict is NEEDS_REVIEW.
+                    #
+                    # It exists because a NEEDS_REVIEW naming nobody is not an
+                    # outcome anyone can act on. On the stable routine that is
+                    # acute: a failure there blocks the sync from the control
+                    # repo to upstream, so every failure has to reach a person,
+                    # and the person is whoever wrote the commit.
+                    #
+                    # `explains` is what keeps it honest. A candidate that does
+                    # NOT account for the failure is still worth listing — it
+                    # may be the only thing that touched the module — and
+                    # saying so beats both silence and a forced culprit.
+                    "candidates": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["commit", "why", "explains"],
+                            "additionalProperties": False,
+                            "properties": {
+                                "commit":   {"type": "string"},
+                                "ticket":   {"type": ["string", "null"]},
+                                "author":   {"type": ["string", "null"]},
+                                "why":      {"type": "string"},
+                                "explains": {"type": "boolean"},
+                            },
+                        },
+                    },
                 },
                 "if":   {"properties": {"classification": {"const": "BUG"}}},
                 "then": {"required": ["culprit_file"],
@@ -1908,6 +1982,20 @@ Per-failure hunks are matched by path tokens, but **a test class can fail becaus
 
 If two or more ticket clusters in the diff plausibly affect the failing test's module, **list ALL candidates** in `specific_change`, separated by `; `, and leave `culprit_file` null. Locking in a single theory hides the alternatives from the human reviewer; enumerating them lets the reviewer pick. **The count does not decide the verdict** — probably a defect is POSSIBLE_BUG with the candidates listed; only being unable to tell a defect from an intentional change makes it NEEDS_REVIEW. Generic error messages (build failed, compile error, batch failed) are a strong signal that multiple changes could explain the failure.
 
+### Ranked candidates — always, even when the verdict is NEEDS_REVIEW
+
+Emit `candidates`: the commits in range that could bear on this failure, best first. This is **not** a second `culprit_file`. That field asserts a cause and stays null unless the evidence supports one; `candidates` asserts only *"these are the changes worth suspecting, in order"*.
+
+Use the **Touches** line under each ticket in "Commits in this range" — it lists the modules that ticket changed. Match it against the failing test's module.
+
+- `commit` — the short hash. `ticket` and `author` come from the same block.
+- `why` — one sentence: what connects this commit to this failure.
+- `explains` — `true` only if it actually accounts for the failure. `false` when it is merely the closest thing in range.
+
+**A candidate that does not explain the failure is still worth listing**, with `explains: false` and a `why` that says why not — for example *"the only change to this module, but it edits JSP and jsdoc does not read JSP"*. That is far more useful than an empty list, and honest in a way a forced culprit is not.
+
+Leave `candidates` empty **only** when nothing in the range touches the failing area at all. Never invent one to fill it: a wrong name costs a person an afternoon.
+
 Rows in `diff_list.csv` with `pre_classification` already set (BUILD_FAILURE, ENV_*, NO_ERROR) are auto-classified upstream and should **not** appear in `results.json`.
 
 ## How to classify, per row
@@ -2008,6 +2096,20 @@ A {unit} can fail because a file the member tests _import_ changed, even if no m
 
 If two or more ticket clusters in the diff plausibly affect the group's space, list ALL candidates in `specific_change`, separated by `; `, and leave `culprit_file` null. **The count does not decide the verdict** — probably a defect is POSSIBLE_BUG with the candidates listed; only being unable to tell a defect from an intentional change makes it NEEDS_REVIEW.
 
+### Ranked candidates — always, even when the verdict is NEEDS_REVIEW
+
+Emit `candidates`: the commits in range that could bear on this {unit}, best first. This is **not** a second `culprit_file`. That field asserts a cause and stays null unless the evidence supports one; `candidates` asserts only *"these are the changes worth suspecting, in order"*.
+
+Use the **touches** line under each ticket in "Commits in this range" — it lists the modules that ticket changed. Match it against the failing test's module.
+
+- `commit` — the short hash. `ticket` and `author` come from the same block.
+- `why` — one sentence: what connects this commit to this failure.
+- `explains` — `true` only if it actually accounts for the failure; `false` when it is merely the closest thing in range.
+
+**A candidate that does not explain the failure is still worth listing**, with `explains: false` and a `why` saying why not — e.g. *"the only change to this module, but it edits JSP and jsdoc does not read JSP"*. That beats an empty list, and is honest in a way a forced culprit is not.
+
+Leave `candidates` empty **only** when nothing in range touches the failing area at all. Never invent one: a wrong name costs a person an afternoon.
+
 {units_title} where every member already has `pre_classification` set are auto-classified upstream and **must not** appear in `results.json` — they are listed in this prompt for traceability only.
 
 ## How to classify, per {unit}
@@ -2044,7 +2146,24 @@ Write `results.json` in this directory, validating against `results.schema.json`
       "confidence": "high",
       "culprit_file": "modules/apps/.../Foo.java",
       "specific_change": "Foo.java:42 removed null check in bar()",
-      "reason": "Diff removed the null check the test relies on."
+      "reason": "Diff removed the null check the test relies on.",
+      "candidates": [
+        {{"commit": "a1b2c3d", "ticket": "LPD-99999", "author": "Jane Doe",
+         "why": "changed Foo.java, which the failing test calls directly",
+         "explains": true}}
+      ]
+    }},
+    {{
+      "group_id": 51,
+      "case_ids": [999],
+      "classification": "NEEDS_REVIEW",
+      "confidence": "medium",
+      "reason": "jsdoc task failed; nothing in range plausibly causes it.",
+      "candidates": [
+        {{"commit": "121bb68", "ticket": "LPD-102287", "author": "Some Dev",
+         "why": "only change touching this module, but it edits JSP and jsdoc does not read JSP",
+         "explains": false}}
+      ]
     }}
   ]
 }}

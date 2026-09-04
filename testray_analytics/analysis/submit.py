@@ -423,6 +423,7 @@ def assemble_dataframe(diff_list: pd.DataFrame, results: list[dict]) -> pd.DataF
                 "culprit_file":    None,
                 "specific_change": None,
                 "reason":          "No entry in results.json — defaulted to NEEDS_REVIEW",
+                "candidates":      None,
                 "match_strategy":  "missing",
             })
         return pd.Series({
@@ -431,6 +432,9 @@ def assemble_dataframe(diff_list: pd.DataFrame, results: list[dict]) -> pd.DataF
             "culprit_file":    r.get("culprit_file"),
             "specific_change": r.get("specific_change"),
             "reason":          r["reason"],
+            # Ranked candidates ride along so the Suspicious cause column can
+            # name a commit when no culprit_file was asserted.
+            "candidates":      r.get("candidates"),
             "match_strategy":  f"confidence={r['confidence']}",
         })
 
@@ -514,6 +518,7 @@ def assemble_dataframe_subtask(
                 "culprit_file":    None,
                 "specific_change": None,
                 "reason":          "No subtask in results.json claimed this case_id — defaulted to NEEDS_REVIEW",
+                "candidates":      None,
                 "match_strategy":  "missing",
             })
         return pd.Series({
@@ -522,6 +527,9 @@ def assemble_dataframe_subtask(
             "culprit_file":    r.get("culprit_file"),
             "specific_change": r.get("specific_change"),
             "reason":          r["reason"],
+            # Ranked candidates ride along so the Suspicious cause column can
+            # name a commit when no culprit_file was asserted.
+            "candidates":      r.get("candidates"),
             "match_strategy":  f"subtask · confidence={r['confidence']}",
         })
 
@@ -592,6 +600,53 @@ def annotate_culprit_commits(df: pd.DataFrame, full_cfg: dict,
         df["culprit_commits"] = df["culprit_file"].map(
             lambda v: annotations.get(str(v).strip()) if pd.notna(v) else None
         )
+
+    # Fall back to the model's ranked candidates. `culprit_commits` is derived
+    # from the FILE, so a verdict with no named culprit produced no commits and
+    # the Suspicious cause column read "—" for rows the model had a clear
+    # opinion about — which is most NEEDS_REVIEW rows, and on the stable routine
+    # those are the ones somebody has to act on.
+    if "candidates" in df.columns:
+        def _from_candidates(row):
+            existing = row.get("culprit_commits")
+            if pd.notna(existing) and str(existing).strip():
+                return existing
+            cands = row.get("candidates")
+            if not isinstance(cands, list) or not cands:
+                return None
+            parts = []
+            for c in cands[:3]:
+                if not isinstance(c, dict):
+                    continue
+                sha = str(c.get("commit") or "").strip()
+                if not sha:
+                    continue
+                # Format is load-bearing: the CX parses this string back into
+                # ticket / commit / author / weak, because those do not have
+                # their own TriageResult fields yet (the object definitions are
+                # updated in the site initializer, but only a fresh site picks
+                # them up). Kept human-readable so the raw value still means
+                # something in Testray's own object view.
+                #   LPD-102498 (brianchandotcom/liferay-portal@35393a15) Eudaldo Alonso?
+                #
+                # The repo slug rides along per candidate so the CX can build a
+                # github.com link. It cannot infer the repo: which one a build
+                # was cut from is per-routine, and a stable commit linked to
+                # liferay/liferay-portal 404s — it has not synced upstream,
+                # which is why the build is being triaged. Repeating the slug is
+                # a few bytes against a link that is right rather than plausible.
+                slug = str(meta.get("repo_slug") or "").strip()
+                ref = f"{slug}@{sha}" if slug else sha
+                label = f"{c.get('ticket')} ({ref})" if c.get("ticket") else ref
+                author = str(c.get("author") or "").strip()
+                if author:
+                    label += f" {author}"
+                # Mark the ones the model itself said do not account for the
+                # failure, so the column never reads as an accusation.
+                parts.append(label if c.get("explains") else f"{label}?")
+            return " · ".join(parts) or None
+
+        df["culprit_commits"] = df.apply(_from_candidates, axis=1)
     return df
 
 
@@ -714,6 +769,11 @@ def main() -> None:
     _pbug_tk  = [_tickets(r) for _, r in pbug_rows.iterrows()]
     pbug_tkt  = sum(1 for t in _pbug_tk if t)
     pbug_one  = sum(1 for t in _pbug_tk if len(t) == 1)
+    # Rows a reviewer has nothing to open: no file AND no ticket. Checking only
+    # tickets warned on rows that named a culprit_file — the strongest
+    # attribution there is — which made the warning contradict the line above it.
+    pbug_blind = sum(1 for (_, r), t in zip(pbug_rows.iterrows(), _pbug_tk)
+                     if not t and not str(r.get("culprit_file") or "").strip())
 
     print(f"\nRun:        {meta['run_id']}")
     print(f"Classifier: {payload['classifier']}")
@@ -734,10 +794,10 @@ def main() -> None:
               f"({100 * pbug_hits / n_pbug:.0f}%; feeds training with BUG), "
               f"{pbug_tkt}/{n_pbug} ticket-grain "
               f"({pbug_one} narrowed to a single ticket)")
-        if pbug_tkt < n_pbug:
+        if pbug_blind:
             # The one shape that is a real gap: probably-a-defect with nothing
             # to open. Silent when it does not happen, which is the point.
-            print(f"  WARN: {n_pbug - pbug_tkt} POSSIBLE_BUG row(s) name neither "
+            print(f"  WARN: {pbug_blind} POSSIBLE_BUG row(s) name neither "
                   f"a culprit_file nor a candidate ticket — nothing for a "
                   f"reviewer to open")
 

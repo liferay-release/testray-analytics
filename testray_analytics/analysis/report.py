@@ -610,6 +610,21 @@ _CSS += """
   .mx-card-text strong { color: var(--c-fg); }
 
   /* Candidate tickets, shown when the classifier named causes but no file. */
+  /* Ranked candidate commits. Each chip is three links' worth of answer —
+     ticket, commit, author — because on the stable routine the deliverable is
+     a person, not a verdict. */
+  .cands { display: flex; flex-direction: column; gap: 3px; }
+  .cand { font-size: 11.5px; line-height: 1.4; }
+  .cand.weak { opacity: .72; }
+  a.cand-ticket { color: #0747a6; text-decoration: none; font-weight: 600; }
+  a.cand-ticket:hover { text-decoration: underline; }
+  a.cand-sha {
+    color: #0747a6; text-decoration: none;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  a.cand-sha:hover { text-decoration: underline; }
+  .cand-author { color: var(--c-muted); }
+  .cand-weak { color: var(--c-muted); cursor: help; font-weight: 700; }
   .cause-tickets { display: flex; flex-wrap: wrap; gap: 4px; }
   a.cause-ticket {
     display: inline-block; padding: 1px 6px; border-radius: 3px;
@@ -1246,13 +1261,25 @@ def _header_row(mode: str, idx: int, label: str, members: pd.DataFrame,
         culprit_cell = (f'<span class="cluster-culprit-none" title="{_esc(" · ".join(sorted(culprits)))}">'
                         f"{len(culprits)} files</span>")
     else:
-        # No file named anywhere in the cluster — fall back to the candidate
-        # tickets its members named instead, so the header carries the same
-        # actionable content the member rows now do.
-        chips = _cause_tickets(meta, " ; ".join(
-            _text(x) for x in members.get("specific_change", [])))
-        culprit_cell = (f'<div class="cause-tickets">{chips}</div>' if chips
-                        else '<span class="cluster-culprit-none">no cause named</span>')
+        # No file named anywhere in the cluster. Prefer the ranked commits its
+        # members named — a commit carries the author, a ticket does not — and
+        # fall back to candidate tickets only when there are none.
+        cands = ""
+        for c in members.get("candidates", []):
+            cands = _candidate_chips(meta, c)
+            if cands:
+                break
+        ranked = [c for c in (_text(x) for x in members.get("culprit_commits", [])) if c]
+        if cands:
+            culprit_cell = cands
+        elif ranked:
+            culprit_cell = (f'<div class="culprit-commits">'
+                            f'{_esc(sorted(set(ranked))[0])}</div>')
+        else:
+            chips = _cause_tickets(meta, " ; ".join(
+                _text(x) for x in members.get("specific_change", [])))
+            culprit_cell = (f'<div class="cause-tickets">{chips}</div>' if chips
+                            else '<span class="cluster-culprit-none">no cause named</span>')
 
     reasons = {r for r in (_text(x) for x in members.get("reason", [])) if r}
     if len(reasons) == 1:
@@ -1355,12 +1382,22 @@ def _member_rows(df: pd.DataFrame, meta: dict, cluster_no: dict[str, int],
             reason_cell = _collapsible(_esc(reason) or "—", reason)
         else:
             reason_cell = _esc(reason) or "—"
+        _commits_txt = _text(r.get("culprit_commits"))
         if cno is not None and culprit and _shared_in_cluster(shared, ckey, "culprit_file", culprit):
             culprit_cell = _collapsible(f"<code>{_esc(culprit)}</code>", culprit)
+        elif (cno is not None and not culprit and _commits_txt
+                and _shared_in_cluster(shared, ckey, "culprit_commits", _commits_txt)):
+            # Same candidates on every member — say it once on the header and
+            # point up. The tooltip keeps the value reachable without expanding.
+            culprit_cell = _collapsible(
+                _candidate_chips(meta, r.get("candidates"))
+                or f'<div class="culprit-commits">{_esc(_commits_txt)}</div>',
+                _commits_txt)
         else:
             culprit_cell = _cause_cell(meta, culprit,
                                        _text(r.get("culprit_commits")),
-                                       r.get("specific_change"))
+                                       r.get("specific_change"),
+                                       r.get("candidates"))
 
         # A cluster with one verdict says it once, on its header. Repeating it
         # on every member is the noise that made the flat table unreadable.
@@ -1515,7 +1552,8 @@ def _cluster_index(df: pd.DataFrame) -> tuple[list[str], dict]:
     for _, r in df.iterrows():
         ck = _cluster_of(r)
         keys.append(ck)
-        for col in ("reason", "culprit_file", "display_verdict", "confidence"):
+        for col in ("reason", "culprit_file", "display_verdict", "confidence",
+                    "culprit_commits"):
             shared.setdefault((ck, col), set()).add(_text(r.get(col)))
     return keys, shared
 
@@ -1933,6 +1971,54 @@ def _jira_base(meta: dict) -> str:
     return str(jira.get("base_url") or "https://liferay.atlassian.net").rstrip("/")
 
 
+def _repo_slug(meta: dict) -> str:
+    """`owner/repo` for commit links. Resolved at prepare time from the
+    routine's own remote, so a Stable commit links to the control repo rather
+    than to an upstream that has not received it yet."""
+    return _text(meta.get("repo_slug")) or "liferay/liferay-portal"
+
+
+def _candidate_chips(meta: dict, candidates) -> str:
+    """Ranked candidate commits, each one reachable in a click.
+
+    Three links' worth of information in one chip: the TICKET (to Jira), the
+    COMMIT (to GitHub), and the AUTHOR — who is the point on the stable
+    routine, since a failure there blocks the sync until a person acts, and a
+    verdict that names nobody leaves the build stuck.
+
+    A candidate the classifier marked `explains: false` is dimmed and marked
+    "?": it is the closest thing in range rather than the cause, and rendering
+    it identically to a real culprit would turn a lead into an accusation.
+    """
+    if not isinstance(candidates, list) or not candidates:
+        return ""
+    jira, slug, chips = _jira_base(meta), _repo_slug(meta), []
+    for c in candidates[:4]:
+        if not isinstance(c, dict):
+            continue
+        sha = _text(c.get("commit"))
+        if not sha:
+            continue
+        explains = bool(c.get("explains"))
+        ticket, author, why = (_text(c.get("ticket")), _text(c.get("author")),
+                               _text(c.get("why")))
+        bits = []
+        if ticket:
+            bits.append(f'<a class="cand-ticket" href="{_esc(jira)}/browse/{_esc(ticket)}" '
+                        f'target="_blank" rel="noopener">{_esc(ticket)}</a>')
+        bits.append(f'<a class="cand-sha" href="https://github.com/{_esc(slug)}/commit/{_esc(sha)}" '
+                    f'target="_blank" rel="noopener">{_esc(sha[:9])}</a>')
+        if author:
+            bits.append(f'<span class="cand-author">{_esc(author)}</span>')
+        if not explains:
+            bits.append('<span class="cand-weak" title="The classifier said this '
+                        'does not account for the failure — it is the closest '
+                        'change in range, not the cause.">?</span>')
+        chips.append(f'<div class="cand{"" if explains else " weak"}" '
+                     f'title="{_esc(why)}">' + " ".join(bits) + "</div>")
+    return f'<div class="cands">{"".join(chips)}</div>' if chips else ""
+
+
 def _cause_tickets(meta: dict, specific_change) -> str:
     """Linked chips for every ticket named in `specific_change`, de-duplicated.
 
@@ -1957,7 +2043,8 @@ def _cause_tickets(meta: dict, specific_change) -> str:
     return "".join(chips)
 
 
-def _cause_cell(meta: dict, culprit: str, commits: str, specific_change) -> str:
+def _cause_cell(meta: dict, culprit: str, commits: str, specific_change,
+                candidates=None) -> str:
     """The Suspicious cause cell.
 
     One column, two kinds of answer: the culprit file when the classifier
@@ -1972,6 +2059,17 @@ def _cause_cell(meta: dict, culprit: str, commits: str, specific_change) -> str:
         if commits:
             cell += f'<div class="culprit-commits">{_esc(commits)}</div>'
         return cell
+    # No file, but the classifier ranked commits: name them. A commit is
+    # strictly more actionable than a ticket — it identifies the change AND
+    # the author, which is what a stable failure needs, since it blocks the
+    # sync until someone acts. A trailing "?" marks a candidate the classifier
+    # said does NOT account for the failure; it is still the closest thing in
+    # range, and saying so beats an empty cell.
+    cands = _candidate_chips(meta, candidates)
+    if cands:
+        return cands
+    if commits:
+        return f'<div class="culprit-commits">{_esc(commits)}</div>'
     chips = _cause_tickets(meta, specific_change)
     if chips:
         return f'<div class="cause-tickets">{chips}</div>'
@@ -2110,7 +2208,8 @@ def _detail_row(r, rid: str, css: str, ckey: str, meta: dict,
     culprit = _text(r.get("culprit_file"))
     commits = _text(r.get("culprit_commits"))
     add("Suspicious cause",
-        _cause_cell(meta, culprit, commits, r.get("specific_change")))
+        _cause_cell(meta, culprit, commits, r.get("specific_change"),
+                    r.get("candidates")))
 
     if culprit and commits:
         add("Changed by", _esc(commits))
