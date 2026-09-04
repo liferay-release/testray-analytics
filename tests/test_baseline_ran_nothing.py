@@ -8,9 +8,21 @@ test that had failed with the IDENTICAL error in the previous ~20 builds. The
 baseline was not a healthy reference; it simply had not run the test.
 
 Such a row is NOT dropped (changed 2026-08-26): no baseline usually means a
-new test, and a failing new test must never disappear. It stays in triage,
-skips the classifier for want of anything to compare against, and reaches a
-human as NEEDS_REVIEW.
+new test, and a failing new test must never disappear.
+
+It is also no longer withheld from the classifier (changed 2026-09-04). "No
+baseline to diff against" is an argument about the BASELINE, not about whether
+the failure can be explained — a test added in this range and failing on its
+first run is among the most attributable failures there is, because the commit
+that added it is in the diff. Withholding them meant a red build could complete
+with no verdicts at all, which is how a real defect
+(PortalLogAssertorTest#testScanXMLLog, build 512102) shipped under a green
+diamond.
+
+What still skips the classifier is a row with nothing to reason from: one that
+did not actually fail in the target (an UNTESTED row carrying the harness
+notice "Unable to run test on CI" is text, not a defect), or one with no error
+text at all. See `prepare._explainable`.
 """
 import pandas as pd
 
@@ -63,11 +75,33 @@ def test_the_no_baseline_row_stays_in_triage():
     assert df.iloc[0]["transition"] == TRANSITION_NO_BASELINE
 
 
-def test_the_no_baseline_row_is_pre_classified_not_sent_to_the_classifier():
-    """Kept, but there is no baseline signature to compare against, so it goes
-    to a human instead of costing a classifier call."""
+def test_a_no_baseline_row_that_really_failed_goes_to_the_classifier():
+    """It failed and it said why, so it is explainable — baseline or not."""
     df = enrich_and_pre_classify(_no_baseline_row())
-    assert df.iloc[0]["pre_classification"] == NO_BASELINE_PRE
+    assert pd.isna(df.iloc[0]["pre_classification"]), \
+        "a failing new test with error text must reach the classifier"
+
+
+def test_a_no_baseline_row_with_no_error_text_is_still_withheld():
+    """Nothing written down, nothing to reason from."""
+    df, _ = compute_test_diff(
+        pd.DataFrame([_frame(1, "FAILED", _NOT_EXECUTED)]),
+        pd.DataFrame([_frame(1, "FAILED", "")]),
+    )
+    assert enrich_and_pre_classify(df).iloc[0]["pre_classification"] is not None
+
+
+def test_explainable_requires_a_real_failure_not_just_error_text():
+    """An UNTESTED row's harness notice reads as text but describes the
+    harness, not a defect. Gating on text alone sent 199 never-ran rows from
+    one build to the classifier — this is the guard that stops it."""
+    from testray_analytics.analysis.prepare import _explainable
+    df = pd.DataFrame({
+        "status_b":      ["FAILED", "UNTESTED", "FAILED", "UNTESTED"],
+        "error_message": ["PortalLogAssertorTest#testScanXMLLog: ...",
+                          "Unable to run test on CI", "", ""],
+    })
+    assert list(_explainable(df)) == [True, False, False, False]
 
 
 def test_the_no_baseline_row_surfaces_as_needs_review():

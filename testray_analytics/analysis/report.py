@@ -2333,7 +2333,7 @@ def _totals(df: pd.DataFrame, n_clusters: int, meta: dict,
         pills.append(
             f'<span class="pill{" warn" if low else ""}" title="Case results '
             f'that ran on BOTH builds, as a share of whichever build ran more. '
-            f'The diff is an inner join on case id, so anything outside this '
+            f'The diff keeps every case the target ran, so anything outside this '
             f'is invisible to it.">'
             f'<strong>Compared:</strong> <span class="n">{compared:,}</span>'
             f'<span class="fanout">{share}</span></span>')
@@ -2436,7 +2436,8 @@ def _banners(df: pd.DataFrame, meta: dict) -> str:
         out.append(
             '<section class="rationale warn"><h2>This comparison covers only '
             f'{pct:.1f}% of the build</h2>'
-            f"<p>The diff is an inner join on case id: only <strong>"
+            f"<p>The diff joins on case id and keeps every case the TARGET "
+            f"ran: only <strong>"
             f"{compared:,}</strong> of the <strong>{denom:,}</strong> case "
             f"results the larger build ran were run on <em>both</em> "
             f"builds, so everything else is invisible to it. A verdict list "

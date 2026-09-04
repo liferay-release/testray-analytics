@@ -305,11 +305,17 @@ _NO_BASELINE = "NO_BASELINE"
 # caused by the change", so this needs no new entry either.
 _PRE_EXISTING = "PRE_EXISTING"
 
+# Produced no result on either side. DID_NOT_RUN is the accurate label: it did
+# not run, as opposed to running and failing for a reason we discounted.
+_NEVER_RAN = "NEVER_RAN"
+
 
 def _auto_label(pre_classification) -> str:
     pc = str(pre_classification or "").strip().upper()
     if pc == _NO_BASELINE:
         return "NEEDS_REVIEW"
+    if pc == _NEVER_RAN:
+        return "DID_NOT_RUN"
     if pc == _PRE_EXISTING:
         return "FALSE_POSITIVE"
     return "DID_NOT_RUN" if pc in _DID_NOT_RUN else "ENV_FAILURE"
@@ -358,6 +364,9 @@ def _auto_reason(row) -> str:
                 "introduces it, so a failure on its first run means the test "
                 "or the change it covers is not finished. There is no earlier "
                 "signature to compare against, so a human decides")
+    if pc == _NEVER_RAN:
+        return ("did not run in either build — a coverage gap, not a failure. "
+                "Worth a glance if the suite is quietly shrinking")
     if pc == _PRE_EXISTING:
         streak = row.get("history_fail_streak")
         depth  = row.get("history_depth")

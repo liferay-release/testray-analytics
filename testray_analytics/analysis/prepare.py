@@ -871,6 +871,7 @@ TRANSITION_AWARENESS    = "awareness"      # FAILED → BLOCKED
 TRANSITION_BLOCKED      = "blocked"        # BLOCKED → FAILED
 TRANSITION_TESTFIX      = "testfix"        # TESTFIX(status) → FAILED
 TRANSITION_NO_BASELINE  = "no_baseline"    # UNTESTED → FAILED
+TRANSITION_NEVER_RAN    = "never_ran"      # UNTESTED → UNTESTED, same reason
 TRANSITION_OTHER        = "other"
 
 # Which transitions are triage candidates. The rest are counted and reported
@@ -901,7 +902,8 @@ TRIAGE_TRANSITIONS = frozenset({
 # PRE_EXISTING, and then excluded from the classify set, the prompt, the
 # clustering and the Testray write. Cost and verdicts are unchanged; only the
 # report gains a section.
-REPORTED_TRANSITIONS = TRIAGE_TRANSITIONS | {TRANSITION_SAME_FAILURE}
+REPORTED_TRANSITIONS = TRIAGE_TRANSITIONS | {TRANSITION_SAME_FAILURE,
+                                             TRANSITION_NEVER_RAN}
 
 _FAILING = ("FAILED", "BLOCKED", "UNTESTED")
 
@@ -925,6 +927,15 @@ _BASELINE_RAN_NOTHING = frozenset({"BUILD_FAILURE", "NO_ERROR", "BATCH_FAILURE"}
 NO_BASELINE_PRE = "NO_BASELINE"
 
 
+def _status_text(value) -> str:
+    """Status as an upper-case string; missing/NaN becomes "" (no baseline)."""
+    if value is None:
+        return ""
+    if isinstance(value, float) and pd.isna(value):
+        return ""
+    return str(value).strip().upper()
+
+
 def classify_transition(status_a, status_b, error_a, error_b) -> str:
     """Label one baseline→target pair per the §12 matrix.
 
@@ -933,8 +944,12 @@ def classify_transition(status_a, status_b, error_a, error_b) -> str:
     "what got fixed" signal for a future Insights view. `UNTESTED→FAILED` has
     no baseline health signal at all, so it cannot be called new.
     """
-    a = (status_a or "").upper()
-    b = (status_b or "").upper()
+    # A right join leaves status_a as NaN for a case the baseline never had.
+    # `(nan or "")` is nan — truthy — so the old form reached .upper() on a
+    # float. Normalising here keeps the "no baseline health signal" reading
+    # that UNTESTED already gets.
+    a = _status_text(status_a)
+    b = _status_text(status_b)
 
     if b == "PASSED":
         return TRANSITION_FIXED if a == "FAILED" else TRANSITION_OTHER
@@ -951,7 +966,25 @@ def classify_transition(status_a, status_b, error_a, error_b) -> str:
         return TRANSITION_BLOCKED
     if a == "TESTFIX" and b in _FAILING:
         return TRANSITION_TESTFIX
-    if a == "UNTESTED" and b in _FAILING:
+    if a == "UNTESTED" and b == "UNTESTED":
+        # It did not run on either side. `UNTESTED` sits in `_FAILING`, so this
+        # pair used to read as "no baseline" and enter triage: ~199 rows in
+        # every Stable build, auto-labelled NEEDS_REVIEW and written to Testray,
+        # burying the one real failure under tests that never ran at all.
+        #
+        # A test that ran on neither side is a coverage fact, not a failure.
+        # It stays on the REPORT — the count is how you notice a suite quietly
+        # shrinking — but it is not triaged and not written, the same treatment
+        # `same_failure` gets. The exception is a CHANGED reason: if the two
+        # sides say different things about why it did not run, that is a real
+        # difference and keeps its no-baseline reading.
+        return (TRANSITION_NO_BASELINE
+                if error_signature.signatures_differ(error_a, error_b)
+                else TRANSITION_NEVER_RAN)
+    if a in ("UNTESTED", "") and b in _FAILING:
+        # "" is a case the baseline never contained — a test added in this
+        # range. Same reading as UNTESTED: it failed, and there is no baseline
+        # health signal to compare it against.
         return TRANSITION_NO_BASELINE
     return TRANSITION_OTHER
 
@@ -1017,6 +1050,12 @@ HISTORY_WORKERS_DEFAULT = 8
 # onto FALSE_POSITIVE, so the verdict vocabulary, the Testray picklist and
 # util/verdict.ts are all untouched.
 PRE_EXISTING = "PRE_EXISTING"
+
+# A case that produced no result on EITHER side. Distinct from
+# PRE_EXISTING, which describes a test that ran and failed before this
+# diff: reusing that tag made the report explain a never-run test as
+# "no PASS in the last N results", which is not what happened to it.
+NEVER_RAN = "NEVER_RAN"
 
 
 def fetch_case_history(case_ids, cfg: dict, *,
@@ -1151,10 +1190,22 @@ def compute_test_diff(baseline: pd.DataFrame, target: pd.DataFrame,
     b = _aggregate_baseline(baseline, key_cols=key_cols)
     t = _aggregate_target(target,     key_cols=key_cols)
 
-    merged = b.merge(t, on=key_cols, how="inner", suffixes=("_a", "_b"))
+    # RIGHT, not inner: every case the TARGET ran has to survive, including
+    # ones the baseline never contained. A test added in this range and failing
+    # on its first run is target-only, and an inner join silently dropped it —
+    # no row, no transition, no verdict, and a green diamond over a real defect
+    # (PortalLogAssertorTest#testScanXMLLog, build 512102). The coverage block
+    # below already counted those as `target_only`; now they are triaged too.
+    #
+    # Baseline-only cases stay out deliberately: a test that ran in A and not in
+    # B produced no target result, so there is nothing to classify. Coverage is
+    # where that half is reported.
+    merged = b.merge(t, on=key_cols, how="right", suffixes=("_a", "_b"))
 
-    # Coverage BEFORE anything is filtered: what the inner join above threw
-    # away. `baseline_only` is the important half — tests that ran in A and
+    # Coverage BEFORE anything is filtered: what the join above left out.
+    # Only `baseline_only` now — target-only cases are KEPT (see the join),
+    # because a newly added failing test lives there. `baseline_only` is the
+    # half with no row — tests that ran in A and
     # not in B produce no failure, no transition and no row, so they cannot
     # be noticed downstream by any means except this.
     if coverage_out is not None:
@@ -1226,6 +1277,16 @@ def compute_test_diff(baseline: pd.DataFrame, target: pd.DataFrame,
 
     if both_have_ids:
         case_id_col = "case_id"
+        # Coalesce onto the target side. A target-only row (a case the baseline
+        # never had) has every `_a` column NaN, so reading the name and
+        # component from the baseline would render it as a blank test with no
+        # component — present in the table but unidentifiable, which is barely
+        # better than the drop this replaced.
+        for base_col, tgt_col in (("case_name_a", "case_name_b"),
+                                  ("component_name_a", "component_name_b")):
+            if base_col in diff.columns and tgt_col in diff.columns:
+                diff[base_col] = diff[base_col].where(
+                    diff[base_col].notna(), diff[tgt_col])
         name_col    = "case_name_a"
         comp_col    = "component_name_a"
     else:
@@ -1439,6 +1500,28 @@ def run_extract_hunks(diff_path: Path, fragments_path: Path, out_path: Path) -> 
 # Step 5: component/team enrichment (optional) + pre-classification
 # ---------------------------------------------------------------------------
 
+def _explainable(df: pd.DataFrame) -> "pd.Series":
+    """Rows the classifier can actually say something about.
+
+    Two conditions, and both are load-bearing:
+
+    * **Failing in the target.** Error text alone is not enough — an
+      UNTESTED row carries a harness notice ("Unable to run test on CI"),
+      which reads as text but describes the harness, not a defect. Gating on
+      text alone sent 199 never-ran rows to the classifier in one build.
+    * **With something written down.** A failure with no error text at all
+      (the aggregate "Top Level Build" row) leaves nothing to reason from.
+
+    This is what "for ANY failure we need an analysis" reduces to in practice:
+    every row that genuinely failed and said why goes to the classifier, and
+    the rules that used to withhold them — BATCH_FAILURE on a shard name,
+    NO_BASELINE on a new test — now only apply when one of those is missing.
+    """
+    failing = df["status_b"].map(lambda v: str(v).strip().upper() == "FAILED") \
+        if "status_b" in df.columns else pd.Series(True, index=df.index)
+    return failing & df["error_message"].map(lambda e: not _is_blank(e))
+
+
 def enrich_and_pre_classify(df: pd.DataFrame) -> pd.DataFrame:
     cfg        = prompt_helpers.load_triage_config()
     extra_pats = cfg.get("auto_classify_patterns") or {}
@@ -1485,7 +1568,21 @@ def enrich_and_pre_classify(df: pd.DataFrame) -> pd.DataFrame:
         )
     # Only where no more specific pattern already fired — an error-text match
     # says something about *why*, which is worth keeping.
-    fill = is_batch & df["pre_classification"].isna()
+    #
+    # And only where the row has nothing to reason from. BATCH_FAILURE means
+    # "keyed by axis and shard, so no single test can be blamed" — true of the
+    # NAME, but not of a row whose error names a test method and a concrete
+    # assertion. Tagging on the name alone auto-classified a real product
+    # defect out of the analysis entirely:
+    #
+    #   PortalLogAssertorTest-modules-integration-postgresql163_stable/0/0
+    #   → "PortalLogAssertorTest#testScanXMLLog: The panel categories
+    #      control_panel.search and control_panel.search_tuning have the same
+    #      order 500"
+    #
+    # which is as attributable as any failure in the run. A shard row with
+    # error text goes to the classifier; one without still has nothing to say.
+    fill = is_batch & df["pre_classification"].isna() & ~_explainable(df)
     if fill.any():
         df.loc[fill, "pre_classification"] = "BATCH_FAILURE"
 
@@ -1496,8 +1593,16 @@ def enrich_and_pre_classify(df: pd.DataFrame) -> pd.DataFrame:
     # `pre_classification` mechanism as the env/infra and batch rows; again
     # only where no more specific pattern already fired.
     if "transition" in df.columns:
+        # Only rows with nothing to reason from. "No baseline to diff against"
+        # is true, but it is an argument about the BASELINE, not about whether
+        # the failure is explainable: a test added in this range and failing on
+        # its first run is among the most attributable failures there is — the
+        # commit that added it is in the diff. Withholding those from the
+        # classifier meant a red build could produce no verdicts at all.
+        # A no-baseline row with no error text still has nothing to say.
         no_base = ((df["transition"] == TRANSITION_NO_BASELINE)
-                   & df["pre_classification"].isna())
+                   & df["pre_classification"].isna()
+                   & ~_explainable(df))
         if no_base.any():
             df.loc[no_base, "pre_classification"] = NO_BASELINE_PRE
 
@@ -1506,6 +1611,11 @@ def enrich_and_pre_classify(df: pd.DataFrame) -> pd.DataFrame:
         # classify set, the prompt, the clustering and the Testray write —
         # the same mechanism the history feature's chronic rows use, so there
         # is one exclusion path rather than two.
+        never_ran = ((df["transition"] == TRANSITION_NEVER_RAN)
+                     & df["pre_classification"].isna())
+        if never_ran.any():
+            df.loc[never_ran, "pre_classification"] = NEVER_RAN
+
         same_fail = ((df["transition"] == TRANSITION_SAME_FAILURE)
                      & df["pre_classification"].isna())
         if same_fail.any():
@@ -3012,7 +3122,7 @@ def prepare(baseline: SideSpec, target: SideSpec, classifier: str,
           ", ".join(f"{n} {name}" for name, n in sorted(transitions.items(),
                                                         key=lambda kv: -kv[1])))
 
-    # The join is an inner join on case id, so the transition total IS how many
+    # The join keeps every case the target ran, so the transition total IS how many
     # cases were comparable. When that is a small share of the target build the
     # two builds ran different test sets, and every verdict below describes that
     # sliver rather than the build. Say it here as well as in the report: a run

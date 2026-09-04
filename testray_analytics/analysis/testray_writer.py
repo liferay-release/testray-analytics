@@ -161,8 +161,14 @@ def _exclusion_reason(row) -> str | None:
     """
     if str(row.get("known_flaky") or "").strip().lower() in ("true", "1", "1.0", "yes"):
         return "known flaky"
-    if str(row.get("pre_classification") or "").strip().upper() == "PRE_EXISTING":
+    pre = str(row.get("pre_classification") or "").strip().upper()
+    if pre == "PRE_EXISTING":
         return "pre-existing failure"
+    if pre == "NEVER_RAN":
+        # Ran on neither side. A coverage fact, not a verdict — writing one
+        # would put ~199 rows per Stable build into the store for tests that
+        # never executed, which is what buried the single real failure.
+        return "never ran in either build"
     cls  = str(row.get("classification") or "").strip()
     conf = str(row.get("confidence") or "").strip().lower()
     if cls == "FALSE_POSITIVE" and conf == "high":
