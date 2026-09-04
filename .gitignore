@@ -19,3 +19,6 @@ runs/
 # Per-step logs from scripts/triage_pipeline.sh
 logs/
 config/config.prod.yml
+
+# Signature-ledger observation log — a rebuildable cache, never committed.
+state/

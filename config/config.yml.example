@@ -116,3 +116,21 @@ triage:
       delay_between_batches_seconds: 2
 
 # ANTHROPIC_API_KEY is passed via the environment, never stored here.
+
+queue:
+  # Pending attribution jobs, as marker files — the pattern liferay-docker uses
+  # in templates/job-runner: a short cron REGISTERS work, a separate serial loop
+  # drains it. Registering an already-pending job is a no-op, so a tick landing
+  # while the previous job runs cannot stack duplicates up.
+  #
+  # Transient by design. There is no observation log and no watermark: whether a
+  # failure has been dealt with is derived from Testray (a TriageResult carrying
+  # its clusterKey), which is what keeps ARCHITECTURE decision #11 intact —
+  # Testray stays the single sink. Losing this directory costs one re-queue on
+  # the next tick, nothing more.
+  #
+  # Relative paths resolve against the PROJECT ROOT, never the current
+  # directory, so the same value works whoever invokes the scanner and from
+  # wherever. $TRIAGE_QUEUE overrides it — the seam to use when one machine runs
+  # both a local experiment and the scheduled job.
+  path: state/queue
