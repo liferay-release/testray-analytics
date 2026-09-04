@@ -1392,8 +1392,66 @@ def resolve_side_metadata(spec: SideSpec, cfg: dict) -> dict:
 # Step 3: git diff with exclusions
 # ---------------------------------------------------------------------------
 
+# Which repository a routine's builds are cut from. This is a property of the
+# ROUTINE, not of the tool, and the three differ:
+#
+#   Stable      brianchandotcom/liferay-portal   the CONTROL repo. Every commit
+#                                                merges here first; a Stable
+#                                                failure blocks the sync to
+#                                                liferay/liferay-portal, so its
+#                                                SHAs exist here before they
+#                                                exist anywhere upstream.
+#   Acceptance  liferay/liferay-portal           master
+#   Release     liferay/liferay-portal-ee        release-202x.qy
+#
+# Before this, a missing SHA fell back to fetching `origin` — a personal fork,
+# which for Stable will never have the commit. Runs succeeded only when the
+# right branch happened to be fetched already, which is not a property to rely
+# on for an unattended scan on a fresh agent.
+def routine_git_remote(cfg: dict, routine_id) -> str | None:
+    """The git remote for a routine's builds, or None to leave it to origin."""
+    git_cfg = (cfg or {}).get("git") or {}
+    sources = git_cfg.get("routine_remotes") or {}
+    # YAML keys may parse as int or str depending on quoting; accept both.
+    for key in (routine_id, str(routine_id)):
+        if key in sources:
+            return str(sources[key]).strip() or None
+    return (git_cfg.get("fetch_remote") or "").strip() or None
+
+
+_SLUG_RE = re.compile(r"[:/]([^/:]+/[^/]+?)(?:\.git)?$")
+
+# Fallback when the remote cannot be read. Correct for acceptance, and wrong
+# for Stable — whose commits are on the control repo — which is exactly why the
+# slug is resolved from the remote rather than hardcoded.
+DEFAULT_REPO_SLUG = "liferay/liferay-portal"
+
+
+def github_slug(git_repo: Path, remote: str | None) -> str:
+    """`owner/repo` for a git remote, for building github.com links.
+
+    Read from the remote's URL rather than assumed, because the answer differs
+    per routine: a Stable commit is on brianchandotcom/liferay-portal, and a
+    link to liferay/liferay-portal for that SHA 404s — the commit has not synced
+    upstream yet, which is the whole reason the build is being triaged.
+    """
+    if not remote:
+        return DEFAULT_REPO_SLUG
+    try:
+        url = subprocess.run(
+            ["git", "-C", str(Path(git_repo).expanduser()),
+             "remote", "get-url", remote],
+            capture_output=True, text=True, timeout=10,
+        ).stdout.strip()
+    except (subprocess.SubprocessError, FileNotFoundError):
+        return DEFAULT_REPO_SLUG
+    m = _SLUG_RE.search(url)
+    return m.group(1) if m else DEFAULT_REPO_SLUG
+
+
 def run_git_diff(git_repo: Path, hash_a: str, hash_b: str, out_path: Path,
-                 fetch_specs: list | None = None) -> int:
+                 fetch_specs: list | None = None,
+                 remote: str | None = None) -> int:
     git_dir = Path(git_repo).expanduser()
     if not (git_dir / ".git").is_dir():
         raise SystemExit(f"Not a git repo: {git_dir}. "
@@ -1730,6 +1788,8 @@ def write_run_yml(run_dir: Path, *, run_id: str,
                   project_id: int | None = None,
                   testray_url: str | None = None,
                   base_branch: str | None = None,
+                  git_remote: str | None = None,
+                  repo_slug: str | None = None,
                   transition_counts: dict | None = None,
                   baseline_rows: int | None = None,
                   target_rows: int | None = None,
@@ -1749,6 +1809,8 @@ def write_run_yml(run_dir: Path, *, run_id: str,
         # master, 81a4afb..b096242") without re-reading config.yml at render
         # time. Absent on bundles written before this key existed.
         "base_branch":         base_branch,
+        "git_remote":          git_remote,
+        "repo_slug":           repo_slug,
         "routine_id":          routine_id,
         # Recorded for the report's Testray deep-links only; nothing in the
         # pipeline branches on either value.
@@ -2062,6 +2124,74 @@ def fetch_commits_in_range(git_repo: Path, hash_a: str, hash_b: str) -> list[tup
 
 
 
+# How many path segments identify a module. `modules/apps/<app>/<artifact>`
+# is the unit a failing Gradle task names, so four is the level that lets
+# "modules-compile[modules/apps/blogs]" be matched against a commit.
+_MODULE_DEPTH = 4
+
+# Enough to show which areas a ticket touched without pasting a refactor's
+# whole file list into the prompt: a 22-commit ticket can span hundreds.
+_MODULES_PER_GROUP = 12
+
+
+def _module_of(path: str) -> str:
+    """The module directory containing a changed file."""
+    parts = [p for p in str(path).strip().split("/") if p]
+    if not parts:
+        return ""
+    depth = _MODULE_DEPTH if parts[0] == "modules" else 2
+    return "/".join(parts[:depth])
+
+
+def fetch_commit_details(git_repo: Path, hash_a: str, hash_b: str) -> list[dict]:
+    """Commits in `A..B` with their author and the modules they touched.
+
+    The mapping is the point. The prompt already listed commits grouped by
+    ticket AND listed the changed files, but never which ticket touched which
+    module — so "if a ticket touches a file related to a failing test, treat
+    the cluster as a candidate root cause" asked for a judgement on evidence
+    that was not there. A failing `modules-compile[modules/apps/blogs]` could
+    not be connected to the ticket that changed blogs without this.
+
+    One `git log --name-only` pass rather than a call per commit: a range of a
+    few hundred commits is normal and the per-commit form takes minutes.
+
+    Author comes along because the downstream work needs it — a Stable failure
+    blocks the upstream sync, so the deliverable is a commit and the person to
+    ask, not just a verdict.
+    """
+    if not (git_repo / ".git").is_dir():
+        return []
+    sep = "\x1e"
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(git_repo), "log", "--name-only",
+             f"--pretty=format:{sep}%h\t%an\t%ae\t%s", f"{hash_a}..{hash_b}"],
+            capture_output=True, text=True, check=True, timeout=120,
+        ).stdout
+    except (subprocess.SubprocessError, FileNotFoundError):
+        return []
+
+    commits: list[dict] = []
+    for chunk in out.split("\x1e"):
+        chunk = chunk.strip("\n")
+        if not chunk:
+            continue
+        head, _, body = chunk.partition("\n")
+        bits = head.split("\t")
+        if len(bits) < 4:
+            continue
+        h, author, email, subj = bits[0], bits[1], bits[2], "\t".join(bits[3:])
+        if _is_noise_commit_subject(subj):
+            continue
+        modules = {_module_of(l) for l in body.splitlines() if l.strip()}
+        commits.append({
+            "hash": h, "author": author, "email": email, "subject": subj,
+            "modules": sorted(m for m in modules if m),
+        })
+    return commits
+
+
 _TICKET_RE = re.compile(r"^([A-Z][A-Z0-9]+-\d+)\b")
 
 
@@ -2232,18 +2362,35 @@ def render_changed_files_section(manifest: dict[str, int]) -> list[str]:
     return lines
 
 
-def render_commits_section(commits: list[tuple[str, str]]) -> list[str]:
-    """Markdown block listing commits in this range, clustered by ticket
-    (LPD-XXXXX / LPP-XXXXX / LPS-XXXXX) when present. Multi-commit clusters
-    under one ticket often represent a single refactor — explicit candidate
-    root causes for transitive-dep failures."""
+def render_commits_section(commits: list) -> list[str]:
+    """Commits in this range, grouped by ticket, WITH the author and the
+    modules each group touched.
+
+    Accepts either the plain `(hash, subject)` tuples or the richer dicts from
+    `fetch_commit_details`; the extra lines appear only for the latter, so an
+    older bundle or a caller that never fetched detail still renders.
+
+    The module list is the load-bearing part. Without it a failing
+    `modules-compile[modules/apps/blogs]` cannot be connected to the ticket
+    that changed blogs, and the instruction below — treat a ticket touching a
+    related file as a candidate — asks for a judgement on evidence the prompt
+    never carried. The author is here because a Stable failure blocks the
+    upstream sync, so the answer has to name a person, not just a verdict.
+    """
     if not commits:
         return []
-    by_ticket: dict[str, list[tuple[str, str]]] = {}
-    for h, subj in commits:
+    rich = isinstance(commits[0], dict)
+
+    def parts(c):
+        if rich:
+            return c["hash"], c["subject"], c.get("author") or "", c.get("modules") or []
+        return c[0], c[1], "", []
+
+    by_ticket: dict[str, list] = {}
+    for c in commits:
+        _h, subj, _a, _m = parts(c)
         m = _LPD_RE.search(subj)
-        key = m.group(1) if m else "(no ticket)"
-        by_ticket.setdefault(key, []).append((h, subj))
+        by_ticket.setdefault(m.group(1) if m else "(no ticket)", []).append(c)
 
     lines = [
         "## Commits in this range",
@@ -2251,19 +2398,34 @@ def render_commits_section(commits: list[tuple[str, str]]) -> list[str]:
         f"_{len(commits)} commits between baseline and target. Multi-commit "
         f"clusters under the same ticket often represent a single refactor — "
         f"if a ticket touches a file related to a failing test (even via "
-        f"imports), treat the cluster as a candidate root cause._",
+        f"imports), treat the cluster as a candidate root cause."
+        + ("  **Touches** lists the modules a ticket changed: match it against "
+           "the failing test's module to find candidates, and say so when the "
+           "only candidate does not explain the failure._" if rich else "_"),
         "",
     ]
-    # Clusters with most commits first; "(no ticket)" last.
     def sort_key(t: str) -> tuple[int, int, str]:
         return (1 if t == "(no ticket)" else 0, -len(by_ticket[t]), t)
+
     for ticket in sorted(by_ticket, key=sort_key):
         cs = by_ticket[ticket]
-        if len(cs) > 1:
-            lines.append(f"### {ticket} ({len(cs)} commits)")
-        else:
-            lines.append(f"### {ticket}")
-        for h, subj in cs:
+        head = f"### {ticket}" + (f" ({len(cs)} commits)" if len(cs) > 1 else "")
+        if rich:
+            authors = sorted({parts(c)[2] for c in cs if parts(c)[2]})
+            if authors:
+                head += " — " + ", ".join(authors[:3]) + (
+                    f" +{len(authors) - 3}" if len(authors) > 3 else "")
+        lines.append(head)
+        if rich:
+            mods = sorted({m for c in cs for m in parts(c)[3]})
+            if mods:
+                shown = mods[:_MODULES_PER_GROUP]
+                more = len(mods) - len(shown)
+                lines.append("- _touches:_ "
+                             + ", ".join(f"`{m}`" for m in shown)
+                             + (f" _+{more} more_" if more else ""))
+        for c in cs:
+            h, subj, _a, _m = parts(c)
             lines.append(f"- `{h}` {subj}")
         lines.append("")
     lines.append("---")
@@ -2390,7 +2552,8 @@ def write_prompt(run_dir: Path, *, run_id: str, classifier: str,
     # Manifest + commits sections — give the model context for transitive
     # deps when per-failure hunk matching is empty.
     manifest = parse_full_diff_manifest(full_diff_path)
-    commits  = fetch_commits_in_range(git_repo, hash_a, hash_b) if hash_a and hash_b else []
+    commits  = (fetch_commit_details(git_repo, hash_a, hash_b)
+                if hash_a and hash_b else [])
     manifest_lines = render_changed_files_section(manifest)
     commit_lines   = render_commits_section(commits)
 
@@ -2809,7 +2972,8 @@ def write_prompt_grouped(run_dir: Path, *, run_id: str, classifier: str,
     )
 
     manifest = parse_full_diff_manifest(full_diff_path)
-    commits  = fetch_commits_in_range(git_repo, hash_a, hash_b) if hash_a and hash_b else []
+    commits  = (fetch_commit_details(git_repo, hash_a, hash_b)
+                if hash_a and hash_b else [])
     manifest_lines = render_changed_files_section(manifest)
     commit_lines   = render_commits_section(commits)
 
@@ -2862,6 +3026,8 @@ def _finalize_bundle(
     history_depth: int = HISTORY_DEPTH_DEFAULT,
     history_streak: int = HISTORY_STREAK_DEFAULT,
     base_branch: str | None = None,
+    git_remote: str | None = None,
+    repo_slug: str | None = None,
 ) -> Path:
     print(f"→ Step 3/6 git diff …")
     diff_path = run_dir / "git_diff_full.diff"
@@ -2871,7 +3037,7 @@ def _finalize_bundle(
     print(f"   {describe_git_range(git_repo, hash_a, hash_b)}")
     print(f"   range {hash_a[:12]}..{hash_b[:12]}")
     diff_lines = run_git_diff(git_repo, hash_a, hash_b, diff_path,
-                              fetch_specs=fetch_specs)
+                              fetch_specs=fetch_specs, remote=git_remote)
     n_files = 0
     try:
         n_files = sum(1 for ln in diff_path.open(encoding="utf-8", errors="replace")
@@ -3062,6 +3228,8 @@ def _finalize_bundle(
         project_id=project_id,
         testray_url=testray_url,
         base_branch=base_branch,
+        git_remote=git_remote,
+        repo_slug=repo_slug,
         transition_counts=transition_counts,
         baseline_rows=baseline_rows,
         target_rows=target_rows,
@@ -3230,6 +3398,11 @@ def prepare(baseline: SideSpec, target: SideSpec, classifier: str,
         # "master" for a 2024.Q1 analysis, so it is only the fallback.
         base_branch=(meta_b.get("branch")
                      or (cfg.get("git") or {}).get("base_branch")),
+        # Which repo this routine's builds are cut from. Stable's are on the
+        # control repo and never on a personal fork, so the fallback to origin
+        # can only ever miss.
+        git_remote=routine_git_remote(cfg, routine_id),
+        repo_slug=github_slug(git_repo, routine_git_remote(cfg, routine_id)),
         git_repo=git_repo,
         mode=mode,
         fetch_specs=fetch_specs,

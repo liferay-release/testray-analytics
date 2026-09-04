@@ -12,11 +12,41 @@
 git:
   # Persistent liferay-portal checkout (ARCHITECTURE.md §2 / §14). `prepare`
   # runs `git diff` and `git log A..B` between the two build hashes; it may
-  # `git fetch origin` if a hash is missing. On Jenkins this is a persistent
-  # workspace that `git pull`s each run — never a fresh clone.
+  # fetch if a hash is missing — from the ROUTINE's remote below, then origin.
+  # On Jenkins this is a persistent workspace that `git pull`s each run —
+  # never a fresh clone.
   # No branch setting needed: the diff is hash-to-hash (branch-agnostic); any
   # branch's build hashes work as long as they're reachable in this checkout.
   repo_path: /path/to/liferay-portal
+
+  # Which repository each routine's builds are cut from, keyed by routine id.
+  # This is a property of the ROUTINE, not of the tool, and the three differ:
+  #
+  #   Stable      brianchandotcom/liferay-portal   the CONTROL repo. Every
+  #                                                commit merges here first, and
+  #                                                a Stable failure blocks the
+  #                                                sync to liferay/liferay-portal
+  #                                                — so any failure has to be
+  #                                                addressed or nobody in the
+  #                                                organisation gets an updated
+  #                                                upstream master.
+  #   Acceptance  liferay/liferay-portal           master
+  #   Release     liferay/liferay-portal-ee        release-202x.qy
+  #
+  # Values are git REMOTE names in the checkout at `repo_path`, not URLs, so
+  # the credentials stay in the developer's or agent's git config.
+  #
+  # Without this, a commit missing from the local checkout is looked for on
+  # `origin` — which for Stable is a personal fork that will never have it.
+  # Runs then succeed only when the right branch happens to be fetched already,
+  # which is not something an unattended scan on a fresh agent can rely on.
+  # A routine with no entry falls back to `fetch_remote`, then to origin.
+  routine_remotes:
+    79529: bchan          # ci:test:stable — control repo
+    590307: upstream      # EE Development Acceptance
+    82964: upstream-ee    # release
+  # Used for any routine not listed above. Leave unset to fall back to origin.
+  #fetch_remote: bchan
 
 testray:
   # Testray REST base_url (env override: TESTRAY_BASE_URL). Point at the instance
