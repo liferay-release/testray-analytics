@@ -53,6 +53,21 @@ _PIPELINE = (Path(__file__).resolve().parents[2] / "scripts"
 
 POLL_SECONDS = 10
 
+# triage_pipeline.sh exits 3 when it completed cleanly but produced no verdicts
+# for a build that has failures. Distinct from 0 and from a step failure,
+# because under unattended operation "explained nothing" must not look like
+# "explained everything".
+_RC_NO_VERDICTS = 3
+
+# Status written for that case. Falls back to FAILED when the Object's picklist
+# does not have the key yet: a wrong-but-visible state beats a green diamond
+# over an unexplained red build.
+STATUS_INCONCLUSIVE = "INCONCLUSIVE"
+
+
+class NoVerdicts(Exception):
+    """The pipeline ran clean and explained nothing."""
+
 
 def _queued(session: _Session) -> list[dict]:
     """QUEUED runs, oldest first so a backlog drains in request order."""
@@ -106,9 +121,15 @@ def _run(cmd: list[str], label: str) -> str:
         sys.stdout.write("  | " + line)
         sys.stdout.flush()
         lines.append(line)
-    if proc.wait() != 0:
+    rc = proc.wait()
+    if rc == _RC_NO_VERDICTS:
+        # Not a failure: every step ran clean, there was simply nothing to
+        # explain. Raised as its own type so the caller can mark the run
+        # INCONCLUSIVE rather than deleting the row as a success.
+        raise NoVerdicts("".join(lines))
+    if rc != 0:
         tail = " / ".join(x.strip() for x in lines[-5:] if x.strip())
-        raise RuntimeError(f"{label} exited {proc.returncode}: {tail}")
+        raise RuntimeError(f"{label} exited {rc}: {tail}")
     return "".join(lines)
 
 
@@ -193,6 +214,24 @@ def main() -> None:
 
             try:
                 bundle = _pipeline(run, args)
+            except NoVerdicts:
+                # The row stays, carrying a state a human can see. Deleting it
+                # would hand the build a green diamond for an analysis that
+                # concluded nothing.
+                msg = ("Ran clean but produced no verdicts — every failure was "
+                       "auto-classified or excluded. Needs a human.")
+                print(f"  ! {erc}: {msg}", file=sys.stderr)
+                try:
+                    _set_status(session, erc, STATUS_INCONCLUSIVE, msg)
+                except Exception:                                # noqa: BLE001
+                    # Picklist may not carry the key yet (it is a schema change
+                    # on the Testray Object). Visible-and-wrong beats silent.
+                    try:
+                        _set_status(session, erc, "FAILED", msg)
+                    except Exception as inner:                   # noqa: BLE001
+                        print(f"  ! also could not mark it: {inner}",
+                              file=sys.stderr)
+                continue
             except Exception as e:                               # noqa: BLE001
                 print(f"  ! {erc} failed: {e}", file=sys.stderr)
                 try:

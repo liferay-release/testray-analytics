@@ -239,9 +239,34 @@ run_step "classify_dry_run" \
 	"${PYTHON}" -m testray_analytics.analysis.classify \
 	"${BUNDLE}" --engine "${ENGINE}" --dry-run || exit 2
 
-run_step "classify" \
-	"${PYTHON}" -m testray_analytics.analysis.classify \
-	"${BUNDLE}" --engine "${ENGINE}" || exit 2
+# Nothing classifiable means nothing to ask. Skipping is not an optimisation
+# detail: a run with zero classifiable clusters used to send its auto-only
+# sections anyway, the model correctly answered with nothing, and it cost real
+# usage to be told so. Reading the count from the bundle rather than from
+# prepare's stdout keeps this working when a bundle is re-run by hand.
+CLASSIFIABLE="$("${PYTHON}" - "${BUNDLE}" <<-'PYEOF'
+	import csv, pathlib, sys
+	p = pathlib.Path(sys.argv[1]) / "diff_list_subtasks.csv"
+	n = 0
+	if p.exists():
+	    with p.open(newline="") as fh:
+	        n = sum(1 for r in csv.DictReader(fh)
+	                if (r.get("bucket") or "").strip() == "classifiable")
+	print(n)
+	PYEOF
+)"
+
+if [ "${CLASSIFIABLE:-0}" -eq 0 ]
+then
+	log "! no classifiable clusters — skipping classify (nothing to ask)"
+	log "  every failure in this pair was auto-classified or excluded upstream."
+	log "  submit will still run so the report and coverage are written."
+	SKIPPED_CLASSIFY=true
+else
+	run_step "classify" \
+		"${PYTHON}" -m testray_analytics.analysis.classify \
+		"${BUNDLE}" --engine "${ENGINE}" || exit 2
+fi
 
 SUBMIT_ARGS=()
 [ "${SUBMIT_DRY_RUN}" == "true" ] && SUBMIT_ARGS+=("--dry-run")
@@ -250,5 +275,16 @@ SUBMIT_ARGS=()
 run_step "submit" \
 	"${PYTHON}" -m testray_analytics.analysis.submit "${BUNDLE}" \
 	"${SUBMIT_ARGS[@]}" || exit 2
+
+# Exit 3, distinct from both success and a step failure: the pipeline behaved
+# correctly but explained nothing about a build that is red. Under unattended
+# operation that has to be visible — silence is indistinguishable from success,
+# which is exactly how a real defect (PortalLogAssertorTest, build 512102) went
+# out under a green diamond. The queue runner turns this into its own status.
+if [ "${SKIPPED_CLASSIFY:-false}" == "true" ]
+then
+	log "pipeline complete WITHOUT VERDICTS: ${BUNDLE}"
+	exit 3
+fi
 
 log "pipeline complete: ${BUNDLE}"
