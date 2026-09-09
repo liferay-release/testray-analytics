@@ -103,6 +103,7 @@ Batching / cost rationale:
 
 import argparse
 import copy
+import hashlib
 import json
 import os
 import re
@@ -913,8 +914,48 @@ def classify(run_dir: Path, classifier: str, dry_run: bool,
         "cost_usd": 0,
     }
 
+    # Batches completed by an earlier invocation of this same bundle. Each
+    # `claude -p` call costs real money and minutes, so a run that dies on
+    # batch 9 of 10 must not throw away the first eight.
+    done_batches = _load_partial(run_dir)
+    if done_batches:
+        # Report what will ACTUALLY be replayed, not what the file holds. The
+        # two differ whenever the bundle was re-batched (a changed
+        # max_chars_per_batch repacks every boundary), and saying "3 completed"
+        # when none of them match the current batching reads as a promise the
+        # run then silently breaks.
+        reusable = sum(1 for b in batches
+                       if _batch_fingerprint(b) in done_batches)
+        if reusable:
+            print(f"\nResuming: {reusable} of {len(batches)} batch(es) already "
+                  f"completed in {PARTIAL_NAME} — replayed, not re-sent.")
+        else:
+            print(f"\n{PARTIAL_NAME} holds {len(done_batches)} batch(es) from an "
+                  f"earlier run, but none match the current batching "
+                  f"(max_chars_per_batch changed, or the bundle was rebuilt). "
+                  f"Re-running all {len(batches)}.")
+
     for i, batch in enumerate(batches, 1):
         total = sum(len(s.text) for s in batch)
+        fingerprint = _batch_fingerprint(batch)
+
+        if fingerprint in done_batches:
+            rows = done_batches[fingerprint]
+            print(f"\n→ batch {i}/{len(batches)}: {len(batch)} {unit} "
+                  f"— already done, replaying {len(rows)} row(s) (no call)")
+            for r in rows:
+                if _is_grouped(mode):
+                    sid = r.get("subtask_id")
+                    if isinstance(sid, int):
+                        seen_subtask_ids.add(sid)
+                    seen_case_ids.update(r.get("case_ids") or [])
+                else:
+                    cid = r.get("testray_case_id")
+                    if cid is not None:
+                        seen_ids.add(cid)
+                all_results.append(r)
+            continue
+
         print(f"\n→ batch {i}/{len(batches)}: {len(batch)} {unit} "
               f"({total:,} chars, ~{total // 4:,} tokens)")
 
@@ -929,6 +970,7 @@ def classify(run_dir: Path, classifier: str, dry_run: bool,
             api_schema=api_schema,
             mode=mode,
         )
+        batch_start_len = len(all_results)
         if engine == "claude-code":
             results, usage = call_claude_code(**common)
         else:
@@ -985,6 +1027,11 @@ def classify(run_dir: Path, classifier: str, dry_run: bool,
         for k in usage_totals:
             usage_totals[k] += usage.get(k, 0)
 
+        # Persist BEFORE the next call: this is the line that makes a failure
+        # at batch 9 cost one batch instead of nine.
+        _append_partial(run_dir, fingerprint, i,
+                        [r for r in all_results][batch_start_len:])
+
         print(f"   returned {len(results)} rows "
               f"(in={usage['input_tokens']:,}, out={usage['output_tokens']:,}, "
               f"cache_read={usage['cache_read_input_tokens']:,})")
@@ -1030,6 +1077,11 @@ def classify(run_dir: Path, classifier: str, dry_run: bool,
     out = run_dir / "results.json"
     out.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
+    # The run finished; the crash-recovery file has done its job. Removing it
+    # keeps a later deliberate re-run honest — otherwise every batch would be
+    # replayed from disk and the run would silently produce stale verdicts.
+    (run_dir / PARTIAL_NAME).unlink(missing_ok=True)
+
     print("\n" + "=" * 60)
     print(f"Wrote {_disp(out)}")
     print(f"Classified: {len(all_results)} / {len(sections)} failures")
@@ -1049,6 +1101,67 @@ def classify(run_dir: Path, classifier: str, dry_run: bool,
               "minimum, so caching did not activate.", file=sys.stderr)
     print(f"Next:       testray-analysis submit {_disp(out.parent)}")
     return out
+
+
+
+# ---------------------------------------------------------------------------
+# Partial results / resume
+# ---------------------------------------------------------------------------
+
+PARTIAL_NAME = "results.partial.jsonl"
+
+
+def _batch_fingerprint(batch) -> str:
+    """Stable id for a batch's CONTENT, not its position.
+
+    Resume keys on this rather than the batch number so that changing
+    `max_chars_per_batch` — which repacks every batch — cannot make a stored
+    result be replayed for a batch that now holds different clusters. A bundle
+    re-prepared with different data produces different section text and so
+    different fingerprints, which is the behaviour we want: no silent reuse.
+    """
+    h = hashlib.sha256()
+    for s in batch:
+        h.update(s.text.encode("utf-8", "replace"))
+        h.update(b"\x00")
+    return h.hexdigest()[:16]
+
+
+def _load_partial(run_dir) -> dict:
+    """{fingerprint: rows} for batches already completed in an earlier run.
+
+    Every line is one completed batch. A truncated final line (killed
+    mid-write) is skipped rather than fatal — the batch simply re-runs.
+    """
+    path = run_dir / PARTIAL_NAME
+    if not path.exists():
+        return {}
+    done = {}
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        fp = rec.get("fingerprint")
+        if fp:
+            done[fp] = rec.get("rows") or []
+    return done
+
+
+def _append_partial(run_dir, fingerprint: str, batch_number: int,
+                    rows: list) -> None:
+    """Append one completed batch. Flushed and fsynced: the whole point is to
+    survive a process that does not get to exit cleanly."""
+    path = run_dir / PARTIAL_NAME
+    rec = {"fingerprint": fingerprint, "batch": batch_number, "rows": rows}
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+
 
 
 def main() -> None:
