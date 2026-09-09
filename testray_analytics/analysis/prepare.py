@@ -1313,11 +1313,18 @@ def compute_test_diff(baseline: pd.DataFrame, target: pd.DataFrame,
         "status_a":               diff["status_a"],
         "status_b":               diff["status_b"],
         "transition":             diff["transition"],
-        "error_message":          diff["errors_b"],
+        # Skip notices are stripped HERE, at the one point error text enters
+        # the analysis, so pre-classification, _explainable, clustering, the
+        # prompt's shared_error and the report all see the real failure rather
+        # than "1 Skipped test ...". Rows that are nothing but skips keep their
+        # text and fall out later on their own merits.
+        "error_message":          diff["errors_b"].map(
+            error_signature.strip_skip_notice),
         # §12: for a changed failure the prompt must carry BOTH errors ("was
         # failing with X, now Y") — the reasoning is about the delta, and the
         # rubric's "baseline was clean" assumption does not hold for it.
-        "baseline_error_message": diff["errors_a"],
+        "baseline_error_message": diff["errors_a"].map(
+            error_signature.strip_skip_notice),
         "linked_issues":          diff["jira_issue_b"],
     })
 
