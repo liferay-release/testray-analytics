@@ -656,6 +656,11 @@ def main() -> None:
     ap.add_argument("--no-write", action="store_true",
                     help="Validate + summarize + render the report, but skip "
                          "building the Testray batch payload.")
+    ap.add_argument("--report-url", default=None,
+                    help="Where this report is readable. Each Jira draft's "
+                         "footer links its cluster id here. Point it at the "
+                         "published report today; at the Testray triage view "
+                         "once triage renders inside Testray.")
     ap.add_argument("--jira-parent", default=None,
                     help="Parent ticket for the report's prefilled Jira "
                          "drafts. Overrides run.yml `jira_parent` and "
@@ -846,6 +851,14 @@ def main() -> None:
     # draft would open with that field empty.
     meta = dict(meta, jira=resolve_jira_settings(
         full_cfg, meta, parent_override=getattr(args, "jira_parent", None)))
+
+    # Where a reader can open this report. Falls back to run.yml so a run can
+    # carry its own destination; absent entirely, the ticket footer still
+    # prints the cluster id, just unlinked.
+    report_url = (getattr(args, "report_url", None)
+                  or meta.get("report_url") or "")
+    if report_url:
+        meta = dict(meta, report_url=str(report_url).strip())
 
     report_path = render_run(run_dir, df, meta)
     print(f"Report:     {report_path}")

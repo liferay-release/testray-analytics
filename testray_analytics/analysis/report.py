@@ -79,8 +79,12 @@ _ERROR_MAX = 2000
 # Jira's CreateIssueDetails takes these as URL parameters, so an over-long
 # field does not truncate gracefully — it makes a URL the browser or the
 # gateway rejects, and the button silently does nothing. Cap here instead.
-_JIRA_SUMMARY_MAX = 240
+# Jira's hard limit is 255; this is a READABILITY budget. A summary is a
+# title — the reasoning lives in the description body under 'Root cause'.
+_JIRA_SUMMARY_MAX = 120
 _JIRA_DESC_MAX = 8000
+# Links listed before the cap starts costing later sections.
+_JIRA_TESTRAY_LINKS = 20
 
 _GROUP_MODES = [
     ("cluster",   "error signature (cluster)"),
@@ -1319,8 +1323,14 @@ def _header_row(mode: str, idx: int, label: str, members: pd.DataFrame,
         + _actions_menu(
             _jira_href(meta, verdict=verdict,
                        summary_text=(next(iter(reasons)) if len(reasons) == 1 else ''),
-                       rows=[members.iloc[0]] if len(members) else [],
-                       n=n),
+                       # every member, not just the first: the Testray
+                       # section lists one link per failing test
+                       rows=([members.iloc[i] for i in range(len(members))]
+                             if len(members) else []),
+                       n=n,
+                       cluster_key=(label if mode == "cluster" else ""),
+                       cluster_no=(cluster_no if cluster_no else idx + 1),
+                       anchor=f"grp-{mode}-{idx}"),
             label="Actions for this cluster",
             prompt=(_reviewer_prompt(
                         members.iloc[0], meta,
@@ -1429,7 +1439,10 @@ def _member_rows(df: pd.DataFrame, meta: dict, cluster_no: dict[str, int],
         ticket_cell = _ticket_cell([r.get("linked_issues")])
         actions_cell = _actions_menu(
             _jira_href(meta, verdict=verdict, summary_text=reason,
-                       rows=[r], n=1),
+                       rows=[r], n=1, cluster_key=ckey,
+                       cluster_no=cno,
+                       # id="grp-cluster-N" is 0-based; cno is 1-based
+                       anchor=(f"grp-cluster-{cno - 1}" if cno is not None else "")),
             prompt=(_reviewer_prompt(r, meta, tests_by_cluster.get(ckey, []))
                     if verdict in _NEEDS_HUMAN else None))
 
@@ -1461,8 +1474,113 @@ def _member_rows(df: pd.DataFrame, meta: dict, cluster_no: dict[str, int],
 
 
 
+def _short_test_name(name: str, cap: int = 45) -> str:
+    """A test identifier short enough for a ticket title.
+
+    Four shapes arrive here and each wastes the budget differently:
+      * `LocalFile.Foo#Bar`            -> the Poshi prefix carries no information
+      * `a/b/c.spec.ts > prose title`  -> Playwright appends the whole test title
+      * `com.liferay.x.y.FooTest#test` -> the package is ~40 identical chars, so
+        truncating from the left produced `com.liferay.headless.commerce.deli…`
+        for a dozen different tests — indistinguishable in a Jira list
+      * `path/to/file`                 -> only the basename identifies it
+    """
+    t = re.sub(r"^LocalFile\.", "", str(name or "").strip())
+    t = re.split(r"\s+[>\u203a]\s+", t)[0]
+    t = re.sub(r"\.spec\.(ts|js)x?$", "", t)
+    if "." in t and "/" not in t:
+        segs = t.split(".")
+        for i, seg in enumerate(segs):
+            if seg[:1].isupper():        # first class-like segment
+                t = ".".join(segs[i:])
+                break
+    t = t.rsplit("/", 1)[-1]
+    return t if len(t) <= cap else t[:cap].rstrip() + "\u2026"
+
+
+def _trim_words(text: str, cap: int) -> str:
+    """Trim on a word boundary. A raw slice produced titles ending mid-word
+    ('...clearing the multi-select ref synchron')."""
+    t = " ".join(str(text or "").split())
+    if len(t) <= cap:
+        return t
+    return t[:cap].rsplit(" ", 1)[0].rstrip(" ,;:\u2014-") + "\u2026"
+
+
+def _first_clause(text: str) -> str:
+    """The claim at the head of a reason: first sentence, first clause.
+
+    Reasons run 200-350 chars. The first sentence alone is often still a
+    compound ("...token response no longer contains 'scope', a server-side
+    misbehavior in the heavily-changed OAuth2/CXF area; the shown hunks..."),
+    so a semicolon or a comma far enough in ends it too.
+    """
+    t = " ".join(str(text or "").split())
+    t = re.split(r"(?<=[.!?])\s", t)[0].split(";")[0]
+    if len(t) > 60:
+        head = t.split(", ")[0]
+        if len(head) >= 25:
+            t = head
+    return t
+
+
+_FQN_RE = re.compile(r"\b(?:[a-z][\w]*\.){2,}([A-Z]\w*)")
+_EXC_RE = re.compile(r"^([A-Z]\w*(?:Exception|Error|Failure))\s*:\s*(.*)", re.S)
+
+
+def _error_gist(err: str, cap: int = 52) -> str:
+    """The identifying fragment of a failure, for a ticket title.
+
+    The error is what makes a ticket findable and de-duplicable — two people
+    hitting `PathNotFoundException: No results for path: $['scope']` should
+    land on the same ticket, which prose reasoning never achieves.
+
+    Four things get in the way and each is stripped:
+      * Playwright prefixes every error with `\u203a file:line \u203a test title`
+      * fully-qualified names bury the class (`com.liferay.poshi.runner.
+        exception.ElementNotFound...`, `java.lang.AssertionError`)
+      * a JSON payload often follows the message and is pure noise
+      * when the remainder is still long, an ALL_CAPS token inside it
+        (INTERNAL_SERVER_ERROR, LIFERAY_ERROR) is usually the real signal
+    """
+    e = " ".join(str(err or "").split())
+    if not e:
+        return ""
+
+    # One definition of the skip rule, in error_signature, shared with
+    # clustering — a second copy here would drift.
+    e = error_signature.strip_skip_notice(e)
+
+    if "\u203a" in e:
+        m = re.search(r"(Error:|Timed out|expect\()", e)
+        if m:
+            e = e[m.start():]
+    e = re.sub(r"^Error:\s*", "", e)
+    e = _FQN_RE.sub(r"\1", e)
+    m = _EXC_RE.match(e)
+    if m:
+        cls, msg = m.group(1), m.group(2).strip()
+        msg = msg.split("{")[0].strip(" :")
+        e = f"{cls}: {msg}" if msg else cls
+    upper = re.search(r'"?\b([A-Z][A-Z0-9_]{6,})\b"?', e)
+    if upper and len(e) > cap:
+        e = upper.group(1)
+    e = e.strip().strip('"')
+
+    # "2 Failed tests testJoinCount testJoinSelect" names WHICH tests failed but
+    # never says what went wrong, so putting it in a title reads as an error
+    # while carrying no information. Returning "" makes the caller drop the
+    # clause entirely and let the test name identify the ticket instead.
+    if re.match(r"^\d+\s+(?:failed|skipped)\s+tests?\b", e, re.IGNORECASE):
+        if not re.search(r"[:=]|Exception|Error\b|Failure", e):
+            return ""
+
+    return e if len(e) <= cap else e[:cap].rsplit(" ", 1)[0].rstrip(" ,;:") + "\u2026"
+
+
 def _jira_href(meta: dict, *, verdict: str, summary_text: str, rows: list,
-               n: int = 1) -> str:
+               n: int = 1, cluster_key: str = "", anchor: str = "",
+               cluster_no: int | None = None) -> str:
     """A prefilled Jira draft link. Opens a draft — nothing is filed.
 
     Blank `parent` / `reporter` are omitted rather than sent empty: Jira reads
@@ -1481,21 +1599,32 @@ def _jira_href(meta: dict, *, verdict: str, summary_text: str, rows: list,
             return ""
 
     build_b = _text(meta.get("build_b_name")) or _text(meta.get("build_id_b"))
-    summary = f"Investigate {n} test failure{'' if n == 1 else 's'}"
+
+    # Built from structured fields, not prose. The component is deliberately
+    # absent — it is its own Jira field, so repeating it in the title spends
+    # characters on something the form already captures.
+    # The test name identifies the ticket; a count does not. "Investigate 1
+    # test ... with '2 Failed tests...'" said nothing twice over.
+    unit = _short_test_name(_g("test_case")) if n == 1 else f"{n} tests"
+    summary = f"Investigate {unit or f'{n} tests'}"
     if build_b:
-        summary += f" in {build_b}"
-    if summary_text:
-        summary += f" — {summary_text}"
+        summary += f" failing in {build_b}"
 
-    parts = [f"h3. Root cause ({verdict or 'UNCLASSIFIED'}, {n} test"
-             f"{'' if n == 1 else 's'})", "", summary_text or "(no reasoning recorded)", ""]
+    # Append what it failed WITH only when that is an actual message — a
+    # roster of failed test names adds length without adding meaning.
+    # No fallback to the reasoning: when there is no real error message the
+    # title stops at the build. The model's prose belongs in the description,
+    # and appending it here produced titles that trailed off mid-thought.
+    gist = _error_gist(_g("error_message"))
+    if gist:
+        summary += f" with {gist}"
 
-    culprit = _g("culprit_file")
-    if culprit:
-        parts += ["h3. Culprit file", "", f"{{{{{culprit}}}}}", ""]
-        commits = _g("culprit_commits")
-        if commits:
-            parts += [f"Changed by: {commits}", ""]
+    # Order is deliberate: observed fact first, then where to see it, then the
+    # interpretation, then the guess. The previous layout opened with
+    # "h3. Root cause" over the model's reasoning, which asserted as settled
+    # fact something the verdict itself only rates POSSIBLE_BUG — a reader
+    # opening the ticket saw a conclusion before any evidence for it.
+    parts: list[str] = []
 
     err = _g("error_message")
     if err:
@@ -1510,12 +1639,101 @@ def _jira_href(meta: dict, *, verdict: str, summary_text: str, rows: list,
         parts += ["h3. Testray", "",
                   (f"{base_ui}#/{link}" if base_ui else link), ""]
     else:
-        url = _case_url(meta, first.get("caseresult_id") if hasattr(first, "get") else None)
-        if url:
-            parts += ["h3. Testray", "", url, ""]
+        # One line per member, not just rows[0]: a cluster's whole point is
+        # that several tests failed together, and a reviewer needs to reach
+        # each result. Jira link syntax is [label|url].
+        links = []
+        for row in rows or []:
+            if not hasattr(row, "get"):
+                continue
+            url = _case_url(meta, row.get("caseresult_id"))
+            if not url:
+                continue
+            label = _text(row.get("test_case")) or _text(row.get("caseresult_id"))
+            links.append(f"* [{_trim_words(label, 110)}|{url}]")
+        if links:
+            # A 36-member cluster produces 6.5 KB of links and pushed
+            # "Possible causes" and the provenance footer past
+            # _JIRA_DESC_MAX, so 20 tickets silently lost their footer. Cap the
+            # list and say what was dropped — the reader can reach the rest
+            # from any of the linked results.
+            shown, extra = links[:_JIRA_TESTRAY_LINKS], len(links) - _JIRA_TESTRAY_LINKS
+            parts += ["h3. Testray", ""] + shown
+            if extra > 0:
+                parts += [f"* … and {extra} more failing test"
+                          f"{'' if extra == 1 else 's'} in this cluster"]
+            parts += [""]
 
-    parts += ["h3. Claude reasoning", "",
-              f"Classifier: {_text(meta.get('classifier'))}",
+    parts += [f"h3. Claude reasoning ({verdict or 'UNCLASSIFIED'}, {n} test"
+              f"{'' if n == 1 else 's'})", "",
+              summary_text or "(no reasoning recorded)", ""]
+
+    # "Possible cause", not "Culprit file": this is the classifier's candidate,
+    # not an established fact, and the heading should not outrank the verdict.
+    culprit  = _g("culprit_file")
+    commits  = _g("culprit_commits")
+    cause_lines: list[str] = []
+    if culprit:
+        cause_lines.append(f"{{{{{culprit}}}}}")
+    if commits:
+        # `LPD-102093 (95355cb, 92ac804) · LPD-102128 (aed3409)` -> one line per
+        # ticket with each sha linked to the commit, so a reviewer can open the
+        # change instead of copying a hash into a search box.
+        default_slug = _repo_slug(meta)
+        for ticket, shas in re.findall(r"([A-Z][A-Z0-9]+-\d+)\s*\(([^)]+)\)", commits):
+            refs = []
+            for raw in (x.strip() for x in shas.split(",")):
+                if not raw:
+                    continue
+                # `annotate_culprit_commits` emits `owner/repo@sha` once a
+                # repo_slug is known, and a bare sha otherwise. Splitting keeps
+                # Stable's brianchandotcom links pointing at the control repo
+                # instead of silently rewriting them to the default.
+                slug, _, sha = raw.rpartition("@")
+                slug = slug or default_slug
+                sha = sha or raw
+                refs.append(f"[{sha[:9]}|https://github.com/{slug}/commit/{sha}]")
+            cause_lines.append(f"{ticket} " + " ".join(refs) if refs else ticket)
+        if not cause_lines or not re.search(r"[A-Z][A-Z0-9]+-\d+", commits):
+            cause_lines.append(commits)
+    if cause_lines:
+        heading = "h3. Possible causes" if len(cause_lines) > 1 else "h3. Possible cause"
+        parts += [heading, ""] + cause_lines + [""]
+
+    # Provenance last: which classifier and which run produced this draft. It
+    # is what you check when a verdict looks wrong, not what you read first,
+    # so it sits under the content rather than interrupting it.
+    parts += ["----"]
+    if cluster_key:
+        # The clusterKey is the stable identity of this failure group — it is
+        # what Testray stores and what the ledger re-attributes against, so a
+        # ticket carrying it can always be traced back to the analysis that
+        # produced it, long after this report is gone.
+        #
+        # `report_url` is per-run on purpose. Today it points at wherever this
+        # report was published; once triage renders inside Testray it should
+        # point there instead, and that is a flag change, not a code change.
+        # NOT `base` — that name already holds the Jira origin used to build
+        # the link this function returns. Shadowing it pointed every "Create
+        # Jira Ticket" button at the report instead of Jira.
+        # NOT `base` — that name already holds the Jira origin used to build
+        # the link this function returns.
+        report_base = _text(meta.get("report_url"))
+        # Point the reader at the row's "Copy prompt" action: the ticket should
+        # say how to verify the claim, not just where it came from. The label is
+        # the number printed on the row (1-based), while the anchor is 0-based.
+        nth = f"Cluster {cluster_no}" if cluster_no else "the cluster"
+        if report_base:
+            target = f"{report_base}#{anchor}" if anchor else report_base
+            parts.append(f"Cluster: Copy prompt from [{nth}|{target}] "
+                         f"for local verification")
+        else:
+            # No report to link: the clusterKey is then the only durable
+            # identity the ticket carries, so print it rather than a bare
+            # ordinal that means nothing outside one render.
+            parts.append(f"Cluster: {cluster_key}"
+                         + (f" ({nth})" if cluster_no else ""))
+    parts += [f"Classifier: {_text(meta.get('classifier'))}",
               f"Run: {_text(meta.get('run_id'))}"]
 
     description = "\n".join(parts)[:_JIRA_DESC_MAX]
