@@ -147,7 +147,6 @@ GIT_DIFF_EXCLUDES = [
 # filtered) and the commit list, not from `git_diff_full.diff`, which is only a
 # fallback the model consults when hunks look too narrow.
 
-
 # Commit subjects matching these patterns are bot-generated module-version
 # bumps (artifact:ignore X Y.Z.W ...) or per-module "prep next" tags. They
 # pollute the cluster section without being plausible root-cause candidates.
@@ -2347,6 +2346,33 @@ def fetch_commit_details(git_repo: Path, hash_a: str, hash_b: str) -> list[dict]
 
 _TICKET_RE = re.compile(r"^([A-Z][A-Z0-9]+-\d+)\b")
 
+# `Revert "LPD-92565 ..."`, possibly nested (`Revert "Revert "..."`).
+_REVERT_PREFIX_RE = re.compile(r'^Revert\s+"')
+
+
+def subject_ticket(subject: str) -> str | None:
+    """Ticket key for a commit subject, seeing through `Revert "..."` wrappers.
+
+    A start-anchored match alone drops reverts, which is wrong for the routines
+    that matter most: a revert is a prime Stable culprit. Build 509462694 was
+    caused by `Revert "LPD-92565 ..."` and LPD-92565 never reached
+    `tickets_in_range.txt`, so nothing downstream could link the failure to the
+    ticket whose revert caused it.
+
+    Merges and `Bump ...` subjects still yield nothing, which is the behaviour
+    the original anchoring was there to get.
+    """
+    text = (subject or "").strip()
+    for _ in range(3):                      # tolerate nested reverts
+        m = _TICKET_RE.match(text)
+        if m:
+            return m.group(1)
+        stripped = _REVERT_PREFIX_RE.sub("", text, count=1)
+        if stripped == text:
+            return None
+        text = stripped.strip()
+    return None
+
 
 def collect_tickets_in_range(git_repo: Path, hash_a: str, hash_b: str
                              ) -> list[str]:
@@ -2364,9 +2390,9 @@ def collect_tickets_in_range(git_repo: Path, hash_a: str, hash_b: str
     """
     seen: list[str] = []
     for _short, subject in fetch_commits_in_range(git_repo, hash_a, hash_b):
-        m = _TICKET_RE.match(subject.strip())
-        if m and m.group(1) not in seen:
-            seen.append(m.group(1))
+        key = subject_ticket(subject)
+        if key and key not in seen:
+            seen.append(key)
     return seen
 
 
@@ -2397,8 +2423,7 @@ def commits_touching_file(git_repo: Path, hash_a: str, hash_b: str,
         if "\t" not in line:
             continue
         short, subject = line.split("\t", 1)
-        m = _TICKET_RE.match(subject.strip())
-        rows.append((short, m.group(1) if m else "", subject.strip()))
+        rows.append((short, subject_ticket(subject) or "", subject.strip()))
     return rows
 
 
