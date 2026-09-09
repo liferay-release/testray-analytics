@@ -21,12 +21,33 @@ from pathlib import Path
 _CONFIG_DIRS = ("config", "configs")
 
 
+# Files that mark a directory as THE config dir even when config.yml is absent.
+# A fresh clone has no config.yml — it is gitignored — but it does carry
+# `config.yml.example` and `module_component_map.csv`, and the component
+# lookup needs that CSV whether or not anyone wrote a config.
+_CONFIG_DIR_MARKERS = ("config.yml", "config.yml.example",
+                       "module_component_map.csv")
+
+
 @lru_cache(maxsize=1)
-def find_config_file() -> Path:
-    """Absolute path to config.yml. Raises FileNotFoundError if none found."""
+def locate_config_file() -> Path | None:
+    """The config file, or None when there is no config at all.
+
+    None is a supported state, not a failure: a Jenkins job can supply every
+    setting through the environment, and requiring a file there would mean
+    committing one or provisioning a secret file for values that are not
+    secret. `load_config` decides what is genuinely required.
+    """
     override = os.environ.get("TRIAGE_CONFIG")
     if override:
-        return Path(override).expanduser().resolve()
+        path = Path(override).expanduser().resolve()
+        if not path.exists():
+            # An explicit override that does not exist is a mistake, not an
+            # invitation to fall back — silently ignoring it would point the
+            # run at whatever config happened to be lying around.
+            raise FileNotFoundError(
+                f"$TRIAGE_CONFIG points at {path}, which does not exist.")
+        return path
 
     here = Path(__file__).resolve()
     for parent in here.parents:
@@ -34,17 +55,46 @@ def find_config_file() -> Path:
             candidate = parent / d / "config.yml"
             if candidate.exists():
                 return candidate
+    return None
+
+
+def find_config_file() -> Path:
+    """Absolute path to config.yml. Raises FileNotFoundError if none found.
+
+    Kept for callers that genuinely cannot proceed without a file.
+    """
+    path = locate_config_file()
+    if path is None:
+        raise FileNotFoundError(
+            "config.yml not found. Looked for config/config.yml or "
+            "configs/config.yml walking up from this package. "
+            "Set $TRIAGE_CONFIG to point at it explicitly."
+        )
+    return path
+
+
+@lru_cache(maxsize=1)
+def config_dir() -> Path:
+    """Directory holding config.yml — also where module_component_map.csv lives.
+
+    Resolved by MARKER rather than by config.yml alone, so the component map is
+    still found on an env-configured run with no config file.
+    """
+    path = locate_config_file()
+    if path is not None:
+        return path.parent
+
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        for d in _CONFIG_DIRS:
+            candidate = parent / d
+            if candidate.is_dir() and any((candidate / m).exists()
+                                          for m in _CONFIG_DIR_MARKERS):
+                return candidate
 
     raise FileNotFoundError(
-        "config.yml not found. Looked for config/config.yml or "
-        "configs/config.yml walking up from this package. "
-        "Set $TRIAGE_CONFIG to point at it explicitly."
-    )
-
-
-def config_dir() -> Path:
-    """Directory holding config.yml — also where module_component_map.csv lives."""
-    return find_config_file().parent
+        "No config directory found. Looked for config/ or configs/ carrying "
+        f"one of {', '.join(_CONFIG_DIR_MARKERS)}.")
 
 
 def project_root() -> Path:

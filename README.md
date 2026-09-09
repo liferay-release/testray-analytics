@@ -47,6 +47,17 @@ testray-analysis scan  --once            # queue what is unexplained, spend noth
 testray-analysis watch --classify        # drain the queue through the pipeline
 ```
 
+On CI, both steps plus their preflight checks and a lock are wrapped in
+**`scripts/triage_jenkins.sh`** — that script is the whole Jenkins build step,
+and **[JENKINS-SETUP.md](JENKINS-SETUP.md)** is the job configuration, the
+one-off agent setup and the troubleshooting:
+
+```bash
+./scripts/triage_jenkins.sh               # scan, then drain with --classify
+./scripts/triage_jenkins.sh --no-classify # free: proves the wiring on a new instance
+./scripts/triage_jenkins.sh --check       # preflight only, no network
+```
+
 `scan` queues a build when it is `importStatus` DONE, has at least one FAILED
 case result, and carries a failure signature Testray has no verdict for.
 Routines opt in via `triage.scan.routines` in config; cadence belongs to the

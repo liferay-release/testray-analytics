@@ -4,10 +4,32 @@
 # Same code runs local / UAT / prod — only this config differs
 # (ARCHITECTURE.md decision #5): base_url + per-env credentials.
 #
-# base_url and the Testray secrets can also come from the ENVIRONMENT, which
-# overrides the values here — TESTRAY_BASE_URL / TESTRAY_CLIENT_ID /
-# TESTRAY_CLIENT_SECRET (keep them in your shell / Jenkins credentials and leave
-# the fields below blank). ANTHROPIC_API_KEY is env-only.
+# THIS FILE IS OPTIONAL. Every setting an unattended run needs can come from
+# the ENVIRONMENT instead, which is how a CI job is meant to be configured —
+# its checkout has no config.yml, because config.yml is gitignored. The
+# environment always wins over the file, and every variable that supplied a
+# value is named in the run's own output (see `testray_target`).
+#
+#   TESTRAY_BASE_URL         testray.base_url
+#   TESTRAY_CLIENT_ID        testray.client_id       (secret)
+#   TESTRAY_CLIENT_SECRET    testray.client_secret   (secret)
+#   TESTRAY_UI_URL           testray.ui_url
+#   TRIAGE_REPO_PATH         git.repo_path
+#   TRIAGE_ROUTINE_REMOTES   git.routine_remotes     `79529=bchan,590307=upstream`
+#   TRIAGE_SCAN_ROUTINES     triage.scan.routines    `79529` or `79529,590307`
+#   TRIAGE_CONFIG            path to this file (a missing path is an error,
+#                            never a fallback)
+#   TRIAGE_QUEUE             queue.path — put it OUTSIDE a CI workspace, or a
+#                            wiped workspace re-queues work already analysed
+#   TRIAGE_LOG_DIR           where triage_pipeline.sh writes per-step logs
+#   ANTHROPIC_API_KEY        env-only, and read ONLY by `classify --engine api`
+#                            (the claude-code engine scrubs it deliberately)
+#
+# What has no environment form: auto_classify_patterns, excluded_components and
+# the classifier block. Those fall back to code defaults, and the default
+# max_chars_per_batch is 400_000 — measured too large for release-size runs
+# (see the note in the classifier block below), so a job that triages wide
+# ranges wants a file rather than pure environment.
 
 git:
   # Persistent liferay-portal checkout (ARCHITECTURE.md §2 / §14). `prepare`

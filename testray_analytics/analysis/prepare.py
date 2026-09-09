@@ -50,7 +50,7 @@ import yaml
 
 from . import prompt_helpers
 from . import error_signature
-from .config import find_config_file
+from .config import find_config_file, locate_config_file
 
 TRIAGE_DIR   = Path(__file__).resolve().parent
 # Run bundles default to ./runs (cwd-relative), NOT inside the installed
@@ -183,27 +183,81 @@ class SideSpec:
 _ENV_OVERRIDES: list[str] = []
 
 
+def _routine_map(raw: str) -> dict:
+    """`79529=bchan,590307=upstream` -> {79529: "bchan", 590307: "upstream"}.
+
+    A flat string because Jenkins bindings are flat strings, while the same
+    setting in config.yml is a nested map. Both have to produce one shape.
+    """
+    out = {}
+    for pair in raw.split(","):
+        key, _, value = pair.partition("=")
+        key, value = key.strip(), value.strip()
+        if key and value:
+            out[int(key) if key.isdigit() else key] = value
+    return out
+
+
+# Settings a CI job can supply with no config file at all. Only the leaves an
+# unattended run genuinely needs are here: this is not a second configuration
+# language, it is the set that has to survive a fresh checkout, where
+# config.yml is gitignored and therefore absent.
+_ENV_SETTINGS = (
+    ("testray", "base_url",        "TESTRAY_BASE_URL",       str),
+    ("testray", "client_id",       "TESTRAY_CLIENT_ID",      str),
+    ("testray", "client_secret",   "TESTRAY_CLIENT_SECRET",  str),
+    ("testray", "ui_url",          "TESTRAY_UI_URL",         str),
+    ("git",     "repo_path",       "TRIAGE_REPO_PATH",       str),
+    ("git",     "routine_remotes", "TRIAGE_ROUTINE_REMOTES", _routine_map),
+)
+
+
 def load_config() -> dict:
-    """Read config.yml, then let TESTRAY_* environment variables override the
-    Testray connection settings (secrets can live in the shell or in Jenkins
-    credentials rather than the file — decision #5).
+    """Read config.yml if there is one, then let the environment override it.
 
     The override lives here, not in prepare(), so that EVERY command resolves
     the same way. When only prepare() applied it, a stale TESTRAY_CLIENT_ID in
     a shell pointed the read half at one instance while submit kept writing to
-    whatever config.yml said — silently, since nothing printed the target."""
-    global _ENV_OVERRIDES
-    with open(find_config_file()) as f:
-        cfg = yaml.safe_load(f)
+    whatever config.yml said — silently, since nothing printed the target.
 
-    tr = cfg.setdefault("testray", {})
+    **The file is optional.** A CI checkout has no config.yml — it is
+    gitignored — and what a job needs is either a secret, which belongs in the
+    job's credential bindings rather than a file, or a path. So "no file, full
+    environment" is a supported configuration; `testray_target()` names every
+    variable that supplied a value, so the run still says where it pointed.
+    """
+    global _ENV_OVERRIDES
+    path = locate_config_file()
+    cfg = {}
+    if path is not None:
+        with open(path) as f:
+            cfg = yaml.safe_load(f) or {}
+
     _ENV_OVERRIDES = []
-    for _key, _env in (("base_url", "TESTRAY_BASE_URL"),
-                       ("client_id", "TESTRAY_CLIENT_ID"),
-                       ("client_secret", "TESTRAY_CLIENT_SECRET")):
-        if os.environ.get(_env):
-            tr[_key] = os.environ[_env]
+    for _section, _key, _env, _parse in _ENV_SETTINGS:
+        raw = os.environ.get(_env)
+        if raw:
+            cfg.setdefault(_section, {})[_key] = _parse(raw)
             _ENV_OVERRIDES.append(_env)
+
+    # Scan routines sit two levels down, so they do not fit the table above.
+    raw_routines = os.environ.get("TRIAGE_SCAN_ROUTINES")
+    if raw_routines:
+        ids = [int(r) for r in raw_routines.replace(" ", "").split(",") if r]
+        cfg.setdefault("triage", {}).setdefault("scan", {})["routines"] = ids
+        _ENV_OVERRIDES.append("TRIAGE_SCAN_ROUTINES")
+
+    cfg.setdefault("testray", {})
+
+    # Neither source said anything. Failing here names both ways out; the old
+    # behaviour was a bare FileNotFoundError on config.yml, which sent a CI
+    # operator looking for a file they were deliberately not going to have.
+    if path is None and not _ENV_OVERRIDES:
+        raise FileNotFoundError(
+            "No config.yml found and no TESTRAY_* / TRIAGE_* settings in the "
+            "environment. Either write config/config.yml (see "
+            "config/config.yml.example) or set TESTRAY_BASE_URL, "
+            "TESTRAY_CLIENT_ID, TESTRAY_CLIENT_SECRET and TRIAGE_REPO_PATH.")
     return cfg
 
 
