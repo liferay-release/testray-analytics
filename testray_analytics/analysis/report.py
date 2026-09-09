@@ -1376,7 +1376,7 @@ def _member_rows(df: pd.DataFrame, meta: dict, cluster_no: dict[str, int],
         # not on screen.
         def _collapsible(full_html: str, raw: str) -> str:
             return (f'<span class="same-as-cluster" title="{_esc(raw)}">'
-                    f'<a href="#grp-cluster-{cno}">&uarr;</a></span>'
+                    f'<a href="#grp-cluster-{cno - 1}">&uarr;</a></span>'
                     f'<span class="own-value">{full_html}</span>')
         if cno is not None and _shared_in_cluster(shared, ckey, "reason", reason):
             reason_cell = _collapsible(_esc(reason) or "—", reason)
