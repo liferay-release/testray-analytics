@@ -299,7 +299,8 @@ def load_api_config() -> dict:
             cfg = (yaml.safe_load(f) or {}).get("triage") or {}
     api_cfg = (cfg.get("classifier") or {}).get("api") or {}
 
-    # The cap is read from the environment first so a CI job can lower it
+    # The cap is read from the environment first so the release-master job can
+    # lower it
     # without a config change, and a human can raise it deliberately for one
     # command.
     cap = os.environ.get("TRIAGE_MAX_COST_USD")

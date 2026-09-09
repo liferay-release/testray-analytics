@@ -4,7 +4,7 @@ Read this before answering questions about this repo or running anything in it.
 
 ## What this tool does
 
-Testray records the result of every test in every CI build. When a build is red,
+Testray records the result of every test in every build. When a build is red,
 someone has to work out *why*. This tool does that first pass automatically:
 
 1. It compares two builds of the same routine — an older one that was fine, and
@@ -17,6 +17,12 @@ someone has to work out *why*. This tool does that first pass automatically:
 
 It never edits product code and never opens a pull request. It explains; people
 fix.
+
+**The Release Tools team owns and runs this.** It is scheduled on
+**release-master**, not by a central CI group, so "who do I ask about the job"
+and "who do I ask about the tool" have the same answer. Where the docs say CI,
+they mean the system that produced the test builds Testray recorded — never the
+owner of this pipeline.
 
 **Plain-language vocabulary is in [docs/GLOSSARY.md](docs/GLOSSARY.md).** If a
 reader is new to this tool, start there rather than in ARCHITECTURE.md.
@@ -43,8 +49,8 @@ this, and a person can call it directly:
 | Command | What it does |
 |---|---|
 | `prepare` | reads two builds, groups the failures into clusters, computes the git diff between the two commits |
-| `classify` | asks a Claude model for a verdict per cluster — **the step that costs money** |
-| `submit` | validates the verdicts, renders the HTML report, writes the verdicts back to Testray, writes the Slack message |
+| `classify` | asks a Claude model for a verdict per cluster; this can be via Claude Code subscription or Anthropic API — **the step that costs money** |
+| `submit` | validates the verdicts, renders the HTML report, writes the verdicts back to Testray, writes the Slack message for Stable failures|
 
 Those two scripts are the single definition of their sequences. Jenkins, `watch`
 and humans all call them, so never re-implement the order somewhere else.
@@ -65,8 +71,8 @@ sends anything and refuses to start if the projection is over the limit, naming
 the figure and telling the reader to fork the repo and run it locally if they
 want to spend more. It also stops between batches if measured spend crosses the
 limit, keeping the verdicts already paid for. Raise it deliberately with
-`TRIAGE_MAX_COST_USD=<n>`; lower it in CI the same way. Never raise it to get a
-run through without saying so.
+`TRIAGE_MAX_COST_USD=<n>`; the release-master job can lower it the same way.
+Never raise it to get a run through without saying so.
 
 **Always run `preflight` first against an instance you have not used before.** It
 tells the difference between "the client extension is not deployed" (404, fine,
@@ -78,9 +84,9 @@ are gitignored. Credentials belong in the environment:
 `TESTRAY_CLIENT_ID`, `TESTRAY_CLIENT_SECRET`, `ANTHROPIC_API_KEY`. If someone
 asks where to put a key, point them at the environment, never at a config file.
 
-**A config file is optional.** Every setting a CI run needs has an environment
-variable; the table is at the top of `config/config.yml.example`. The
-environment always wins over the file.
+**A config file is optional.** Every setting a release-master run needs has an
+environment variable; the table is at the top of `config/config.yml.example`.
+The environment always wins over the file.
 
 **Routine ids mean different things and must not be mixed up.**
 
@@ -88,7 +94,8 @@ environment always wins over the file.
 |---|---|---|
 | 79529 | Stable (`ci:test:stable`) — the control repo, every commit merges here first | `brianchandotcom/liferay-portal` |
 | 590307 | Acceptance | `liferay/liferay-portal` |
-| 82964 | Release | `liferay/liferay-portal-ee` |
+| 336020509 | ci:test:cms | `liferay/liferay-portal` |
+| 82964 | EE Package Tester (7.4 Release tester) | `liferay/liferay-portal` |
 
 `git.routine_remotes` maps a routine id to a **git remote name inside the local
 checkout** — not a URL. If it is wrong, nothing errors: every commit link falls

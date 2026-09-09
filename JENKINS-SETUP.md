@@ -228,8 +228,8 @@ $15; `classify` estimates before it sends and refuses to start above that,
 and stops between batches if measured spend crosses it. Nothing was charged for
 a refused run. If that build genuinely needs analysing, fork the repo and run it
 locally with `TRIAGE_MAX_COST_USD=<higher>` — a decision someone makes on
-purpose, rather than a limit CI quietly raises. To make the run cheaper instead,
-triage a narrower build pair.
+purpose, rather than a limit the job quietly raises. To make the run cheaper
+instead, triage a narrower build pair.
 
 ---
 

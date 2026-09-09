@@ -198,7 +198,8 @@ def _routine_map(raw: str) -> dict:
     return out
 
 
-# Settings a CI job can supply with no config file at all. Only the leaves an
+# Settings the release-master job can supply with no config file at all. Only
+# the leaves an
 # unattended run genuinely needs are here: this is not a second configuration
 # language, it is the set that has to survive a fresh checkout, where
 # config.yml is gitignored and therefore absent.
@@ -220,7 +221,7 @@ def load_config() -> dict:
     a shell pointed the read half at one instance while submit kept writing to
     whatever config.yml said — silently, since nothing printed the target.
 
-    **The file is optional.** A CI checkout has no config.yml — it is
+    **The file is optional.** The release-master checkout has no config.yml — it is
     gitignored — and what a job needs is either a secret, which belongs in the
     job's credential bindings rather than a file, or a path. So "no file, full
     environment" is a supported configuration; `testray_target()` names every
@@ -250,7 +251,7 @@ def load_config() -> dict:
     cfg.setdefault("testray", {})
 
     # Neither source said anything. Failing here names both ways out; the old
-    # behaviour was a bare FileNotFoundError on config.yml, which sent a CI
+    # behaviour was a bare FileNotFoundError on config.yml, which sent an
     # operator looking for a file they were deliberately not going to have.
     if path is None and not _ENV_OVERRIDES:
         raise FileNotFoundError(

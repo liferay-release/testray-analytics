@@ -62,8 +62,8 @@ testray-analysis scan  --once            # queue what is unexplained, spend noth
 testray-analysis watch --classify        # drain the queue through the pipeline
 ```
 
-On CI, both steps plus their preflight checks and a lock are wrapped in
-**`scripts/triage_jenkins.sh`** — that script is the entry point on
+On release-master, both steps plus their preflight checks and a lock are wrapped
+in **`scripts/triage_jenkins.sh`** — that script is the entry point on
 release-master,
 and **[JENKINS-SETUP.md](JENKINS-SETUP.md)** is the job configuration, the
 one-off agent setup and the troubleshooting:

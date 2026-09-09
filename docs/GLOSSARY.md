@@ -8,8 +8,8 @@ documentation becomes much shorter.
 ## Testray words
 
 **Routine**
-A repeating group of CI builds. `ci:test:stable` is one routine. Each routine has
-a number. Ours: **79529** is Stable, **590307** is Acceptance, **82964** is
+A repeating group of test builds. `ci:test:stable` is one routine. Each routine
+has a number. Ours: **79529** is Stable, **590307** is Acceptance, **82964** is
 Release.
 
 **Build**
@@ -21,9 +21,9 @@ The result of one test in one build: passed, failed, blocked, or not run. A
 Stable build has a few hundred of them; a Release build has a few thousand.
 
 **Import status**
-Testray does not receive results the moment CI finishes. It imports them. The
-tool only looks at builds whose import status is `DONE`, because a build still
-importing has an incomplete list of failures.
+Testray does not receive results the moment the tests finish. It imports them.
+The tool only looks at builds whose import status is `DONE`, because a build
+still importing has an incomplete list of failures.
 
 **Object**
 Liferay's name for a custom database table with a REST endpoint. This tool adds
@@ -119,8 +119,8 @@ Where waiting work sits. Two possible places, chosen automatically:
   queued or failed run is invisible outside the logs.
 
 **Tick**
-One pass of the CI job: scan once, drain once. Jenkins runs a tick every 30
-minutes.
+One pass of the release-master job: scan once, drain once. It runs a tick every
+30 minutes.
 
 **Dry run**
 A run that does everything except spend money. `classify --dry-run` reports what
@@ -138,6 +138,7 @@ skipped, and a build pair that has already been analysed is skipped.
 **Engine**
 Which service answers the classification.
 
-- `api` — the Anthropic API. Bills per token. This is what CI uses.
+- `api` — the Anthropic API. Bills per token. This is what the release-master
+  job uses.
 - `claude-code` — the `claude` command-line tool, using a subscription instead of
   an API key. Needs the CLI installed and logged in.

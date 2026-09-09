@@ -51,7 +51,8 @@ export TESTRAY_UI_URL="${TESTRAY_UI_URL:-https://testray.liferay.com/web/testray
 
 # The credential guard in triage_pipeline.sh refuses env-supplied secrets,
 # because a stale TESTRAY_CLIENT_ID in a shell silently redirects the read half
-# of a run. On CI they are supplied deliberately, which is what this says.
+# of a run. On release-master they are supplied deliberately, which is what
+# this says.
 export TRIAGE_ALLOW_ENV_CREDENTIALS=1
 
 function print_help {
