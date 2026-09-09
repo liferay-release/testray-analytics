@@ -136,7 +136,7 @@ except ImportError:
     raise SystemExit(1)
 
 
-from .config import find_config_file
+from .config import find_config_file, locate_config_file
 
 TRIAGE_DIR  = Path(__file__).resolve().parent
 
@@ -158,16 +158,165 @@ DEFAULT_CLASSIFIER = "agent:claude-opus-4-8"
 # Config
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Cost cap
+# ---------------------------------------------------------------------------
+#
+# One triage run must not be able to spend an unbounded amount. The scanner
+# queues work unattended and a wide build pair can carry hundreds of clusters,
+# so the size of a run is not something anybody approves before it happens.
+#
+# Two guards, because an estimate is only an estimate:
+#
+#   before the first call   refuse if the projected cost is over the cap
+#   between batches         stop if the ACTUAL spend has crossed it
+#
+# The second one is what protects against a bad estimate. Batches already
+# completed keep their verdicts — they are journalled to results.partial.jsonl
+# — so stopping costs nothing that was already paid for.
+
+DEFAULT_MAX_COST_USD = 15.0
+
+# USD per million tokens, first-party Anthropic API rates. Cache reads are
+# ~0.1x input and cache writes ~1.25x, which matters here because the shared
+# header is cached: only the first batch pays full price for it.
+MODEL_PRICES = {
+    "claude-fable-5-1": (10.00, 50.00),
+    "claude-fable-5":   (10.00, 50.00),
+    "claude-opus-5":    (5.00, 25.00),
+    "claude-opus-4-8":  (5.00, 25.00),
+    "claude-opus-4-7":  (5.00, 25.00),
+    "claude-opus-4-6":  (5.00, 25.00),
+    "claude-sonnet-5":  (2.00, 10.00),
+    "claude-sonnet-4-6": (3.00, 15.00),
+    "claude-haiku-4-5": (1.00, 5.00),
+}
+CACHE_READ_MULTIPLIER = 0.1
+
+# Unknown model: price it as the most expensive tier we know. A cap that
+# under-estimates an unrecognised model is not a cap.
+_FALLBACK_PRICE = (10.00, 50.00)
+
+# The tokens-from-characters convention used throughout this module.
+CHARS_PER_TOKEN = 4
+
+
+def model_price(model: str) -> tuple[float, float]:
+    """(input, output) USD per million tokens, and never zero for an unknown."""
+    return MODEL_PRICES.get((model or "").strip(), _FALLBACK_PRICE)
+
+
+def cost_of(model: str, *, input_tokens: int = 0, output_tokens: int = 0,
+            cache_read_tokens: int = 0) -> float:
+    """USD for a token count on one model."""
+    price_in, price_out = model_price(model)
+    return (input_tokens / 1e6 * price_in
+            + cache_read_tokens / 1e6 * price_in * CACHE_READ_MULTIPLIER
+            + output_tokens / 1e6 * price_out)
+
+
+# Measured, not derived: $4.91 per MB of prompt actually sent, from the one run
+# with a known invoice — 21 calls, 40.72 MB sent, $200 billed (release routine
+# 82964, bundle r_20260904T220132Z, Opus at effort=xhigh).
+#
+# This replaces a token-arithmetic estimate that put the same run at $6.61 —
+# wrong by 30x, for two reasons worth keeping in mind before anyone "improves"
+# this function:
+#
+#   1. THE HEADER IS SENT WITH EVERY BATCH, and it is almost all of the bytes.
+#      That run's header was 1.87 MB; 21 calls x 1.87 MB is 96% of the 40.72 MB.
+#      Pricing it once and assuming cache reads for the rest — which is what
+#      the docs suggest and what the old code did — understates the bill by an
+#      order of magnitude at this scale.
+#   2. BATCH COUNT IS A CONFIG DECISION, and a smaller max_chars_per_batch
+#      makes a run MORE expensive, not less: fewer clusters per call, same
+#      header on each. config.prod.yml's 160,000 gave 21 calls where the
+#      400,000 default would have given 9.
+#
+# Anything measured in tokens is a floor here. Bytes-actually-sent is the
+# quantity that tracked the invoice, and it is also what the $8/MB
+# subscription-equivalent law in the cost notes measures — that figure is for
+# `claude -p`, this one is for the API.
+USD_PER_MB_SENT = 4.91
+
+_BYTES_PER_MB = 1024 * 1024
+
+
+def bytes_sent(batches, header_chars: int, instruction_chars: int) -> int:
+    """Total prompt bytes this run would put on the wire.
+
+    Every call carries the shared header and the instructions again. That
+    repetition is the cost model, so it is the arithmetic here.
+    """
+    if not batches:
+        return 0
+    per_call_fixed = header_chars + instruction_chars
+    bodies = sum(sum(len(s.text) for s in b) for b in batches)
+    return per_call_fixed * len(batches) + bodies
+
+
+def estimate_cost(batches, header_chars: int, instruction_chars: int,
+                  cfg: dict) -> float:
+    """What this run would cost, before any of it is sent.
+
+    Priced from bytes on the wire at a rate measured against a real invoice.
+    An estimate is still an estimate — the mid-run guard on measured spend is
+    what actually holds the line — but this one is within the right order of
+    magnitude, which the previous one was not.
+    """
+    if not batches:
+        return 0.0
+
+    rate = float(cfg.get("usd_per_mb_sent") or USD_PER_MB_SENT)
+    return bytes_sent(batches, header_chars, instruction_chars) / _BYTES_PER_MB * rate
+
+
+def over_cap_message(estimate: float, cap: float, bundle: str = "<bundle>") -> str:
+    """The refusal. Says the number, the limit, and what to do instead."""
+    return (
+        f"This analysis would cost about ${estimate:,.2f}, which is over the "
+        f"${cap:,.2f} limit set per triage run. Nothing was sent.\n"
+        f"\n"
+        f"  This limit exists because triage runs unattended: a wide build "
+        f"pair can carry hundreds of clusters, and nobody approves the size "
+        f"of a run before it happens.\n"
+        f"\n"
+        f"  To analyse this run anyway, fork the repo and run it locally, "
+        f"where raising the limit is a decision someone makes on purpose:\n"
+        f"      TRIAGE_MAX_COST_USD=<higher limit> \\\n"
+        f"          testray-analysis classify {bundle}\n"
+        f"\n"
+        f"  Or make the run smaller — triage a narrower build pair, or lower "
+        f"max_chars_per_batch so fewer clusters are packed per call."
+    )
+
+
 def load_api_config() -> dict:
-    with open(find_config_file()) as f:
-        cfg = (yaml.safe_load(f) or {}).get("triage", {})
+    cfg = {}
+    path = locate_config_file()
+    if path is not None:
+        with open(path) as f:
+            cfg = (yaml.safe_load(f) or {}).get("triage") or {}
     api_cfg = (cfg.get("classifier") or {}).get("api") or {}
+
+    # The cap is read from the environment first so a CI job can lower it
+    # without a config change, and a human can raise it deliberately for one
+    # command.
+    cap = os.environ.get("TRIAGE_MAX_COST_USD")
+    if cap is None:
+        cap = (cfg.get("classifier") or {}).get("max_cost_usd",
+                                               DEFAULT_MAX_COST_USD)
+
     return {
         "model":              api_cfg.get("model", "claude-opus-4-8"),
         "effort":             api_cfg.get("effort", "xhigh"),
         "max_chars_per_batch": int(api_cfg.get("max_chars_per_batch", 400_000)),
         "max_output_tokens":   int(api_cfg.get("max_output_tokens", 16_000)),
         "delay_between":       float(api_cfg.get("delay_between_batches_seconds", 2)),
+        "max_cost_usd":        float(cap),
+        # Overridable so a re-measurement does not need a code change.
+        "usd_per_mb_sent":     float((cfg.get("classifier") or {}).get(
+            "usd_per_mb_sent", USD_PER_MB_SENT)),
     }
 
 
@@ -837,6 +986,18 @@ def classify(run_dir: Path, classifier: str, dry_run: bool,
     print(f"Batches:      {len(batches)} "
           f"(max {cfg['max_chars_per_batch']:,} chars/batch)")
 
+    active_instruction_chars = len(grouped_instructions(mode) if _is_grouped(mode)
+                                   else _SYSTEM_INSTRUCTIONS)
+    estimate = estimate_cost(batches, len(header), active_instruction_chars, cfg)
+    if engine == "api":
+        sent = bytes_sent(batches, len(header), active_instruction_chars)
+        print(f"Prompt sent:  {sent / _BYTES_PER_MB:,.1f} MB over "
+              f"{len(batches)} call(s) — the {len(header) / _BYTES_PER_MB:,.1f} MB "
+              f"shared header rides on every one")
+        print(f"Est. cost:    ${estimate:,.2f} at ${USD_PER_MB_SENT:.2f}/MB "
+              f"(measured against a real invoice) "
+              f"— limit ${cfg['max_cost_usd']:,.2f}")
+
     if dry_run:
         batches_dir = run_dir / "batches"
         batches_dir.mkdir(exist_ok=True)
@@ -887,6 +1048,14 @@ def classify(run_dir: Path, classifier: str, dry_run: bool,
 
     # State plainly which engine is about to spend something, and on whose
     # meter — the two are billed completely differently.
+    # The cap, checked before anything is sent. Only the api engine bills per
+    # token; claude-code spends a subscription, which this cannot price.
+    if engine == "api" and estimate > cfg["max_cost_usd"]:
+        print()
+        print(over_cap_message(estimate, cfg["max_cost_usd"], _disp(run_dir)),
+              file=sys.stderr)
+        raise SystemExit(4)
+
     # The engine is already named in the plan block above; here just set
     # expectations for the wait, since a batch runs silently for minutes.
     if engine == "claude-code":
@@ -1031,6 +1200,27 @@ def classify(run_dir: Path, classifier: str, dry_run: bool,
         # at batch 9 cost one batch instead of nine.
         _append_partial(run_dir, fingerprint, i,
                         [r for r in all_results][batch_start_len:])
+
+        # The estimate was only an estimate. This is the guard that holds when
+        # it was wrong: stop on measured spend, with everything paid for so far
+        # already journalled.
+        if engine == "api":
+            spent = cost_of(
+                cfg["model"],
+                input_tokens=usage_totals["input_tokens"],
+                output_tokens=usage_totals["output_tokens"],
+                cache_read_tokens=usage_totals["cache_read_input_tokens"])
+            if spent > cfg["max_cost_usd"] and i < len(batches):
+                print(f"\n   ! stopping after batch {i} of {len(batches)}: "
+                      f"${spent:,.2f} spent, over the "
+                      f"${cfg['max_cost_usd']:,.2f} limit for one run.")
+                print(f"   The {len(all_results)} verdict(s) already paid for "
+                      f"are in {PARTIAL_NAME} and will be replayed, not "
+                      f"re-sent, if this bundle is classified again.")
+                print(f"   Raise the limit deliberately to finish it: "
+                      f"TRIAGE_MAX_COST_USD=<higher> testray-analysis "
+                      f"classify {_disp(run_dir)}", file=sys.stderr)
+                break
 
         print(f"   returned {len(results)} rows "
               f"(in={usage['input_tokens']:,}, out={usage['output_tokens']:,}, "

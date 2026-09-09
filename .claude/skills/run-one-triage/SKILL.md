@@ -101,8 +101,8 @@ commit is missing from it, fetch first. For Stable, the commits are in
 
 ## Step 3 — classify (this costs money)
 
-Always dry-run first. It prints the batch plan, the size and the estimated
-tokens, and sends nothing:
+Always dry-run first. It prints the batch plan, the size, the estimated tokens
+**and the estimated cost**, and sends nothing:
 
 ```bash
 .venv/bin/testray-analysis classify <bundle> --dry-run
@@ -117,6 +117,12 @@ Report the plan to the person and get agreement. Then, only if they agreed:
 If it stops partway — a bad response, a network drop — just run it again. It
 journals each finished batch to `results.partial.jsonl` and replays those
 instead of paying for them twice.
+
+**There is a $15 limit per run.** If the estimate is over it, `classify`
+refuses to start and prints the figure; if measured spend crosses it mid-run,
+it stops after the current batch and keeps what was already paid for. Report
+the number to the person rather than raising the limit yourself. Someone who
+wants to spend more sets `TRIAGE_MAX_COST_USD` deliberately.
 
 ---
 

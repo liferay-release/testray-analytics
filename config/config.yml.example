@@ -127,6 +127,26 @@ triage:
     ENV_SETUP:
       - "docker: 'docker rmi' requires at least 1 argument"
   classifier:
+    # Hard ceiling on what ONE triage run may spend, in USD (default 15).
+    # $TRIAGE_MAX_COST_USD overrides it — a CI job can lower it, and a human
+    # can raise it deliberately for one command.
+    #
+    # Checked twice: the projected cost is refused before the first call, and
+    # the run stops between batches if MEASURED spend crosses the limit. The
+    # second check is the one that holds when the estimate was wrong; batches
+    # already paid for keep their verdicts in results.partial.jsonl.
+    #
+    # For scale, from the one run with a known invoice: a RELEASE pair (routine
+    # 82964) cost $200 — 21 calls, each re-sending a 1.87 MB shared header.
+    # A STABLE run (79529) has a ~54 KB header and costs well under $1. So the
+    # limit is ~30x a normal Stable run and refuses a Release-sized one
+    # outright, which is the accident it exists to stop.
+    #
+    # It does NOT protect a monthly budget: 87 runs/month at the cap would be
+    # far more than the $250/month this is funded for. What keeps the month
+    # safe is that Stable and CMS runs cost cents; if a wider routine is ever
+    # enabled, add a monthly ledger rather than trusting this number.
+    max_cost_usd: 15
     api:
       # Classifier label is `api:<model>` and is model-version-pinned
       # (ARCHITECTURE.md decision #9). Bumping the model creates new rows

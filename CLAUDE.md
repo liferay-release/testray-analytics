@@ -21,33 +21,52 @@ fix.
 **Plain-language vocabulary is in [docs/GLOSSARY.md](docs/GLOSSARY.md).** If a
 reader is new to this tool, start there rather than in ARCHITECTURE.md.
 
-## The five commands
+## The commands
 
-All of them are subcommands of one entry point, `testray-analysis`, installed in
-the repo's virtualenv at `.venv/bin/testray-analysis`.
+One entry point — `.venv/bin/testray-analysis <command>` — and two scripts that
+run those commands in the right order. **Money is spent in exactly one place:
+`classify`.** Everything else is free; the steps above it only decide whether
+that one gets reached.
 
-| Command | What it does | Spends money |
-|---|---|---|
-| `prepare` | reads two builds, computes the diff, writes a run bundle | no |
-| `classify` | asks the model for a verdict per cluster | **yes** |
-| `submit` | validates, renders the report, writes verdicts to Testray | no |
-| `scan` | queues builds that have unexplained failures | no |
-| `watch` | drains the queue by running prepare → classify → submit | **yes, with `--classify`** |
-| `preflight` | checks credentials, OAuth scopes and the Testray Objects | no |
+`scripts/triage_jenkins.sh` — the entry point on **release-master**, run
+every 30 minutes:
 
-`scripts/triage_pipeline.sh` runs prepare → classify → submit in order. It is the
-single definition of that sequence — Jenkins, `watch` and humans all call it, so
-never re-implement the order somewhere else.
+| Command | What it does |
+|---|---|
+| `preflight` | checks the credentials, the OAuth scopes and whether the Testray Objects answer |
+| `scan` | queues builds that have failures nobody has explained yet |
+| `watch` | if anything is queued, runs the pipeline below on each queued build pair. Without `--classify` it stops after `prepare`, so it spends nothing |
 
-`scripts/triage_jenkins.sh` is the whole CI job: `scan` then `watch`, with
-preflight checks and a lock.
+`scripts/triage_pipeline.sh` — one build pair, start to finish. `watch` calls
+this, and a person can call it directly:
+
+| Command | What it does |
+|---|---|
+| `prepare` | reads two builds, groups the failures into clusters, computes the git diff between the two commits |
+| `classify` | asks a Claude model for a verdict per cluster — **the step that costs money** |
+| `submit` | validates the verdicts, renders the HTML report, writes the verdicts back to Testray, writes the Slack message |
+
+Those two scripts are the single definition of their sequences. Jenkins, `watch`
+and humans all call them, so never re-implement the order somewhere else.
 
 ## Rules that cost money or time when broken
 
-**Never run `classify` or `watch --classify` without being asked to.** Each call
-bills the Anthropic API. When someone asks for a test run, use `--dry-run`
-(classify) or `--no-classify` (watch), both of which do everything except the
-model call and report what the call *would* have been.
+**Do not run `classify` or `watch --classify` yourself unless you were asked
+to.** Each call bills the Anthropic API. When someone says "try it" or "test
+it", use `--dry-run` (classify) or `--no-classify` (watch): both do everything
+except the model call, and report what the call would have cost.
+
+This is about *you*, working interactively. On release-master the job classifies
+unattended on every tick — that is the whole point of it — and what protects the
+bill there is not restraint but the cap below.
+
+**One run cannot spend more than $15.** `classify` estimates the cost before it
+sends anything and refuses to start if the projection is over the limit, naming
+the figure and telling the reader to fork the repo and run it locally if they
+want to spend more. It also stops between batches if measured spend crosses the
+limit, keeping the verdicts already paid for. Raise it deliberately with
+`TRIAGE_MAX_COST_USD=<n>`; lower it in CI the same way. Never raise it to get a
+run through without saying so.
 
 **Always run `preflight` first against an instance you have not used before.** It
 tells the difference between "the client extension is not deployed" (404, fine,
@@ -90,7 +109,7 @@ task you were given.
 
 | Path | What |
 |---|---|
-| `JENKINS-SETUP.md` | the CI job: fields, agent setup, troubleshooting |
+| `JENKINS-SETUP.md` | the release-master job: fields, agent setup, troubleshooting |
 | `docs/GLOSSARY.md` | plain-language terms |
 | `ARCHITECTURE.md` | the full design and the reasoning behind every decision. Long. Search it; do not read it end to end |
 | `tests/TESTING.md` | how the tool is validated |

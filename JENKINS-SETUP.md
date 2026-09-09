@@ -1,11 +1,12 @@
-# Running triage on Jenkins
+# Running triage on release-master
 
 Every 30 minutes: find Stable builds whose failures nobody has accounted for,
 work out which commits caused them, write the verdicts back to Testray, and
 post a summary to `#portal-failures`.
 
-One script does the whole job — `scripts/triage_jenkins.sh`. Everything below is
-either a Jenkins field or a one-off on the agent.
+`scripts/triage_jenkins.sh` is the job's entry point — the only thing the build
+step calls. Everything below is either a Jenkins field or a one-off on the
+agent.
 
 ---
 
@@ -220,6 +221,15 @@ the whole record of what a run concluded and why.
 | 0 | ran, or skipped because another tick holds the lock |
 | 1 | usage, or preflight — a missing secret, a bad remote, no portal checkout, a scope gap |
 | 2 | a pipeline step failed. The failing step's own log is named in the console |
+
+A step-2 failure whose log ends with "would cost about $X, which is over the
+$15.00 limit" is the **cost cap**, not a fault. One run may not spend more than
+$15; `classify` estimates before it sends and refuses to start above that,
+and stops between batches if measured spend crosses it. Nothing was charged for
+a refused run. If that build genuinely needs analysing, fork the repo and run it
+locally with `TRIAGE_MAX_COST_USD=<higher>` — a decision someone makes on
+purpose, rather than a limit CI quietly raises. To make the run cheaper instead,
+triage a narrower build pair.
 
 ---
 

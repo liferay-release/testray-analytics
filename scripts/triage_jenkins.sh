@@ -12,7 +12,7 @@
 # build pair that has already been looked at, are both skipped — which is what
 # keeps a routine that is red for days from being re-analysed every half hour.
 #
-# This is the whole Jenkins build step. The job binds three secrets, sets a few
+# This is the entry point on release-master. The job binds three secrets, sets a few
 # paths, and calls this; the ORDER of the two commands, the preflight checks and
 # the lock live here rather than in a text field in a job config, so they can be
 # reviewed, tested and fixed like the rest of the pipeline.
