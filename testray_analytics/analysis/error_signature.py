@@ -62,7 +62,11 @@ import re
 # Bump on ANY behavioural change to normalize() — see open-Q #9. Stored keys
 # carry this prefix, so a bump makes old and new keys visibly incomparable
 # rather than silently different.
-SIGNATURE_VERSION = "v2"
+# v3 (2026-09-05): normalize() now strips JUnit "N Skipped test(s)" notices,
+# so the same defect no longer splits by how many tests were skipped that run.
+# Bumping invalidates stored v2 clusterKeys by design — that is what the stamp
+# is for; the ledger re-attributes rather than silently mismatching.
+SIGNATURE_VERSION = "v3"
 
 # How many stack frames to keep when an error is nothing but a trace. Enough to
 # tell two traces apart, few enough that a deep-frame difference in the same
@@ -169,11 +173,44 @@ def _text(value) -> str:
     return str(value)
 
 
+# JUnit prints the tests it SKIPPED before the ones that failed, in the same
+# blob. A skip is deliberate and evidences nothing, but the notice is a PREFIX,
+# not the whole story: on the U152->U153 release run all six rows carrying a
+# skip notice also carried a real failure behind it — four AssertionErrors with
+# concrete expected/actual values. Dropping those rows would have discarded the
+# most attributable evidence in the run, so this removes the notice and the run
+# of skipped method names and keeps whatever follows.
+_SKIP_HEAD_RE  = re.compile(r"^\s*\d+\s+skipped tests?\b", re.IGNORECASE)
+_SKIP_NAMES_RE = re.compile(r"^\s*(?:test[A-Za-z0-9_]*\s*)+")
+
+
+def strip_skip_notice(text) -> str:
+    """Drop a leading "N Skipped test(s) <names>" notice.
+
+    Returns the text unchanged when no notice is present, and — deliberately —
+    also when nothing follows the notice: a row that is *only* skips keeps its
+    text so callers can still see what it was, rather than becoming an
+    indistinguishable empty string that matches every other unknown.
+    """
+    s = _text(text)
+    stripped = _SKIP_HEAD_RE.sub("", s, count=1)
+    if stripped == s:
+        return s
+    stripped = _SKIP_NAMES_RE.sub("", stripped, count=1).lstrip(" :;-")
+    return stripped if stripped.strip() else s
+
+
 def normalize(text) -> str:
     """Reduce error text to a signature that is stable across runs of the same
     failure. Returns "" for missing/blank input — callers must treat that as
     *unknown*, never as a match."""
     s = _text(text).strip()
+    if not s:
+        return ""
+
+    # Skips are not failures: two runs of the same defect that happened to skip
+    # different numbers of tests must not land in different clusters.
+    s = strip_skip_notice(s).strip()
     if not s:
         return ""
 
