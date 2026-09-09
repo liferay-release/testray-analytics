@@ -21,12 +21,17 @@ only thing on disk, and losing them costs one re-queue.
 
 from __future__ import annotations
 
+import argparse
 import os
+import sys
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from . import ledger as L
-from .prepare import _testray_oauth_token, fetch_paginated, testray_target
-from .queue import Job, open_queue
+from .prepare import (_testray_oauth_token, fetch_paginated, load_config,
+                      testray_target)
+from .queue import Job, open_queue, queue_path
 
 # Cadence lives in the environment, like the job-runner's crontab expression.
 SCAN_INTERVAL_ENV = "TRIAGE_SCAN_INTERVAL"
@@ -201,3 +206,99 @@ def scan(cfg: dict, routine_id: int, *, queue_dir: Path,
         print("\n--dry-run: nothing was written to the queue.")
     return {"targets": len(targets), "queued": queued, "skipped": skipped,
             "new": n_new, "active": n_active, "no_range": n_norange}
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def _routines(args, cfg: dict) -> list[int]:
+    """Which routines to scan: the flag, else config, else refuse.
+
+    Configured rather than discovered. Scanning every routine Testray has would
+    queue work for teams who never asked for it, and the cost of a run is real
+    — so a routine is opted in by name, in config, by someone who meant it.
+
+    This is where `TriageRoutineSetting.autoTriage` belongs once that Object
+    exists on the instance being scanned. It does not on prod (both /o/c/
+    endpoints 404 there), which is exactly where Stable lives, so the switch
+    lives in config for now.
+    """
+    if args.routines:
+        return args.routines
+    configured = ((cfg.get("triage") or {}).get("scan") or {}).get("routines")
+    if configured:
+        return [int(r) for r in configured]
+    print("No routine to scan. Pass --routine ID, or set triage.scan.routines "
+          "in config.", file=sys.stderr)
+    raise SystemExit(2)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(
+        description="Register unexplained failures as triage jobs. Never "
+                    "classifies and never spends.")
+    ap.add_argument("--routine", type=int, action="append", dest="routines",
+                    metavar="ID",
+                    help="routine to scan; repeatable. Defaults to "
+                         "triage.scan.routines in config.")
+    ap.add_argument("--interval", type=int, default=None, metavar="SECONDS",
+                    help="keep scanning every SECONDS instead of exiting after "
+                         f"one tick (env {SCAN_INTERVAL_ENV}). A tick is cheap: "
+                         "one build list plus a case-result read per failing "
+                         "build, all of it cached.")
+    ap.add_argument("--once", action="store_true",
+                    help="one tick, even if --interval or "
+                         f"{SCAN_INTERVAL_ENV} says otherwise — the form to "
+                         "call from cron or a Jenkins job.")
+    ap.add_argument("--catch-up", type=int, default=DEFAULT_CATCH_UP,
+                    metavar="N",
+                    help=f"failing builds to examine per tick (default "
+                         f"{DEFAULT_CATCH_UP}). Raise it to work through a "
+                         f"backlog after downtime.")
+    ap.add_argument("--window", type=int, default=DEFAULT_BUILD_WINDOW,
+                    metavar="N",
+                    help=f"how many recent builds are baseline candidates "
+                         f"(default {DEFAULT_BUILD_WINDOW}).")
+    ap.add_argument("--queue-dir", default=None, metavar="DIR",
+                    help="marker directory for the file queue (default: "
+                         "queue.path in config). Ignored where the TriageRun "
+                         "Object is deployed — that queue is rows, not files.")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="report what would be queued and write nothing.")
+    args = ap.parse_args()
+
+    cfg = load_config()
+    routines = _routines(args, cfg)
+    queue_dir = Path(args.queue_dir) if args.queue_dir else queue_path(cfg)
+
+    interval = args.interval
+    if interval is None and os.environ.get(SCAN_INTERVAL_ENV):
+        interval = int(os.environ[SCAN_INTERVAL_ENV])
+    if args.once:
+        interval = None
+
+    while True:
+        if interval:
+            print(f"\n=== {datetime.now(timezone.utc):%Y-%m-%d %H:%M:%S} UTC ===")
+
+        for routine_id in routines:
+            try:
+                scan(cfg, routine_id, queue_dir=queue_dir,
+                     catch_up=args.catch_up, window=args.window,
+                     dry_run=args.dry_run)
+            except Exception as e:                               # noqa: BLE001
+                # One routine's bad tick must not take the others down, nor end
+                # a long-running scan: the usual cause is transient (a token, a
+                # Testray restart, a 500 on one build's case results).
+                print(f"! routine {routine_id} scan failed: "
+                      f"{type(e).__name__}: {e}", file=sys.stderr)
+
+        if not interval:
+            return
+
+        time.sleep(interval)
+
+
+if __name__ == "__main__":
+    main()

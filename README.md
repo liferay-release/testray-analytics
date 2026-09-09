@@ -40,6 +40,22 @@ new/changed-failure diff + relevant hunks, and writes a run bundle. `classify`
 sends the bundle to the Anthropic API. `submit` validates the results and writes
 `TriageResult` rows to Testray. See ARCHITECTURE.md §14 for the local loop.
 
+## Usage — unattended (scan + watch)
+
+```bash
+testray-analysis scan  --once            # queue what is unexplained, spend nothing
+testray-analysis watch --classify        # drain the queue through the pipeline
+```
+
+`scan` queues a build when it is `importStatus` DONE, has at least one FAILED
+case result, and carries a failure signature Testray has no verdict for.
+Routines opt in via `triage.scan.routines` in config; cadence belongs to the
+caller (cron, Jenkins, `--interval`, `TRIAGE_SCAN_INTERVAL`). `watch` drains
+both producers — the scanner and *Run Triage* in the Testray UI — and
+`--classify` is opt-in because it is the step that costs money. See
+ARCHITECTURE.md §9 "Auto-queue" for the queue backends and what an instance
+without the analytics Objects cannot do.
+
 > Dev status: foundational extraction (LPD-95842). The headless Testray write
 > sink lands in LPD-95843; until then `submit` writes the exact batch payload
 > locally for inspection.

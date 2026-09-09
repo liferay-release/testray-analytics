@@ -1,10 +1,25 @@
 """
-runner.py — drain the QUEUED TriageRun rows the UI creates.
+runner.py — drain the triage queue, whoever filled it.
 
-`Run Triage` in Testray's build list writes a `TriageRun` with
-`triageRunStatus: QUEUED` and three foreign keys, and nothing more (see
-ARCHITECTURE "The queue contract"). This is what turns that request into a run:
-claim it, execute the pipeline, and let `submit` write the real result row.
+Two producers, one drainer. `Run Triage` in Testray's build list writes a
+`TriageRun` with `triageRunStatus: QUEUED` and three foreign keys, and nothing
+more (see ARCHITECTURE "The queue contract"); `scan.py` registers the same work
+for a routine's unexplained failures on a tick. This is what turns either
+request into a run: claim it, execute the pipeline, and let `submit` write the
+real result row.
+
+**Which queue is not a preference, it is a property of the instance.** The
+TriageRun Object exists only where the analytics client extension is deployed
+— prod answers 404 for it today, and prod is where Stable (routine 79529)
+lives. So the scanner falls back to marker files there, and a drainer that only
+knew about rows would leave every auto-queued job untouched. Both backends are
+drained through the same pipeline; only the bookkeeping differs:
+
+    TriageRun rows   QUEUED -> RUNNING -> deleted / FAILED / INCONCLUSIVE
+                     (visible to the build-list diamond)
+    file markers     present -> absent
+                     (invisible to Testray; the next scan re-queues if the
+                     failure is still unexplained)
 
 The pipeline itself is `scripts/triage_pipeline.sh`, not three subprocess calls
 from here. That script is the single definition of the sequence — Jenkins runs
@@ -21,7 +36,8 @@ small gesture to attach that to silently. Without the flag the runner does the
 slow, free part (REST reads, the git diff, hunk filtering) and prints the two
 commands that finish the job.
 
-State transitions, which exist so the build-list diamond never lies:
+Row-queue state transitions, which exist so the build-list diamond never
+lies (the file queue has nowhere to record any of this — see _drain_files):
 
     QUEUED  --claim-->  RUNNING  --ok-->    (row deleted; submit wrote the real one)
                                  --fail-->  FAILED + errorMessage
@@ -41,6 +57,7 @@ import urllib.error
 from pathlib import Path
 
 from .prepare import load_config, testray_target
+from .queue import FileQueue, TestrayQueue, queue_path
 from .testray_writer import RUN_ENDPOINT, _Session, _run_erc_path
 
 # The pipeline script echoes this after prepare, precisely so a caller can learn
@@ -133,15 +150,24 @@ def _run(cmd: list[str], label: str) -> str:
     return "".join(lines)
 
 
-def _pipeline(run: dict, args) -> str:
-    """Run the pipeline script for one queued row. Returns the bundle path."""
+def _row_pair(run: dict) -> tuple[int, int]:
+    """The build pair a queued row names, or a readable failure."""
     baseline = run.get("r_baselineBuildToTriageRuns_c_buildId")
     target = run.get("r_buildToTriageRuns_c_buildId")
     if not (baseline and target):
         raise RuntimeError(
             f"queued row {run.get('externalReferenceCode')} is missing a build "
             f"FK (baseline={baseline!r}, target={target!r})")
+    return int(baseline), int(target)
 
+
+def _pipeline(baseline: int, target: int, args) -> str:
+    """Run the pipeline script for one build pair. Returns the bundle path.
+
+    Takes ids rather than a queue entry so both backends share it: a marker
+    file and a TriageRun row disagree about everything except the pair, which
+    is the only thing the pipeline needs.
+    """
     if not _PIPELINE.is_file():
         raise RuntimeError(f"pipeline script not found at {_PIPELINE}")
 
@@ -165,9 +191,135 @@ def _pipeline(run: dict, args) -> str:
     return match.group(1)
 
 
+def _drain_files(q: FileQueue, args) -> int:
+    """Run every pending marker, oldest first. Returns how many were claimed.
+
+    How a job ends decides what is recorded, and the distinction is the whole
+    reason `complete` exists. An answer — verdicts, or a clean run that
+    explained nothing — is recorded as done, because this backend is only
+    chosen on instances with no TriageResult Object, so nothing else remembers
+    the pair was analysed and the next scan would queue it again. A failure is
+    merely released: the pair stays eligible, so a token, a 500 or an unfetched
+    commit gets another attempt rather than being written off.
+    """
+    pending = q.pending()
+
+    for job in pending:
+        print(f"\n=== claiming {job.name} "
+              f"(build {job.baseline_build} -> {job.target_build}) ===")
+        if job.signatures:
+            print(f"  queued for {len(job.signatures)} unexplained "
+                  f"signature(s): {', '.join(job.signatures[:3])}"
+                  + (" …" if len(job.signatures) > 3 else ""))
+
+        try:
+            bundle = _pipeline(job.baseline_build, job.target_build, args)
+        except NoVerdicts:
+            # An answer, not a failure: re-running would reach it again.
+            print(f"  ! {job.name}: ran clean but produced no verdicts — every "
+                  f"failure was auto-classified or excluded. Needs a human.",
+                  file=sys.stderr)
+            q.complete(job)
+            continue
+        except Exception as e:                                   # noqa: BLE001
+            print(f"  ! {job.name} failed: {e}", file=sys.stderr)
+            q.release(job)
+            continue
+
+        q.complete(job)
+
+        if args.classify:
+            print(f"\n  Done: {bundle}")
+        else:
+            print(f"\n  Prepared: {bundle}")
+            print("  Not classified (add --classify). Finish it with:")
+            print(f"    testray-analysis classify {bundle}")
+            print(f"    testray-analysis submit   {bundle}")
+
+    return len(pending)
+
+
+def _drain_rows(session: _Session, args) -> int:
+    """Claim and run every QUEUED TriageRun row. Returns how many were seen."""
+    try:
+        queued = _queued(session)
+    except Exception as e:                                       # noqa: BLE001
+        # A poll failure is transient (token, restart, network). Report and
+        # keep waiting rather than dying and leaving the queue unattended.
+        print(f"  ! poll failed: {e}", file=sys.stderr)
+        return 0
+
+    for run in queued:
+        erc = run.get("externalReferenceCode") or ""
+        print(f"\n=== claiming {erc} ===")
+        try:
+            baseline, target = _row_pair(run)
+        except RuntimeError as e:
+            print(f"  ! {e}", file=sys.stderr)
+            try:
+                _set_status(session, erc, "FAILED", str(e))
+            except Exception as inner:                           # noqa: BLE001
+                print(f"  ! also could not mark it FAILED: {inner}",
+                      file=sys.stderr)
+            continue
+
+        print(f"  build {baseline} -> {target}")
+        try:
+            _set_status(session, erc, "RUNNING")
+        except Exception as e:                                   # noqa: BLE001
+            print(f"  ! could not claim {erc}: {e}", file=sys.stderr)
+            continue
+
+        try:
+            bundle = _pipeline(baseline, target, args)
+        except NoVerdicts:
+            # The row stays, carrying a state a human can see. Deleting it
+            # would hand the build a green diamond for an analysis that
+            # concluded nothing.
+            msg = ("Ran clean but produced no verdicts — every failure was "
+                   "auto-classified or excluded. Needs a human.")
+            print(f"  ! {erc}: {msg}", file=sys.stderr)
+            try:
+                _set_status(session, erc, STATUS_INCONCLUSIVE, msg)
+            except Exception:                                    # noqa: BLE001
+                # Picklist may not carry the key yet (it is a schema change
+                # on the Testray Object). Visible-and-wrong beats silent.
+                try:
+                    _set_status(session, erc, "FAILED", msg)
+                except Exception as inner:                       # noqa: BLE001
+                    print(f"  ! also could not mark it: {inner}",
+                          file=sys.stderr)
+            continue
+        except Exception as e:                                   # noqa: BLE001
+            print(f"  ! {erc} failed: {e}", file=sys.stderr)
+            try:
+                _set_status(session, erc, "FAILED", str(e))
+            except Exception as inner:                           # noqa: BLE001
+                print(f"  ! also could not mark it FAILED: {inner}",
+                      file=sys.stderr)
+            continue
+
+        if args.classify:
+            # submit wrote the real run row, keyed by the bundle id; this
+            # one was only the request, and leaving both would give the
+            # build two runs with the column free to show either.
+            _delete(session, erc)
+            print(f"\n  Done: {bundle}")
+        else:
+            print(f"\n  Prepared: {bundle}")
+            print("  Not classified (add --classify). The row stays "
+                  "RUNNING, so the diamond reads 'in progress', and this "
+                  "runner will not pick it up again — finish it with:")
+            print(f"    testray-analysis classify {bundle}")
+            print(f"    testray-analysis submit   {bundle}")
+
+    return len(queued)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="Claim QUEUED TriageRun rows and run the pipeline for them.")
+        description="Drain the triage queue — scanner jobs and Run Triage "
+                    "requests — through the pipeline.")
     ap.add_argument("--interval", type=int, default=POLL_SECONDS,
                     help=f"seconds between polls (default {POLL_SECONDS})")
     ap.add_argument("--once", action="store_true",
@@ -184,79 +336,45 @@ def main() -> None:
                     help="passed to prepare (default by-cluster)")
     ap.add_argument("--out", default="runs",
                     help="where prepare writes bundles (default ./runs)")
+    ap.add_argument("--queue", default="auto",
+                    choices=("auto", "testray", "file"),
+                    help="which queue to drain. auto (default) uses TriageRun "
+                         "rows where the Object is deployed and marker files "
+                         "where it is not — prod has no Object, so scanner "
+                         "jobs land in files there.")
     args = ap.parse_args()
 
     cfg = load_config()
-    session = _Session(cfg["testray"])
 
-    print(f"Watching {testray_target(cfg)} for QUEUED triage runs")
+    # Probed, not assumed: the same command has to work against a local
+    # instance carrying the Objects and against prod, which does not.
+    # `TestrayQueue.available` is the same probe `open_queue` uses, so the
+    # scanner and the drainer cannot disagree about which queue is live.
+    kind = args.queue
+    if kind == "auto":
+        kind = "testray" if TestrayQueue.available(cfg["testray"]) else "file"
+
+    # Only the backend actually drained gets built: constructing a session
+    # mints an OAuth token, and the marker path needs no session at all.
+    session = _Session(cfg["testray"]) if kind == "testray" else None
+    q = None if kind == "testray" else FileQueue(queue_path(cfg))
+
+    print(f"Watching {testray_target(cfg)} for triage work")
+    print("  queue:    " + ("QUEUED TriageRun rows (the build-list diamond "
+                            "shows their state)"
+                            if kind == "testray"
+                            else f"{queue_path(cfg)} — marker files, because "
+                                 f"the TriageRun Object is not deployed here, "
+                                 f"so runs are invisible to Testray"))
     print(f"  classify: {'yes' if args.classify else 'no (prepare only)'}"
           f"   poll: {args.interval}s")
 
     while True:
-        try:
-            queued = _queued(session)
-        except Exception as e:                                   # noqa: BLE001
-            # A poll failure is transient (token, restart, network). Report and
-            # keep waiting rather than dying and leaving the queue unattended.
-            print(f"  ! poll failed: {e}", file=sys.stderr)
-            queued = []
-
-        for run in queued:
-            erc = run.get("externalReferenceCode") or ""
-            target = run.get("r_buildToTriageRuns_c_buildId")
-            print(f"\n=== claiming {erc} (target build {target}) ===")
-            try:
-                _set_status(session, erc, "RUNNING")
-            except Exception as e:                               # noqa: BLE001
-                print(f"  ! could not claim {erc}: {e}", file=sys.stderr)
-                continue
-
-            try:
-                bundle = _pipeline(run, args)
-            except NoVerdicts:
-                # The row stays, carrying a state a human can see. Deleting it
-                # would hand the build a green diamond for an analysis that
-                # concluded nothing.
-                msg = ("Ran clean but produced no verdicts — every failure was "
-                       "auto-classified or excluded. Needs a human.")
-                print(f"  ! {erc}: {msg}", file=sys.stderr)
-                try:
-                    _set_status(session, erc, STATUS_INCONCLUSIVE, msg)
-                except Exception:                                # noqa: BLE001
-                    # Picklist may not carry the key yet (it is a schema change
-                    # on the Testray Object). Visible-and-wrong beats silent.
-                    try:
-                        _set_status(session, erc, "FAILED", msg)
-                    except Exception as inner:                   # noqa: BLE001
-                        print(f"  ! also could not mark it: {inner}",
-                              file=sys.stderr)
-                continue
-            except Exception as e:                               # noqa: BLE001
-                print(f"  ! {erc} failed: {e}", file=sys.stderr)
-                try:
-                    _set_status(session, erc, "FAILED", str(e))
-                except Exception as inner:                       # noqa: BLE001
-                    print(f"  ! also could not mark it FAILED: {inner}",
-                          file=sys.stderr)
-                continue
-
-            if args.classify:
-                # submit wrote the real run row, keyed by the bundle id; this
-                # one was only the request, and leaving both would give the
-                # build two runs with the column free to show either.
-                _delete(session, erc)
-                print(f"\n  Done: {bundle}")
-            else:
-                print(f"\n  Prepared: {bundle}")
-                print("  Not classified (add --classify). The row stays "
-                      "RUNNING, so the diamond reads 'in progress', and this "
-                      "runner will not pick it up again — finish it with:")
-                print(f"    testray-analysis classify {bundle}")
-                print(f"    testray-analysis submit   {bundle}")
+        seen = (_drain_rows(session, args) if kind == "testray"
+                else _drain_files(q, args))
 
         if args.once:
-            if not queued:
+            if not seen:
                 print("Nothing queued.")
             return
 

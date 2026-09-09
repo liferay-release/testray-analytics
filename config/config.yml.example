@@ -115,6 +115,32 @@ triage:
       max_output_tokens: 16000
       delay_between_batches_seconds: 2
 
+  scan:
+    # Routines `testray-analysis scan` auto-queues work for. A routine is
+    # opted in by id, deliberately: scanning everything Testray has would
+    # queue runs for teams who never asked for one, and a run costs real
+    # money. Stable (79529) is the control repo — every commit merges there
+    # first and a failure blocks the sync to upstream master, so an
+    # unexplained Stable failure is the one that always has to be looked at.
+    #
+    # A build is queued when it is importStatus DONE, carries at least one
+    # FAILED case result, and holds a failure signature Testray has no verdict
+    # for. The last condition is what keeps the cost bounded: a red build
+    # whose failures are all already explained queues nothing.
+    #
+    # This is what `TriageRoutineSetting.autoTriage` will hold once that
+    # Object exists on the instance being scanned. It does not on prod (both
+    # /o/c/ endpoints 404 there), which is where Stable lives — so for now the
+    # switch is here.
+    #
+    # CADENCE IS NOT HERE. It belongs to whoever calls the scanner — a cron
+    # expression, a Jenkins trigger, `--interval`, or TRIAGE_SCAN_INTERVAL —
+    # the same way the job-runner keeps its schedule in crontab and not in the
+    # job. Poll rather than schedule to a clock: builds arrive on a drifting
+    # one and Testray imports them hours later.
+    routines:
+      -   79529          # ci:test:stable
+
 # ANTHROPIC_API_KEY is passed via the environment, never stored here.
 
 queue:

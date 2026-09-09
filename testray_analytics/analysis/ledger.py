@@ -277,21 +277,52 @@ class TestraySource:
         return BuildFailures(build_id=build_id, signatures=sigs,
                              not_run=not_run, present=present)
 
-    def attributions(self) -> dict[str, Attribution]:
-        """Earliest TriageResult per clusterKey.
+    # Class-level, so a long-running scan warns once rather than every tick.
+    _warned_no_store = False
 
-        One pass sorted oldest-first, keeping the first row seen per key — far
-        cheaper than a per-signature query, and the ordering makes "first wins"
-        equivalent to "earliest".
-        """
+    def _fetch_attributions(self) -> list[dict]:
+        """The raw rows. Split out only so the 404 below has one call to guard."""
         from .prepare import fetch_paginated
-        items = fetch_paginated(
+        return fetch_paginated(
             "/o/c/triageresults",
             {"fields": "clusterKey,gitHashA,gitHashB,dateCreated,classification",
              "sort": "dateCreated:asc"},
             token=self._token(), base_url=self.cfg["base_url"],
             progress_label="triageresults",
         )
+
+    def attributions(self) -> dict[str, Attribution]:
+        """Earliest TriageResult per clusterKey.
+
+        One pass sorted oldest-first, keeping the first row seen per key — far
+        cheaper than a per-signature query, and the ordering makes "first wins"
+        equivalent to "earliest".
+
+        **A missing Object is not an error here.** `/o/c/triageresults` 404s on
+        any instance without the analytics client extension — prod today, which
+        is where Stable lives — and a scan that died on that could never run
+        there at all. "No verdicts on file" is the truth about such an instance,
+        so this degrades to it instead of raising. What that costs is said out
+        loud rather than hidden: with no verdict store every failure reads as
+        NEW, nothing is skipped for already having been explained, and the only
+        thing stopping a drained job from being queued again on the next tick is
+        the queue's own completion record (`queue.py` `complete`).
+        """
+        import urllib.error
+        try:
+            items = self._fetch_attributions()
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                raise
+            if not TestraySource._warned_no_store:
+                TestraySource._warned_no_store = True
+                print("  ! /o/c/triageresults is not deployed on "
+                      f"{self.cfg.get('base_url')} — proceeding with no "
+                      "verdicts on file. Every failure reads as new, so "
+                      "re-analysis is prevented only by the queue's "
+                      "completion markers.")
+            return {}
+
         out: dict[str, Attribution] = {}
         for it in items:
             ck = (it.get("clusterKey") or "").strip()

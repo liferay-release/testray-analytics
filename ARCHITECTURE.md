@@ -940,6 +940,77 @@ timestamp is an absolute moment and Testray spans timezones.
 > apply a change to an existing Object, delete it (Control Panel → Objects) and
 > redeploy; safe while row counts are zero, a migration once they are not.
 
+### Who may run a triage
+
+Reading a triage is open to the whole team; **starting one is `Testray
+Administrator` only**. A run costs minutes of wall clock and real model usage on
+a build nobody else asked this of, which makes it an administrator's call rather
+than a lead's — the one place in this design where we are narrower than
+Testray's own `[ADMINISTRATOR, LEAD]` split.
+
+The gate is a Liferay Object permission, not a UI check. Both Run Triage buttons
+write `TriageRun` from the browser, as the **session user** (the CX authenticates
+with the portal session plus `x-csrf-token`; the OAuth app is the CLI's, not the
+frontend's), so `ADD_OBJECT_ENTRY` on `TriageRun` is enforced by the REST layer
+and cannot be talked past from a console. It is granted in
+`liferay-testray-analytics-site-initializer/site-initializer/resource-permissions.json`,
+which mirrors the shape Testray already uses for its own Objects:
+`ADD_OBJECT_ENTRY` on `com.liferay.object#[$OBJECT_DEFINITION_ID:<name>$]` plus
+`VIEW/UPDATE/DELETE` on `[$OBJECT_DEFINITION_CLASS_NAME:<name>$]` for the
+administrator, and `VIEW` alone for Analyst, Lead and User — because a verdict
+written back into Testray that the team cannot read defeats the point of writing
+it there.
+
+The UI checks are cosmetic, and exist only so nobody is offered a button that
+403s. There are four surfaces, which is one more than it looks:
+
+| Surface | Where |
+|---|---|
+| Build-list menu (select baseline / target) | `useBuildActions.ts` |
+| Build-list Triage column (Run Triage) | `TriageSelectionCell.tsx` + its call site in `Routine.tsx` |
+| Triage index picker (Run Triage) | `TriageIndex.tsx` → `TriagePicker.tsx` |
+| Triage index Abort | `TriageIndex.tsx` |
+
+Three things that make this easy to get wrong:
+
+- **`usePermission` fails open.** It answers `undefined` until
+  `/my-user-account` resolves, and `Permission.filterActions` *shows* any action
+  whose `permission` is not a boolean. Worse, `useBuildActions` builds its array
+  in a `useRef`, frozen at first render. So a permission-gated entry there stays
+  visible to whoever mounted the view before the account arrived. The triage
+  entries are therefore held in a second array and **appended** only for an
+  administrator — absent is unambiguous where `permission: undefined` is not.
+- **The analytics CX has no user at all.** It never fetched an account, and
+  nothing is shared between two custom elements (separate bundles, separate React
+  trees), so it asks `/o/headless-admin-user/v1.0/my-user-account` itself in
+  `services/permission.ts` and matches `roleBriefs` by name.
+- **The runner needs the role too.** `runner.py` PATCHes `TriageRun` to
+  `RUNNING` and deletes it on success, and `submit` writes `TriageResult` — all
+  as whatever user the CLI's OAuth application acts as. Locally that is the
+  hand-made client-credentials app from TESTRAY-SETUP.md step 2, which acts as
+  its creator (an omni-admin, so nothing to do); the site initializer's own app
+  runs as `default-service-account`. On any shared instance, give that user
+  `Testray Administrator` or the queue drains into 403s that read as a broken
+  listener.
+
+Permissions are applied **at site initialization**, and the initializer creates
+rather than reconciles (above). On an instance that already has the objects, this
+file changes nothing until a `--fresh` run — grant the role by hand in Control
+Panel → Roles in the meantime, and verify what actually landed rather than
+trusting the deploy:
+
+```bash
+docker exec testray-postgres psql -U root -d lportal -c \
+  "select r.name, rp.actionids, rp.name as resource
+   from resourcepermission rp join role_ r on r.roleid = rp.roleid
+   where rp.name like '%TriageRun%' or rp.name like '%TriageResult%';"
+```
+
+The placeholder tokens are text-substituted, and a malformed one — the missing
+`$` in `[$OBJECT_DEFINITION_ID:Build]` that already cost us the
+Build↔BuildSummary relationship — resolves to nothing and skips the grant
+without an error.
+
 ---
 
 ## 10. Build sequence (follows the tickets)

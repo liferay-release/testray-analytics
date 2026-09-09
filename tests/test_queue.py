@@ -72,3 +72,57 @@ def test_relative_queue_path_anchors_to_project_root_not_cwd(monkeypatch, tmp_pa
     monkeypatch.delenv(QUEUE_ENV, raising=False)
     monkeypatch.chdir(tmp_path)
     assert queue_path({"queue": {"path": "state/q"}}) == project_root() / "state/q"
+
+
+# --- completion records ----------------------------------------------------
+#
+# The file backend is chosen exactly when the TriageRun Object is absent, and
+# that same absence means /o/c/triageresults is absent too — so nothing in
+# Testray remembers a pair was analysed. Without a local record the scanner
+# re-queues the same pair on every tick, forever, and with --classify that is
+# unbounded spend on one analysis.
+
+def test_a_completed_pair_is_not_queued_again(tmp_path):
+    q = FileQueue(tmp_path / "queue")
+    job = Job(79529, 1, 2, [SIG_A])
+
+    q.register(job)
+    q.complete(job)
+
+    assert q.pending() == [], "completing takes it off the pending list"
+    assert q.register(job) is False, "the pair has been analysed here already"
+    assert [j.name for j in q.completed()] == [job.name]
+
+
+def test_a_released_pair_is_eligible_again(tmp_path):
+    """Release is for a job that ended badly — a retry must stay possible."""
+    q = FileQueue(tmp_path / "queue")
+    job = Job(79529, 1, 2, [SIG_A])
+
+    q.register(job)
+    q.release(job)
+
+    assert q.register(job) is True
+    assert q.completed() == []
+
+
+def test_completion_records_a_pair_that_was_never_pending(tmp_path):
+    """A hand-run pair, or one whose marker was cleaned up mid-run."""
+    q = FileQueue(tmp_path / "queue")
+    job = Job(79529, 1, 2, [SIG_A])
+
+    q.complete(job)
+
+    assert q.register(job) is False
+    assert [j.name for j in q.completed()] == [job.name]
+
+
+def test_done_records_do_not_look_like_pending_work(tmp_path):
+    """`done/` lives inside the queue directory; it must not be drained."""
+    q = FileQueue(tmp_path / "queue")
+    q.register(Job(79529, 1, 2, [SIG_A]))
+    q.complete(Job(79529, 1, 2, [SIG_A]))
+    q.register(Job(79529, 2, 3, [SIG_B]))
+
+    assert [j.target_build for j in q.pending()] == [3]
+    assert len(q) == 1

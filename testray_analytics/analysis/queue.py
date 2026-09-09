@@ -95,13 +95,31 @@ class Job:
 
 
 class FileQueue:
-    """Marker-file queue. One JSON file per pending job."""
+    """Marker-file queue. One JSON file per pending job, plus a `done/` record.
+
+    `done/` exists because of what the file backend implies about the instance:
+    it is chosen when the TriageRun Object is absent, and that same absence
+    means `/o/c/triageresults` is absent too, so no verdict is ever written
+    where the ledger could read it back. "Has this been dealt with?" therefore
+    cannot be derived from Testray on this instance, and without a local answer
+    the scanner re-queues the same build pair on every tick forever — with
+    `--classify`, that is unbounded spend on one analysis.
+
+    So a completed pair is recorded, and `register` declines it. This is the
+    one piece of state the design would rather not keep (ARCHITECTURE: no
+    watermark, nothing to get stuck), and it is scoped as tightly as possible:
+    it answers only "this exact pair has already been analysed here", it is
+    per-machine, and deleting the directory costs one re-analysis per pair.
+    Where the Objects exist, Testray remains the authority and this is
+    belt-and-braces.
+    """
 
     def __init__(self, directory: Path):
         self.dir = Path(directory)
+        self.done_dir = self.dir / "done"
 
     def register(self, job: Job) -> bool:
-        """Enqueue unless already pending. Returns True when it was added.
+        """Enqueue unless already pending or already done. True when added.
 
         Written to a temp file and renamed, so a drainer polling the directory
         can never observe a half-written job — `os.replace` is atomic within a
@@ -109,7 +127,7 @@ class FileQueue:
         """
         self.dir.mkdir(parents=True, exist_ok=True)
         target = self.dir / f"{job.name}.json"
-        if target.exists():
+        if target.exists() or (self.done_dir / f"{job.name}.json").exists():
             return False
         fd, tmp = tempfile.mkstemp(dir=self.dir, suffix=".tmp")
         try:
@@ -136,10 +154,46 @@ class FileQueue:
         return out
 
     def release(self, job: Job) -> None:
-        """Drop a job's marker. Called after it has been run, successfully or
-        not — a job that keeps failing should not spin the drainer forever;
-        the next scan re-queues it if the signature is still unattributed."""
+        """Drop a job's marker without recording it as done.
+
+        For a job that ended badly. It leaves the pair eligible again, so a
+        transient failure — a token, a 500 on one build's case results, a
+        commit not yet fetched — gets another attempt on a later tick instead
+        of being written off. It does not spin: the marker is gone, so the
+        retry happens only if a scan decides the failure is still unexplained.
+        """
         (self.dir / f"{job.name}.json").unlink(missing_ok=True)
+
+    def complete(self, job: Job) -> None:
+        """Record a pair as analysed, and drop its pending marker.
+
+        Called when the pipeline produced an answer — including "ran clean and
+        explained nothing", which is an answer and would be the same answer
+        next time. Not called when it failed; see `release`.
+        """
+        self.done_dir.mkdir(parents=True, exist_ok=True)
+        pending = self.dir / f"{job.name}.json"
+        record = self.done_dir / f"{job.name}.json"
+        if pending.exists():
+            os.replace(pending, record)
+        else:
+            # Nothing pending to move — a hand-run pair, or a marker someone
+            # cleaned up mid-run. The record is the point, so write it anyway.
+            record.write_text(json.dumps(job.to_json(), indent=2,
+                                         sort_keys=True), encoding="utf-8")
+
+    def completed(self) -> list[Job]:
+        """Pairs already analysed on this machine, oldest first."""
+        if not self.done_dir.exists():
+            return []
+        out = []
+        for f in sorted(self.done_dir.glob("*.json"),
+                        key=lambda x: x.stat().st_mtime):
+            try:
+                out.append(Job.from_json(json.loads(f.read_text(encoding="utf-8"))))
+            except (json.JSONDecodeError, KeyError, ValueError):
+                continue
+        return out
 
     def __len__(self) -> int:
         return len(list(self.dir.glob("*.json"))) if self.dir.exists() else 0
