@@ -355,7 +355,8 @@ def main() -> None:
     # `TestrayQueue.available` is the same probe `open_queue` uses, so the
     # scanner and the drainer cannot disagree about which queue is live.
     kind = args.queue
-    if kind == "auto":
+    probed = kind == "auto"
+    if probed:
         kind = "testray" if TestrayQueue.available(cfg["testray"]) else "file"
 
     # Only the backend actually drained gets built: constructing a session
@@ -365,12 +366,16 @@ def main() -> None:
     q = None if kind == "testray" else FileQueue(marker_dir)
 
     print(f"Watching {testray_target(cfg)} for triage work")
-    print("  queue:    " + ("QUEUED TriageRun rows (the build-list diamond "
-                            "shows their state)"
-                            if kind == "testray"
-                            else f"{marker_dir} — marker files, because "
-                                 f"the TriageRun Object is not deployed here, "
-                                 f"so runs are invisible to Testray"))
+    if kind == "testray":
+        print("  queue:    QUEUED TriageRun rows (the build-list diamond "
+              "shows their state)")
+    else:
+        # Only say WHY when we actually asked. Forced with --queue file, the
+        # Object may well be deployed and simply not in use.
+        print(f"  queue:    {marker_dir} — marker files"
+              + (", because the TriageRun Object is not deployed here"
+                 if probed else " (requested with --queue file)")
+              + ", so runs are invisible to Testray")
     print(f"  classify: {'yes' if args.classify else 'no (prepare only)'}"
           f"   poll: {args.interval}s")
 
