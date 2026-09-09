@@ -17,17 +17,18 @@ pipeline above.
 
 import sys
 
-_SUBCOMMANDS = ("prepare", "classify", "submit", "scan", "watch")
+_SUBCOMMANDS = ("prepare", "classify", "submit", "scan", "watch", "slack")
 
 
 def _usage() -> None:
     print(
-        "usage: testray-analysis <prepare|classify|submit|scan|watch> [args]\n"
+        "usage: testray-analysis <prepare|classify|submit|scan|watch|slack> [args]\n"
         "  prepare   read builds over REST, compute the diff, write a run bundle\n"
         "  classify  send the bundle to the Anthropic API\n"
         "  submit    validate results and hand verdicts to the Testray writer\n"
         "  scan      queue a routine's unexplained failures (never classifies)\n"
         "  watch     drain the queue — scanner jobs and Run Triage requests\n"
+        "  slack     re-render a run bundle as the Slack message Jenkins posts\n"
         "\nRun `testray-analysis <subcommand> --help` for subcommand flags."
     )
 
@@ -51,6 +52,8 @@ def main() -> None:
         from .prepare import main as run
     elif sub == "classify":
         from .classify import main as run
+    elif sub == "slack":
+        from .slack_message import main as run
     elif sub == "scan":
         from .scan import main as run
     elif sub == "watch":

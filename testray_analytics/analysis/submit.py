@@ -37,6 +37,7 @@ from pathlib import Path
 import pandas as pd
 import yaml
 
+from . import slack_message
 from . import verdicts
 from .jira_settings import resolve_jira_settings
 from .prepare import commits_touching_file, load_config, testray_target
@@ -656,6 +657,12 @@ def main() -> None:
     ap.add_argument("--no-write", action="store_true",
                     help="Validate + summarize + render the report, but skip "
                          "building the Testray batch payload.")
+    ap.add_argument("--slack-out", default=None, metavar="PATH",
+                    help="where to write the Slack message (default: "
+                         f"{slack_message.OUT_REL} under the project root). "
+                         "Jenkins posts this file.")
+    ap.add_argument("--no-slack", action="store_true",
+                    help="skip writing the Slack message.")
     ap.add_argument("--report-url", default=None,
                     help="Where this report is readable. Each Jira draft's "
                          "footer links its cluster id here. Point it at the "
@@ -863,8 +870,36 @@ def main() -> None:
     report_path = render_run(run_dir, df, meta)
     print(f"Report:     {report_path}")
 
+    # The Slack message is written on every run, including one that concluded
+    # nothing: an unattended pipeline that posts only when it has news is
+    # indistinguishable from one that did not run. Rendered from the bundle,
+    # not from `df`, so the same file can be regenerated later with
+    # `testray-analysis slack <bundle>`.
+    #
+    # `link_testray` is passed only after a successful upsert, because the
+    # triage view reads TriageResult rows: linking it on a --dry-run, or on an
+    # instance where the write 404s, sends the channel to an empty page.
+    def write_slack(*, link_testray: bool) -> None:
+        if args.no_slack:
+            return
+        try:
+            slack_path = slack_message.write(
+                run_dir,
+                out=Path(args.slack_out) if args.slack_out else None,
+                report_url=report_url, link_testray=link_testray)
+            print(f"Slack:      {slack_path}"
+                  + ("" if link_testray else "  (no Testray link — "
+                     "verdicts were not written there)"))
+        except Exception as e:                                   # noqa: BLE001
+            # Never fail a run over the notification. The verdicts are the
+            # product; the message is how someone hears about them, and a
+            # broken template must not discard a completed analysis.
+            print(f"Slack:      not written ({type(e).__name__}: {e})",
+                  file=sys.stderr)
+
     if args.no_write:
         print("\n--no-write set → not building the Testray batch payload.")
+        write_slack(link_testray=False)
         return
 
     items = build_batch(df, meta, classifier=payload["classifier"])
@@ -881,6 +916,7 @@ def main() -> None:
 
     if args.dry_run:
         print("  --dry-run set → not upserting into Testray.")
+        write_slack(link_testray=False)
         return
 
     cfg = full_cfg["testray"]
@@ -889,6 +925,8 @@ def main() -> None:
     n_ok, n_fail, failures = post_batch(items, cfg, progress=True)
     print(f"  Upserted {n_ok}/{len(items)} TriageResults"
           + (f", {n_fail} failed" if n_fail else ""))
+    # Rows are in Testray, so the triage view has something to render.
+    write_slack(link_testray=n_ok > 0)
     for f in failures[:10]:
         print(f"    ! {f['externalReferenceCode']}: "
               f"HTTP {f['status']} {f['error']}")
