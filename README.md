@@ -1,5 +1,20 @@
 # testray-analytics
 
+**New to this tool?** Read [docs/GLOSSARY.md](docs/GLOSSARY.md) first — it
+defines every word the rest of the documentation uses. Then:
+
+| I want to… | Read |
+|---|---|
+| understand what this does at all | [docs/GLOSSARY.md](docs/GLOSSARY.md) |
+| analyse one failing build myself | [.claude/skills/run-one-triage](.claude/skills/run-one-triage/SKILL.md) |
+| set up or fix the Jenkins job | [JENKINS-SETUP.md](JENKINS-SETUP.md), [.claude/skills/check-the-jenkins-job](.claude/skills/check-the-jenkins-job/SKILL.md) |
+| know why it was built this way | [ARCHITECTURE.md](ARCHITECTURE.md) (long — search it) |
+| run the tests | [tests/TESTING.md](tests/TESTING.md) |
+
+The two skills are for Claude Code: ask it "triage build 520106758" or "why did
+the Jenkins triage job post nothing" and it will follow them.
+
+
 Additive analytics module for Testray. Reads Testray over REST, analyzes test
 results, and writes results back for a client extension to render — without
 patching core Testray.
