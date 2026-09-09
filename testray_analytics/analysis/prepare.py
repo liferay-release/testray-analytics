@@ -389,11 +389,30 @@ def fetch_case_metadata(case_ids: list[int], cfg: dict) -> dict[int, dict]:
     for i, cid in enumerate(case_ids, start=1):
         url = f"{base}/o/c/cases/{cid}"
         def _do_request(tok):
-            req = urllib.request.Request(
-                url, headers={"Authorization": f"Bearer {tok}"},
-            )
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                return json.loads(resp.read())
+            # Retry transient network faults. This loop runs once per case and
+            # a release-routine diff has ~2,000 of them (the docstring's "~100"
+            # holds for Stable, not here), so over a 20-minute pass a single
+            # dropped read is close to expected. Without this, one timeout at
+            # case 606/2025 discards the whole run — both builds re-fetched
+            # from scratch on the retry, since prepare has no resume.
+            # HTTPError is NOT caught here: 401 and 404 carry meaning and are
+            # handled by the caller.
+            last = None
+            for attempt in range(4):
+                try:
+                    req = urllib.request.Request(
+                        url, headers={"Authorization": f"Bearer {tok}"},
+                    )
+                    with urllib.request.urlopen(req, timeout=30) as resp:
+                        return json.loads(resp.read())
+                except urllib.error.HTTPError:
+                    raise
+                except (TimeoutError, urllib.error.URLError, ConnectionError,
+                        http.client.HTTPException) as exc:
+                    last = exc
+                    if attempt < 3:
+                        time.sleep(2 ** attempt)
+            raise last
         try:
             body = _do_request(token)
         except urllib.error.HTTPError as e:
