@@ -630,6 +630,73 @@ investigate.
 > on a live instance, because `headless-admin-list-type` returns an empty
 > collection for both the service account and the session.
 
+### Auto-queue — the scanner is the second producer
+
+Added 2026-09-09, for Stable (routine **79529**). *Run Triage* covers the case
+where a person already knows which pair they want. This covers the case nobody
+is watching: a build lands red overnight and the failure needs to be waiting for
+someone in the morning, not discovered by them.
+
+**The rule.** A build is queued when it is `importStatus` **DONE**, carries at
+least one **FAILED** case result, and holds a failure signature Testray has no
+verdict for. The third clause is the one that keeps this affordable — Stable is
+red most of the time, and a red build whose failures are all already explained
+queues nothing. `testray-analysis scan` is the producer; it never classifies and
+never spends, so its worst case is a wasted request.
+
+Both counters come off the Build row, so a green build costs nothing to skip.
+Where those counters are **not** populated — the local mirror leaves every one
+at zero, `loadTestrayData.py` does not recompute them — the scanner reads the
+case results of the newest few builds instead, keyed on PASSED rather than
+FAILED: a window with no failures is normal, a window where nothing passed means
+the counters were never computed. Trusting them there would report "nothing red"
+on a routine with real failures, which is the worst kind of wrong.
+
+**Opting in is per routine, in config** (`triage.scan.routines`), because
+scanning everything Testray has would queue runs for teams who never asked and a
+run costs real money. This is what `TriageRoutineSetting.autoTriage` will hold
+once that Object exists on the instance being scanned — it does not on prod,
+which is exactly where Stable lives, so the switch is in config for now.
+
+**Cadence belongs to the caller**, not to the tool: a cron expression, a Jenkins
+trigger, `--interval`, or `TRIAGE_SCAN_INTERVAL` — the same way the job-runner
+keeps its schedule in crontab and not in the job. Poll rather than schedule to a
+clock: builds arrive on a drifting one and Testray imports them hours later, so a
+fixed time hits an empty window as often as not.
+
+### Two queues, one drainer
+
+The TriageRun Object exists only where the analytics client extension is
+deployed. **Prod has neither Object** — `/o/c/triageruns` and
+`/o/c/triageresults` both 404 there (verified 2026-09-09) — and prod is where
+Stable lives. So the scanner registers marker files there, and
+`testray-analysis watch` drains rows or markers through the same
+`triage_pipeline.sh`; `--queue auto|testray|file` selects, and auto probes.
+
+Three consequences on an instance with no Objects, all of them worth saying out
+loud because each is silent:
+
+1. **No diamond.** A marker is invisible to Testray, so a queued, running or
+   failed run has nowhere to show. The console and the per-step logs are the
+   only account of it.
+2. **No verdict write-back.** `submit` cannot write `TriageResult` where the
+   Object does not exist, so the product of a prod run is the rendered report
+   and the batch file, not a row the team can read in Testray.
+3. **Every failure reads as NEW.** The ledger derives "already explained" from
+   `TriageResult`; with no store, that query 404s. It degrades to an empty
+   answer rather than failing the tick — a scan that died on it could never run
+   on prod at all — but the dedup clause of the rule above is then inert.
+
+(3) is why the file queue keeps a **`done/` record**. Nothing else remembers that
+a pair was analysed, so without it the scanner re-queues the same pair on every
+tick forever, and with `--classify` that is unbounded spend on one analysis. It
+is the one piece of state this design would rather not keep, and it is scoped as
+tightly as it can be: it answers only "this exact pair has already been analysed
+on this machine", and deleting the directory costs one re-analysis per pair.
+How a job ends decides what is recorded — an answer (verdicts, or a clean run
+that explained nothing) is completed; a failure is only released, so a token, a
+500 or an unfetched commit gets another attempt rather than being written off.
+
 **The report renders in-app.** Not a hosted artifact, not a link out. The verdicts
 are already in Testray as `TriageResult` rows, so the view reads them through the
 `CaseResult` FK and groups by `clusterKey` (§7); shipping an HTML file alongside

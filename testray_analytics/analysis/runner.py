@@ -336,6 +336,10 @@ def main() -> None:
                     help="passed to prepare (default by-cluster)")
     ap.add_argument("--out", default="runs",
                     help="where prepare writes bundles (default ./runs)")
+    ap.add_argument("--queue-dir", default=None, metavar="DIR",
+                    help="marker directory to drain (default: queue.path in "
+                         "config, or $TRIAGE_QUEUE). Must match the scanner's "
+                         "--queue-dir, or the drainer watches an empty one.")
     ap.add_argument("--queue", default="auto",
                     choices=("auto", "testray", "file"),
                     help="which queue to drain. auto (default) uses TriageRun "
@@ -356,14 +360,15 @@ def main() -> None:
 
     # Only the backend actually drained gets built: constructing a session
     # mints an OAuth token, and the marker path needs no session at all.
+    marker_dir = Path(args.queue_dir) if args.queue_dir else queue_path(cfg)
     session = _Session(cfg["testray"]) if kind == "testray" else None
-    q = None if kind == "testray" else FileQueue(queue_path(cfg))
+    q = None if kind == "testray" else FileQueue(marker_dir)
 
     print(f"Watching {testray_target(cfg)} for triage work")
     print("  queue:    " + ("QUEUED TriageRun rows (the build-list diamond "
                             "shows their state)"
                             if kind == "testray"
-                            else f"{queue_path(cfg)} — marker files, because "
+                            else f"{marker_dir} — marker files, because "
                                  f"the TriageRun Object is not deployed here, "
                                  f"so runs are invisible to Testray"))
     print(f"  classify: {'yes' if args.classify else 'no (prepare only)'}"
