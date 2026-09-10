@@ -43,9 +43,9 @@ from .jira_settings import resolve_jira_settings
 from .prepare import commits_touching_file, load_config, testray_target
 from .report import render_run
 from .testray_writer import (
-    ENDPOINT, FK_FIELD, build_batch, build_triage_run, count_excluded,
-    excluded_breakdown, format_exclusions, post_batch, write_batch_file,
-    write_triage_run,
+    ENDPOINT, FK_FIELD, RUN_ENDPOINT, _Session, _run_erc_path, build_batch,
+    build_triage_run, count_excluded, excluded_breakdown, format_exclusions,
+    post_batch, write_batch_file, write_triage_run,
 )
 
 
@@ -651,6 +651,52 @@ def annotate_culprit_commits(df: pd.DataFrame, full_cfg: dict,
     return df
 
 
+def clear_request_rows(cfg: dict, meta: dict, keep_erc: str) -> int:
+    """Delete leftover *request* TriageRun rows for this build pair.
+
+    Two producers create a request row and they spell its id differently — the
+    UI writes `queued-<baseline>-<target>`, the scanner writes
+    `<routine>-<baseline>-<target>` — so this matches on the build FKs rather
+    than guessing an ERC.
+
+    It matters because the report page asks for "a run for this build" and
+    takes the first answer, unordered. A request row left behind therefore
+    competes with the real one, and being the row *without* counts, it renders
+    a report with no status matrix and a build stuck at "in progress". The
+    runner already deletes the row it claimed; this covers the case it cannot
+    see — a run finished by hand, or by a different process.
+
+    Never fatal: the verdicts are already written by the time this runs.
+    """
+    if not (meta.get("build_id_a") and meta.get("build_id_b")):
+        return 0
+
+    session = _Session(cfg)
+    query = (f"?pageSize=50&filter="
+             f"r_buildToTriageRuns_c_buildId%20eq%20%27{meta['build_id_b']}%27")
+    try:
+        body = session.request("GET", f"{RUN_ENDPOINT}{query}")
+    except Exception:                                            # noqa: BLE001
+        return 0
+
+    removed = 0
+    for row in body.get("items") or []:
+        erc = row.get("externalReferenceCode") or ""
+        status = (row.get("triageRunStatus") or {}).get("key")
+        same_pair = str(row.get("r_baselineBuildToTriageRuns_c_buildId") or "") \
+            == str(meta["build_id_a"])
+        # Only request rows: QUEUED or RUNNING, never a finished analysis, and
+        # never the row this run just wrote.
+        if erc == keep_erc or not same_pair or status not in ("QUEUED", "RUNNING"):
+            continue
+        try:
+            session.request("DELETE", _run_erc_path(erc))
+            removed += 1
+        except Exception:                                        # noqa: BLE001
+            pass
+    return removed
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Submit a triage run bundle.")
     ap.add_argument("run_dir", type=Path, help="Path to runs/r_<id>/")
@@ -971,6 +1017,13 @@ def main() -> None:
         print(f"  TriageRun {run_payload['externalReferenceCode']} upserted "
               f"({run_payload['totalClusters']} clusters, "
               f"{run_payload['totalWritten']} written)")
+
+        # The request row that asked for this analysis has served its purpose.
+        # Leaving it gives the build two runs, and the report page picks the
+        # first one it is handed — which is the one with no counts.
+        stale = clear_request_rows(cfg, meta, run_payload["externalReferenceCode"])
+        if stale:
+            print(f"  Cleared {stale} stale request row(s) for this pair")
     except Exception as e:
         print(f"  ! TriageRun upsert failed ({e}) — the {n_ok} TriageResults "
               f"still landed, but the build-index icon and the report header "
