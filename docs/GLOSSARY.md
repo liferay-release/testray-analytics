@@ -10,7 +10,7 @@ documentation becomes much shorter.
 **Routine**
 A repeating group of test builds. `ci:test:stable` is one routine. Each routine
 has a number. Ours: **79529** is Stable, **590307** is Acceptance, **82964** is
-Release.
+EE Package Tester.
 
 **Build**
 One run of a routine. It contains many test results. A build has a git commit —
@@ -37,7 +37,7 @@ Objects, without changing Testray itself.
 
 ---
 
-## Words this tool invented
+## Terms this tool added
 
 **Baseline and target**
 The two builds being compared. The **baseline** is the older build. The
