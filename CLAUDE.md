@@ -115,10 +115,15 @@ misconfiguration. When someone is working locally, look the ids up
 .venv/bin/python -m pytest -q --ignore=tests/test_prompt_size.py --ignore=tests/test_resume.py
 ```
 
-Expect `216 passed, 11 skipped`. The two ignored files are specifications for
-work that is not finished — they fail at import, on purpose, and are not
-committed. Do not "fix" them by changing the source to match unless that is the
-task you were given.
+Expect no failures and a dozen or so skips. The pass count is deliberately not
+written down here: it changes every time a test is added, so a stale number
+reads as a regression when nothing is wrong. What is worth checking is that the
+run collected *hundreds* of tests — a green run reporting tens of them means
+collection broke, which looks like success and is not.
+
+The two ignored files are specifications for work that is not finished — they
+fail at import, on purpose, and are not committed. Do not "fix" them by changing
+the source to match unless that is the task you were given.
 
 ## Where things are
 
