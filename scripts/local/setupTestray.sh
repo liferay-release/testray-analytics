@@ -292,7 +292,15 @@ deploy_component() {
     info "WARNING: no artifact matching '$artifact' in bundles/osgi/$kind"
     return
   fi
-  touch "$f"
+  if ! touch "${f}" 2> /dev/null
+  then
+  # Rootless Docker: `docker cp` creates the file with a remapped uid,
+  # so it is not ours. Container-root maps to our host uid, so chowning
+  # via `docker exec` gives the file back to us without sudo. Rootful
+  # Docker skips this because the `touch` above already succeeds.
+    docker exec -u 0 "${CONTAINER}" chown 0:0 "/opt/liferay/osgi/${kind}/$(basename "${f}")"
+    touch "$f"
+  fi
   after=$(artifact_mtime "$kind" "$artifact")
   if [[ "$before" == "0" ]]; then
     info "artifact installed: $(basename "$f")"
