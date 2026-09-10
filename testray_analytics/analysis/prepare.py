@@ -832,6 +832,7 @@ def fetch_build_metadata(build_id: int, cfg: dict) -> dict:
         "routine_id": int(rid) if rid else None,
         "project_id": fetch_routine_project(int(rid), cfg) if rid else None,
         "branch":     _portal_branch(body.get("description")),
+        "jenkins_url": _jenkins_report_url(body.get("description")),
     }
 
 
@@ -852,6 +853,32 @@ def _portal_branch(description) -> str | None:
     if not description:
         return None
     m = _PORTAL_BRANCH_RE.search(str(description))
+    return m.group(1).strip() or None if m else None
+
+
+# The same Build description carries the top-level Jenkins job as an anchor:
+#
+#   …; <a href="https://test-1-46.liferay.com/job/test-portal-testsuite-upstream(master)/1531">Jenkins Report</a>; …
+#
+# It is the only place Testray records it — the caseresult `attachments` field
+# names GCS artifact paths, not job URLs, so there is nothing else to read it
+# from without fetching and parsing build-report.json.gz. Worth having because
+# it is the link a person actually opens when the diff explains nothing: the
+# console below it says WHICH task failed, which our error text does not.
+_JENKINS_REPORT_RE = re.compile(r'href="(https?://[^"]+/job/[^"]+)"',
+                                re.IGNORECASE)
+
+
+def _jenkins_report_url(description) -> str | None:
+    """The top-level Jenkins job URL in a Build description, or None.
+
+    Unescaped on purpose: the URL contains literal parentheses
+    (`…upstream(master)/1531`) and every consumer needs to do its own escaping
+    — Slack's link syntax breaks on a bare `)`, Jira's does not.
+    """
+    if not description:
+        return None
+    m = _JENKINS_REPORT_RE.search(str(description))
     return m.group(1).strip() or None if m else None
 
 
@@ -1473,6 +1500,7 @@ def resolve_side_metadata(spec: SideSpec, cfg: dict) -> dict:
         "routine_id": build["routine_id"],
         "project_id": build.get("project_id"),
         "branch":     build.get("branch"),
+        "jenkins_url": build.get("jenkins_url"),
     }
 
 
@@ -1950,6 +1978,7 @@ def write_run_yml(run_dir: Path, *, run_id: str,
                   project_id: int | None = None,
                   testray_url: str | None = None,
                   base_branch: str | None = None,
+                  jenkins_url_b: str | None = None,
                   git_remote: str | None = None,
                   repo_slug: str | None = None,
                   transition_counts: dict | None = None,
@@ -1971,6 +2000,10 @@ def write_run_yml(run_dir: Path, *, run_id: str,
         # master, 81a4afb..b096242") without re-reading config.yml at render
         # time. Absent on bundles written before this key existed.
         "base_branch":         base_branch,
+        # The target build's top-level Jenkins job. Read from the Build
+        # description at prepare time because run.yml is the only thing the
+        # Slack renderer sees — it never talks to Testray.
+        "jenkins_url_b":       jenkins_url_b,
         "git_remote":          git_remote,
         "repo_slug":           repo_slug,
         "routine_id":          routine_id,
@@ -3259,6 +3292,7 @@ def _finalize_bundle(
     history_depth: int = HISTORY_DEPTH_DEFAULT,
     history_streak: int = HISTORY_STREAK_DEFAULT,
     base_branch: str | None = None,
+    jenkins_url_b: str | None = None,
     git_remote: str | None = None,
     repo_slug: str | None = None,
 ) -> Path:
@@ -3461,6 +3495,7 @@ def _finalize_bundle(
         project_id=project_id,
         testray_url=testray_url,
         base_branch=base_branch,
+        jenkins_url_b=jenkins_url_b,
         git_remote=git_remote,
         repo_slug=repo_slug,
         transition_counts=transition_counts,
@@ -3631,6 +3666,7 @@ def prepare(baseline: SideSpec, target: SideSpec, classifier: str,
         # "master" for a 2024.Q1 analysis, so it is only the fallback.
         base_branch=(meta_b.get("branch")
                      or (cfg.get("git") or {}).get("base_branch")),
+        jenkins_url_b=meta_b.get("jenkins_url"),
         # Which repo this routine's builds are cut from. Stable's are on the
         # control repo and never on a personal fork, so the fallback to origin
         # can only ever miss.

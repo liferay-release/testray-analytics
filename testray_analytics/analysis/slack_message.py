@@ -101,6 +101,20 @@ def _build_url(meta: dict, build_id) -> str:
             f"/build/{bid}")
 
 
+def _case_result_url(meta: dict, caseresult_id) -> str:
+    """Testray deep-link for one case result inside the target build.
+
+    Testray's own `attachments` field uses exactly this shape to point back at
+    a build's top-level result, so it is the instance's own spelling rather
+    than one invented here.
+    """
+    build = _build_url(meta, meta.get("build_id_b"))
+    crid = _text(caseresult_id)
+    if not (build and crid):
+        return ""
+    return f"{build}/case-result/{crid}"
+
+
 def triage_url(meta: dict) -> str:
     """The Testray triage view for the target build, or "".
 
@@ -134,11 +148,16 @@ def _compare_url(meta: dict) -> str:
     return f"https://github.com/{slug}/compare/{a}...{b}"
 
 
-def _load(run_dir: Path) -> tuple[dict, list[dict], dict]:
-    """run.yml, the verdicts, and the cluster rows keyed by group id.
+def _load(run_dir: Path) -> tuple[dict, list[dict], dict, dict]:
+    """run.yml, the verdicts, the cluster rows by group id, and a
+    case_id -> caseresult_id map.
 
-    All three are bundle files rather than submit's in-memory frame, so this
-    can be re-rendered for a finished run without re-running anything.
+    All four come from bundle files rather than submit's in-memory frame, so
+    this can be re-rendered for a finished run without re-running anything.
+
+    The last one exists because the cluster rows carry Testray CASE ids while
+    a deep-link needs the CASE RESULT id — different numbers, and only
+    `diff_list.csv` holds both.
     """
     meta = yaml.safe_load((run_dir / "run.yml").read_text(encoding="utf-8")) or {}
 
@@ -155,7 +174,17 @@ def _load(run_dir: Path) -> tuple[dict, list[dict], dict]:
             for row in csv.DictReader(fh):
                 clusters[_text(row.get("group_id"))] = row
 
-    return meta, results, clusters
+    caseresult_ids: dict[str, str] = {}
+    diff_list = run_dir / "diff_list.csv"
+    if diff_list.exists():
+        with diff_list.open(newline="", encoding="utf-8") as fh:
+            for row in csv.DictReader(fh):
+                case_id = _text(row.get("testray_case_id"))
+                crid = _text(row.get("caseresult_id"))
+                if case_id and crid:
+                    caseresult_ids.setdefault(case_id, crid)
+
+    return meta, results, clusters, caseresult_ids
 
 
 def _verdict_of(result: dict) -> str:
@@ -196,7 +225,8 @@ def _cause_row(meta: dict, result: dict) -> str:
     return f"> *Culprit file:* `{culprit}`" if culprit else ""
 
 
-def _block(meta: dict, n: int, result: dict, cluster: dict) -> list[str]:
+def _block(meta: dict, n: int, result: dict, cluster: dict,
+           caseresult_ids: dict | None = None) -> list[str]:
     """One `Failure --- N` block."""
     verdict = _verdict_of(result)
     confidence = _text(result.get("confidence")).lower()
@@ -214,7 +244,17 @@ def _block(meta: dict, n: int, result: dict, cluster: dict) -> list[str]:
     if count > 1:
         title += f"  (+{count - 1} more)"
 
-    lines = [f"*Failure --- {n}:* *{title}*"]
+    # Link the title at the failing case result in Testray. The first member,
+    # not the cluster: a cluster has no page of its own until the analytics
+    # client extension is deployed, and a reader following this link wants the
+    # error text and the attachments, both of which live on the result.
+    members = [c for c in _text(cluster.get("member_case_ids")).split("|") if c]
+    if not members:
+        members = [_text(c) for c in (result.get("case_ids") or [])]
+    crid = (caseresult_ids or {}).get(members[0]) if members else ""
+    href = _case_result_url(meta, crid) if crid else ""
+
+    lines = [f"*Failure --- {n}:* *{_link(href, title) if href else title}*"]
 
     cause = _cause_row(meta, result)
     if cause:
@@ -242,7 +282,7 @@ def render(run_dir: Path, *, report_url: str = "",
            link_testray: bool = False) -> str:
     """The message body. Plain text — the poster adds nothing."""
     run_dir = Path(run_dir)
-    meta, results, clusters = _load(run_dir)
+    meta, results, clusters, caseresult_ids = _load(run_dir)
 
     build_b = _text(meta.get("build_b_name")) or _text(meta.get("build_id_b"))
     build_a = _text(meta.get("build_a_name")) or _text(meta.get("build_id_a"))
@@ -280,6 +320,15 @@ def render(run_dir: Path, *, report_url: str = "",
                  f"{_link(_build_url(meta, meta.get('build_id_a')), build_a)}"
                  f" → {_link(_build_url(meta, meta.get('build_id_b')), build_b)}")
 
+    # The Jenkins job that produced the build. Named "Top Level Build" to
+    # match Testray's own label for it, and worth a row of its own on Stable:
+    # our error text stops at "a Gradle task failed", and the console under
+    # this link is where the failing task and its cause are actually written.
+    jenkins = _text(meta.get("jenkins_url_b"))
+    if jenkins:
+        lines.append(f"• *Top Level Build:* "
+                     f"{_link(jenkins, jenkins.rstrip('/').rpartition('/job/')[2] or 'open in Jenkins')}")
+
     total = _text(meta.get("total_failures"))
     lines.append(f"• *Clusters:* {len(results)} classified"
                  + (f" over {total} failure(s)" if total else ""))
@@ -311,7 +360,7 @@ def render(run_dir: Path, *, report_url: str = "",
 
     for i, result in enumerate(ordered[:MAX_BLOCKS], start=1):
         cluster = clusters.get(_text(result.get("group_id")), {})
-        lines += [""] + _block(meta, i, result, cluster)
+        lines += [""] + _block(meta, i, result, cluster, caseresult_ids)
 
     if len(ordered) > MAX_BLOCKS:
         lines += ["", f"_{len(ordered) - MAX_BLOCKS} further cluster(s) not "
