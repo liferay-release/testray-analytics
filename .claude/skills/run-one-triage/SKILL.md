@@ -9,13 +9,70 @@ This walks through analysing **one pair of builds**: an older build that was
 fine (the *baseline*) and a newer build that failed (the *target*). See
 [GLOSSARY.md](../../../docs/GLOSSARY.md) for the words.
 
-**Money warning.** Step 3 calls a Claude model and costs money. Steps 1, 2 and
-the dry run cost nothing. Never run step 3 unless the person asked for a real
-classification.
+**Money warning.** Step 4 calls a Claude model and costs money. Everything
+before it, and the dry run, cost nothing. Never run step 4 unless the person
+asked for a real classification.
 
 ---
 
-## Step 0 — check the instance answers
+## Step 0 — is the tool installed and configured?
+
+Do this first and do not assume. A fresh clone has neither a virtualenv nor a
+config file, and both are gitignored, so "it worked last week" is not evidence.
+
+**The virtualenv:**
+
+```bash
+ls .venv/bin/testray-analysis
+```
+
+Missing? Build it. The editable install (`-e`) is what keeps `config/` and
+`slack/` resolving inside this checkout:
+
+```bash
+python3.13 -m venv .venv && .venv/bin/pip install -e .
+```
+
+**The configuration:**
+
+```bash
+ls config/config.yml; env | grep TESTRAY_
+```
+
+Settings can come from either, and the environment wins. If there is neither,
+copy the template — `cp config/config.yml.example config/config.yml` — and fill
+in four values:
+
+| Setting | Value |
+|---|---|
+| `testray.base_url` | `https://testray.liferay.com` |
+| `testray.ui_url` | `https://testray.liferay.com/web/testray` |
+| `testray.client_id` / `client_secret` | an OAuth2 client-credentials application; read-only is enough |
+| `git.repo_path` | a `liferay-portal` checkout — required, the analysis diffs the two builds' commits |
+
+**Never invent credentials, and never read them out of another project's
+config.** Ask the person for them, and tell them the file is gitignored so
+nothing is committed.
+
+**Then check the git side, because it fails silently:**
+
+```bash
+ls "$(grep -A1 '^git:' config/config.yml | grep repo_path | cut -d: -f2- | tr -d ' ')"
+git -C <that path> remote get-url <the remote in routine_remotes>
+```
+
+`git.routine_remotes` maps a routine to a **remote name inside that checkout**,
+not a URL. For Stable (79529) it must resolve to `brianchandotcom/liferay-portal`
+— Stable's commits reach `liferay/liferay-portal` only later. Get this wrong and
+nothing errors: every commit link in the report points at a repository that does
+not have the commit.
+
+If any of this is missing, fix it with the person before going further. A run
+started on a broken config wastes their time at step 3, twenty minutes in.
+
+---
+
+## Step 1 — check the instance answers
 
 ```bash
 .venv/bin/testray-analysis preflight
@@ -36,7 +93,7 @@ environment: `TESTRAY_CLIENT_ID` and `TESTRAY_CLIENT_SECRET`.
 
 ---
 
-## Step 1 — choose the two builds
+## Step 2 — choose the two builds
 
 You need two build ids from the same routine.
 
@@ -62,7 +119,7 @@ fewer commits between them, the better the answer.
 
 ---
 
-## Step 2 — gather the evidence (free)
+## Step 3 — gather the evidence (free)
 
 ```bash
 ./scripts/triage_pipeline.sh -b <baseline id> -t <target id> --no-classify
@@ -99,7 +156,7 @@ commit is missing from it, fetch first. For Stable, the commits are in
 
 ---
 
-## Step 3 — classify (this costs money)
+## Step 4 — classify (this costs money)
 
 Always dry-run first. It prints the batch plan, the size, the estimated tokens
 **and the estimated cost**, and sends nothing:
@@ -126,20 +183,26 @@ wants to spend more sets `TRIAGE_MAX_COST_USD` deliberately.
 
 ---
 
-## Step 4 — write the results and read them
+## Step 5 — write the results and read them
 
 ```bash
-.venv/bin/testray-analysis submit <bundle>
+.venv/bin/testray-analysis submit <bundle>              # local instance with the Objects
+.venv/bin/testray-analysis submit <bundle> --no-write   # anywhere else, including prod
 ```
 
 This validates the verdicts, renders `report.html` inside the bundle, writes the
 Slack message to `slack/testray_analyzer_slack_message.txt`, and — if the
 Testray Objects exist — saves the verdicts into Testray.
 
+**Against prod, use `--no-write`.** Prod has no `TriageResult` Object, so there
+is nothing to write to and nothing should try. Step 0's preflight already told
+you which case you are in: `Ready` means the plain form works, `Usable, in
+degraded mode` means `--no-write`.
+
 Options worth knowing:
 
-- `--dry-run` — do everything except save into Testray.
-- `--no-write` — also skip building the payload. Report only.
+- `--no-write` — validate and render only. No Testray payload is built at all.
+- `--dry-run` — build the payload but do not send it. For debugging the writer.
 - `--report-url <url>` — put a link in each draft Jira ticket's footer.
 
 Open `report.html` in a browser. One row per cluster, worst verdict first.

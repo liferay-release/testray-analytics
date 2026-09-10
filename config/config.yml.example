@@ -15,7 +15,7 @@
 #   TESTRAY_CLIENT_SECRET    testray.client_secret   (secret)
 #   TESTRAY_UI_URL           testray.ui_url
 #   TRIAGE_REPO_PATH         git.repo_path
-#   TRIAGE_ROUTINE_REMOTES   git.routine_remotes     `79529=bchan,590307=upstream`
+#   TRIAGE_ROUTINE_REMOTES   git.routine_remotes     `79529=brianchandotcom`
 #   TRIAGE_SCAN_ROUTINES     triage.scan.routines    `79529` or `79529,590307`
 #   TRIAGE_CONFIG            path to this file (a missing path is an error,
 #                            never a fallback)
@@ -64,11 +64,11 @@ git:
   # which is not something an unattended scan on a fresh agent can rely on.
   # A routine with no entry falls back to `fetch_remote`, then to origin.
   routine_remotes:
-    79529: bchan          # ci:test:stable — control repo
+    79529: brianchandotcom   # ci:test:stable — control repo
     590307: upstream      # EE Development Acceptance
     82964: upstream-ee    # release
   # Used for any routine not listed above. Leave unset to fall back to origin.
-  #fetch_remote: bchan
+  #fetch_remote: brianchandotcom
 
 testray:
   # Testray REST base_url (env override: TESTRAY_BASE_URL). Point at the instance

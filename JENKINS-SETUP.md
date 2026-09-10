@@ -49,7 +49,7 @@ empty and every tick prints `Nothing queued.`
 
 | Field | Value |
 |---|---|
-| Git > Repository URL | the repo this file is in |
+| Git > Repository URL | `https://github.com/liferay/liferay-testray-analytics` |
 | Git > Branch Specifier | `master` |
 | Build Triggers | Build periodically, `H/30 * * * *` |
 | Execute shell | the block above |

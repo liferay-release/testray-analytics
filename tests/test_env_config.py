@@ -85,9 +85,9 @@ def test_an_explicit_config_that_does_not_exist_is_an_error(monkeypatch,
 def test_routine_remotes_parse_from_a_flat_string():
     """Jenkins bindings are flat strings; config.yml holds a nested map. Both
     have to produce the shape prepare reads."""
-    assert P._routine_map("79529=bchan,590307=upstream") == {
-        79529: "bchan", 590307: "upstream"}
-    assert P._routine_map(" 79529 = bchan ") == {79529: "bchan"}
+    assert P._routine_map("79529=brianchandotcom,590307=upstream") == {
+        79529: "brianchandotcom", 590307: "upstream"}
+    assert P._routine_map(" 79529 = brianchandotcom ") == {79529: "brianchandotcom"}
     assert P._routine_map("79529") == {}, "a pair with no remote is dropped"
 
 

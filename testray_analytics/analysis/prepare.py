@@ -184,7 +184,7 @@ _ENV_OVERRIDES: list[str] = []
 
 
 def _routine_map(raw: str) -> dict:
-    """`79529=bchan,590307=upstream` -> {79529: "bchan", 590307: "upstream"}.
+    """`79529=brianchandotcom,590307=upstream` -> {79529: "brianchandotcom", …}.
 
     A flat string because Jenkins bindings are flat strings, while the same
     setting in config.yml is a nested map. Both have to produce one shape.

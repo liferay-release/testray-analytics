@@ -2471,7 +2471,7 @@ def _detail_row(r, rid: str, css: str, ckey: str, meta: dict,
 # the product.
 # The commit range behind a run, as a GitHub compare link. Points at the
 # canonical public repo rather than whichever remote `prepare` happened to
-# fetch the commits from (bchan, release-ee, a PR fork): this link is for a
+# fetch the commits from (brianchandotcom, release-ee, a PR fork): this link is for a
 # person to click, so it has to be the repo they can actually open.
 #
 # Testray's Build object has a `githubCompareURLs` field for this, but it reads

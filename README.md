@@ -6,6 +6,8 @@ defines every word the rest of the documentation uses. Then:
 | I want to… | Read |
 |---|---|
 | understand what this does at all | [docs/GLOSSARY.md](docs/GLOSSARY.md) |
+| analyse a failing build and read the report (no Testray needed) | [QUICKSTART.md](QUICKSTART.md) |
+| stand up a local Testray with the triage screens | [QUICKSTART-LOCAL-TESTRAY.md](QUICKSTART-LOCAL-TESTRAY.md) |
 | analyse one failing build myself | [.claude/skills/run-one-triage](.claude/skills/run-one-triage/SKILL.md) |
 | set up or fix the Jenkins job | [JENKINS-SETUP.md](JENKINS-SETUP.md), [.claude/skills/check-the-jenkins-job](.claude/skills/check-the-jenkins-job/SKILL.md) |
 | know why it was built this way | [ARCHITECTURE.md](ARCHITECTURE.md) (long — search it) |

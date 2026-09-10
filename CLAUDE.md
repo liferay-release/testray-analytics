@@ -116,6 +116,8 @@ task you were given.
 
 | Path | What |
 |---|---|
+| `QUICKSTART.md` | analyse a build with no local Testray — the common path |
+| `QUICKSTART-LOCAL-TESTRAY.md` | a local instance: containers, data, the triage screens |
 | `JENKINS-SETUP.md` | the release-master job: fields, agent setup, troubleshooting |
 | `docs/GLOSSARY.md` | plain-language terms |
 | `ARCHITECTURE.md` | the full design and the reasoning behind every decision. Long. Search it; do not read it end to end |
