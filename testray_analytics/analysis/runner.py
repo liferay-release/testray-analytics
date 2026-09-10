@@ -56,6 +56,7 @@ import time
 import urllib.error
 from pathlib import Path
 
+from .config import cli_command
 from .prepare import load_config, testray_target
 from .queue import FileQueue, TestrayQueue, queue_path
 from .testray_writer import RUN_ENDPOINT, _Session, _run_erc_path
@@ -233,8 +234,8 @@ def _drain_files(q: FileQueue, args) -> int:
         else:
             print(f"\n  Prepared: {bundle}")
             print("  Not classified (add --classify). Finish it with:")
-            print(f"    testray-analysis classify {bundle}")
-            print(f"    testray-analysis submit   {bundle}")
+            print(f"    {cli_command()} classify {bundle}")
+            print(f"    {cli_command()} submit   {bundle}")
 
     return len(pending)
 
@@ -310,8 +311,8 @@ def _drain_rows(session: _Session, args) -> int:
             print("  Not classified (add --classify). The row stays "
                   "RUNNING, so the diamond reads 'in progress', and this "
                   "runner will not pick it up again — finish it with:")
-            print(f"    testray-analysis classify {bundle}")
-            print(f"    testray-analysis submit   {bundle}")
+            print(f"    {cli_command()} classify {bundle}")
+            print(f"    {cli_command()} submit   {bundle}")
 
     return len(queued)
 

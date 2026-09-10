@@ -136,3 +136,20 @@ def test_the_component_map_is_found_without_a_config_file(monkeypatch,
 
     C.config_dir.cache_clear()
     assert C.config_dir() == tmp_path / "config"
+
+
+# --- printed commands ------------------------------------------------------
+
+def test_printed_commands_are_runnable_without_activating_the_venv():
+    """Every "finish it with:" hint used to print a bare `testray-analysis`,
+    which only resolves inside an activated virtualenv — so pasting one gave
+    "command not found" at exactly the moment someone needed it to work."""
+    cmd = C.cli_command()
+    assert cmd != "testray-analysis", "must name the entry point, not assume PATH"
+    assert cmd.endswith("testray-analysis")
+
+    from pathlib import Path
+    resolved = Path(cmd)
+    if not resolved.is_absolute():
+        resolved = C.project_root() / resolved
+    assert resolved.exists(), f"{resolved} does not exist"

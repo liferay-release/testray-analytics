@@ -97,6 +97,29 @@ def config_dir() -> Path:
         f"one of {', '.join(_CONFIG_DIR_MARKERS)}.")
 
 
+def cli_command() -> str:
+    """How to invoke this tool, as the reader would have to type it.
+
+    Printed hints used to say a bare `testray-analysis`, which only works
+    inside an activated virtualenv — so every "finish it with:" line in the
+    output failed when pasted, which is exactly when a person is most likely to
+    paste one. The entry point sits beside the running interpreter, so ask
+    that instead of assuming a PATH.
+    """
+    import sys as _sys
+
+    candidate = Path(_sys.executable).with_name("testray-analysis")
+    if not candidate.exists():
+        return "testray-analysis"
+
+    # Relative to the project root when it is inside it (`.venv/bin/…`), which
+    # is shorter to read and correct to paste from the repo.
+    try:
+        return str(candidate.relative_to(project_root()))
+    except ValueError:
+        return str(candidate)
+
+
 def project_root() -> Path:
     """Repo root — the parent of the config dir.
 

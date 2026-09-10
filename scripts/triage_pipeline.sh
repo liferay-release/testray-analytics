@@ -227,8 +227,12 @@ echo "BUNDLE=${BUNDLE}"
 if [ "${CLASSIFY}" != "true" ]
 then
 	log "stopping before classify (--no-classify). To finish:"
-	echo "  testray-analysis classify ${BUNDLE}"
-	echo "  testray-analysis submit   ${BUNDLE}"
+	# The entry point beside the interpreter this script is already using —
+	# a bare `testray-analysis` only resolves inside an activated virtualenv,
+	# so pasting it is exactly where a reader hits a "command not found".
+	CLI="${PYTHON%/*}/testray-analysis"
+	echo "  ${CLI} classify ${BUNDLE}"
+	echo "  ${CLI} submit   ${BUNDLE}"
 	exit 0
 fi
 

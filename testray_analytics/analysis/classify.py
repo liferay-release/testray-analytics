@@ -136,7 +136,7 @@ except ImportError:
     raise SystemExit(1)
 
 
-from .config import find_config_file, locate_config_file
+from .config import cli_command, find_config_file, locate_config_file
 
 TRIAGE_DIR  = Path(__file__).resolve().parent
 
@@ -284,7 +284,7 @@ def over_cap_message(estimate: float, cap: float, bundle: str = "<bundle>") -> s
         f"  To analyse this run anyway, fork the repo and run it locally, "
         f"where raising the limit is a decision someone makes on purpose:\n"
         f"      TRIAGE_MAX_COST_USD=<higher limit> \\\n"
-        f"          testray-analysis classify {bundle}\n"
+        f"          {cli_command()} classify {bundle}\n"
         f"\n"
         f"  Or make the run smaller — triage a narrower build pair, or lower "
         f"max_chars_per_batch so fewer clusters are packed per call."
@@ -1290,7 +1290,7 @@ def classify(run_dir: Path, classifier: str, dry_run: bool,
         print("NOTE: cache_read_input_tokens=0 across a multi-batch run — "
               "shared header is below the model's 4096-token cacheable "
               "minimum, so caching did not activate.", file=sys.stderr)
-    print(f"Next:       testray-analysis submit {_disp(out.parent)}")
+    print(f"Next:       {cli_command()} submit {_disp(out.parent)}")
     return out
 
 

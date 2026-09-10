@@ -50,7 +50,7 @@ import yaml
 
 from . import prompt_helpers
 from . import error_signature
-from .config import find_config_file, locate_config_file
+from .config import cli_command, find_config_file, locate_config_file
 
 TRIAGE_DIR   = Path(__file__).resolve().parent
 # Run bundles default to ./runs (cwd-relative), NOT inside the installed
@@ -3472,9 +3472,9 @@ def _finalize_bundle(
 
     rel = _disp(run_dir)
     print(f"\nRun bundle ready: {rel}")
-    print(f"Next:  testray-analysis classify {rel}")
+    print(f"Next:  {cli_command()} classify {rel}")
     print(f"       (or classify {rel}/prompt.md by hand in a Claude Code session)")
-    print(f"Then:  testray-analysis submit {rel}")
+    print(f"Then:  {cli_command()} submit {rel}")
     return run_dir
 
 
