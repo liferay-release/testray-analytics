@@ -29,80 +29,84 @@
 
 set -euo pipefail
 
-# Derived, not hardcoded to one person's home: this script lives in
-# <testray-analytics>/scripts/local, so the directory two levels above the repo
-# root is the shared parent holding liferay-portal and testray2 beside it.
-# Every level can be overridden.
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
-WORKSPACE_DIR="${TESTRAY_WORKSPACE_DIR:-$(dirname -- "${REPO_ROOT}")}"
+function main {
+	# Derived, not hardcoded to one person's home: this script lives in
+	# <testray-analytics>/scripts/local, so the directory two levels above the
+	# repo root is the shared parent holding liferay-portal and testray2 beside
+	# it. Every level can be overridden.
+	#
+	# Not sorted alphabetically: each depends on the one before it, so
+	# reordering would use a variable before it is set.
+	local script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+	local repo_root=$(cd -- "${script_dir}/../.." && pwd)
+	local workspace_dir=${TESTRAY_WORKSPACE_DIR:-$(dirname -- "${repo_root}")}
 
-PORTAL_DIR="${TESTRAY_PORTAL_DIR:-${WORKSPACE_DIR}/liferay-portal}"
-WORKSPACE="${TESTRAY_WORKSPACE:-${PORTAL_DIR}/workspaces/liferay-testray-workspace/client-extensions}"
-BUNDLES="${TESTRAY_BUNDLES:-${WORKSPACE_DIR}/testray2/liferay/bundles}"
-PORTAL_URL="${TESTRAY_URL:-http://localhost:8080}"
+	local bundles=${TESTRAY_BUNDLES:-${workspace_dir}/testray2/liferay/bundles}
+	local portal_dir=${TESTRAY_PORTAL_DIR:-${workspace_dir}/liferay-portal}
+	local portal_url=${TESTRAY_URL:-http://localhost:8080}
+	local workspace=${TESTRAY_WORKSPACE:-${portal_dir}/workspaces/liferay-testray-workspace/client-extensions}
 
-NAME="${1:-}"
+	local name=${1:-}
 
-if [ -z "${NAME}" ] || [ "${NAME}" == "-h" ] || [ "${NAME}" == "--help" ]
-then
-	cat <<-END
-	Usage: $(basename "${0}") <client-extension-name>
+	if [ -z "${name}" ] || [ "${name}" == "-h" ] || [ "${name}" == "--help" ]
+	then
+		cat <<-END
+		Usage: $(basename "${0}") <client-extension-name>
 
-	Available in ${WORKSPACE}:
-	$(ls -1 "${WORKSPACE}" 2>/dev/null | sed 's/^/	  /')
+		Available in ${workspace}:
+		$(ls -1 "${workspace}" 2> /dev/null | sed --expression "s/^/	  /")
 
-	Environment:
-	  TESTRAY_WORKSPACE  client-extensions dir (default the liferay-portal workspace)
-	  TESTRAY_BUNDLES    docker bundles dir   (default <workspace>/testray2/liferay/bundles,
-	                     where <workspace> is the directory holding this repo)
-	  TESTRAY_PORTAL_DIR liferay-portal checkout (default <workspace>/liferay-portal)
-	  TESTRAY_WORKSPACE_DIR  override <workspace> itself
-	  TESTRAY_URL        portal base url      (default http://localhost:8080)
-	END
-	exit 1
-fi
+		Environment:
+		  TESTRAY_WORKSPACE  client-extensions dir (default the liferay-portal workspace)
+		  TESTRAY_BUNDLES    docker bundles dir   (default <workspace>/testray2/liferay/bundles,
+		                     where <workspace> is the directory holding this repo)
+		  TESTRAY_PORTAL_DIR liferay-portal checkout (default <workspace>/liferay-portal)
+		  TESTRAY_WORKSPACE_DIR  override <workspace> itself
+		  TESTRAY_URL        portal base url      (default http://localhost:8080)
+		END
+		exit 1
+	fi
 
-CE_DIR="${WORKSPACE}/${NAME}"
-DEPLOYED="${BUNDLES}/osgi/client-extensions/${NAME}.zip"
+	local ce_dir="${workspace}/${name}"
+	local deployed="${bundles}/osgi/client-extensions/${name}.zip"
 
-[ -d "${CE_DIR}" ] || { echo "No such client extension: ${CE_DIR}" >&2; exit 1; }
-[ -f "${DEPLOYED}" ] || { echo "Not currently deployed, so there is no config to reuse: ${DEPLOYED}" >&2; exit 1; }
+	[ -d "${ce_dir}" ] || { echo "No such client extension: ${ce_dir}" >&2; exit 1; }
+	[ -f "${deployed}" ] || { echo "Not currently deployed, so there is no config to reuse: ${deployed}" >&2; exit 1; }
 
-WORK="$(mktemp -d)"
-trap 'rm -rf "${WORK}"' EXIT
+	local work=$(mktemp --directory)
+	trap 'rm --force --recursive "${work}"' EXIT
 
-# Which branch the source is on. Not cosmetic: liferay-testray-custom-element
-# exists on every branch, so building it from a branch without the triage work
-# deploys a bundle with the hook MISSING and silently removes the feature from
-# the running instance. The build succeeds, the deploy succeeds, and the column
-# just goes blank. Print it, and refuse when TESTRAY_EXPECT_BRANCH says
-# otherwise.
-BRANCH="$(git -C "${WORKSPACE}" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
+	# Which branch the source is on. Not cosmetic: liferay-testray-custom-element
+	# exists on every branch, so building it from a branch without the triage
+	# work deploys a bundle with the hook MISSING and silently removes the
+	# feature from the running instance. The build succeeds, the deploy
+	# succeeds, and the column just goes blank. Print it, and refuse when
+	# TESTRAY_EXPECT_BRANCH says otherwise.
+	local branch=$(git -C "${workspace}" rev-parse --abbrev-ref HEAD 2> /dev/null || echo '?')
 
-echo "== build ${NAME}"
-echo "   source branch: ${BRANCH}"
+	echo "== build ${name}"
+	echo "   source branch: ${branch}"
 
-if [ -n "${TESTRAY_EXPECT_BRANCH:-}" ] && [ "${BRANCH}" != "${TESTRAY_EXPECT_BRANCH}" ]
-then
-	echo "   !! expected branch ${TESTRAY_EXPECT_BRANCH}, found ${BRANCH}." >&2
-	echo "      Refusing: building from the wrong branch can deploy a bundle" >&2
-	echo "      that silently drops features present on the other one." >&2
-	exit 1
-fi
+	if [ -n "${TESTRAY_EXPECT_BRANCH:-}" ] && [ "${branch}" != "${TESTRAY_EXPECT_BRANCH}" ]
+	then
+		echo "   !! expected branch ${TESTRAY_EXPECT_BRANCH}, found ${branch}." >&2
+		echo "      Refusing: building from the wrong branch can deploy a bundle" >&2
+		echo "      that silently drops features present on the other one." >&2
+		exit 1
+	fi
 
-# `npm run build` and not `npx tsc`: there is no local tsc on the package, so
-# npx installs an unrelated `tsc` package from npm, prints "This is not the tsc
-# command you are looking for", and exits 0 WITHOUT typechecking. If this step
-# fails with "tsc: not found", node_modules is missing — it is a yarn workspace,
-# so run `yarn install --frozen-lockfile` at the workspace ROOT, not here.
-if ! (cd "${CE_DIR}" && npm run build > "${WORK}/build.log" 2>&1)
-then
-	tail -25 "${WORK}/build.log"
-	exit 1
-fi
+	# `npm run build` and not `npx tsc`: there is no local tsc on the package, so
+	# npx installs an unrelated `tsc` package from npm, prints "This is not the tsc
+	# command you are looking for", and exits 0 WITHOUT typechecking. If this step
+	# fails with "tsc: not found", node_modules is missing — it is a yarn workspace,
+	# so run `yarn install --frozen-lockfile` at the workspace ROOT, not here.
+	if ! (cd "${ce_dir}" && npm run build > "${work}/build.log" 2>&1)
+	then
+		tail --lines=25 "${work}/build.log"
+		exit 1
+	fi
 
-python3 - "${NAME}" "${CE_DIR}" "${DEPLOYED}" "${WORK}" <<'PY'
+	python3 - "${name}" "${ce_dir}" "${deployed}" "${work}" <<'PY'
 import json, os, sys, zipfile
 
 name, ce_dir, deployed, work = sys.argv[1:5]
@@ -138,39 +142,45 @@ with zipfile.ZipFile(f'{work}/{name}.zip', 'w', zipfile.ZIP_DEFLATED) as dst:
 print('   statics:', ', '.join(statics))
 PY
 
-echo "== deploy"
-cp "${WORK}/${NAME}.zip" "${BUNDLES}/deploy/"
+	echo "== deploy"
+	cp "${work}/${name}.zip" "${bundles}/deploy/"
 
-# AutoDeploy normally consumes it in a few seconds.
-for _ in $(seq 1 30)
-do
-	[ -f "${BUNDLES}/deploy/${NAME}.zip" ] || break
-	sleep 2
-done
+	# AutoDeploy normally consumes it in a few seconds.
+	for _ in $(seq 1 30)
+	do
+		[ -f "${bundles}/deploy/${name}.zip" ] || break
+		sleep 2
+	done
 
-if [ -f "${BUNDLES}/deploy/${NAME}.zip" ]
-then
-	echo "   !! still sitting in deploy/ after 60s — is the container up?" >&2
-	exit 2
-fi
-
-# The bundle restart is asynchronous, so poll the served asset rather than
-# sleeping a fixed amount and hoping.
-BUILT_SUM="$(md5sum "${CE_DIR}/build/static/index.js" | cut -d' ' -f1)"
-
-for _ in $(seq 1 30)
-do
-	SERVED_SUM="$(curl -s "${PORTAL_URL}/o/${NAME}/index.js" | md5sum | cut -d' ' -f1)"
-
-	if [ "${SERVED_SUM}" == "${BUILT_SUM}" ]
+	if [ -f "${bundles}/deploy/${name}.zip" ]
 	then
-		echo "   serving the new build"
-		exit 0
+		echo "   !! still sitting in deploy/ after 60s — is the container up?" >&2
+		exit 2
 	fi
 
-	sleep 2
-done
+	# The bundle restart is asynchronous, so poll the served asset rather than
+	# sleeping a fixed amount and hoping.
+	local built_sum=$(md5sum "${ce_dir}/build/static/index.js" | cut --delimiter=' ' --fields=1)
 
-echo "   !! served asset still differs from the build after 60s" >&2
-echo "      check ${BUNDLES}/logs/ for a STOPPED/STARTED pair for this bundle" >&2
-exit 2
+	for _ in $(seq 1 30)
+	do
+		local served_sum=$( \
+			curl --silent "${portal_url}/o/${name}/index.js" | \
+			md5sum | \
+			cut --delimiter=' ' --fields=1)
+
+		if [ "${served_sum}" == "${built_sum}" ]
+		then
+			echo "   serving the new build"
+			exit 0
+		fi
+
+		sleep 2
+	done
+
+	echo "   !! served asset still differs from the build after 60s" >&2
+	echo "      check ${bundles}/logs/ for a STOPPED/STARTED pair for this bundle" >&2
+	exit 2
+}
+
+main "${@}"
