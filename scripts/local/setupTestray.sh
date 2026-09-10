@@ -224,6 +224,10 @@ PY
 wait_for_portal() {
   local deadline=$((SECONDS + 600)) code
   log "Waiting for $BASE_URL (up to 10 min)"
+  # This is the longest silent stretch in the whole setup, and a first-time
+  # reader has no way to tell "starting normally" from "wedged". Name the one
+  # command that shows what is actually happening.
+  log "  Watch it in another terminal: docker logs -f --tail 100 testray-liferay"
   while (( SECONDS < deadline )); do
     code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$BASE_URL/" || true)
     if [[ "$code" == "200" || "$code" == "302" ]]; then

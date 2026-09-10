@@ -140,8 +140,21 @@ fi
 
 # --- step 1: the containers -------------------------------------------------
 
+# "Answering" is not the same as "200". Once credentials are wanted,
+# /o/c/routines returns 401 on a perfectly healthy instance — gating on 200
+# would call it down and re-run a 20-minute setup. The portal root is the right
+# liveness probe (setupTestray.sh uses the same one); the object endpoint is
+# checked separately, where 404 means the extension did not install.
 function testray_is_up {
-	[ "$(curl -s -o /dev/null -m 5 -w '%{http_code}' "${TESTRAY_URL}/o/c/routines")" == "200" ]
+	local code
+	code="$(curl -s -o /dev/null -m 5 -w '%{http_code}' "${TESTRAY_URL}/" 2>/dev/null || true)"
+	[ "${code}" == "200" ] || [ "${code}" == "302" ]
+}
+
+function testray_objects_ready {
+	local code
+	code="$(curl -s -o /dev/null -m 5 -w '%{http_code}' "${TESTRAY_URL}/o/c/routines" 2>/dev/null || true)"
+	[ -n "${code}" ] && [ "${code}" != "000" ] && [ "${code}" != "404" ]
 }
 
 step "step 1: Testray"
@@ -152,8 +165,12 @@ else
 	args=()
 	[ "${FRESH}" == "true" ] && args+=(--fresh)
 	log "   running setupTestray.sh ${args[*]} — about 20 minutes"
+	log "   most of that is one silent wait for the portal to answer."
+	log "   Watch it in another terminal:"
+	log "       docker logs -f --tail 100 testray-liferay"
 	"${SCRIPT_DIR}/setupTestray.sh" "${args[@]}" || die "setupTestray.sh failed. Its output is above, and ${SCRIPT_DIR}/logs/ has the detail."
-	testray_is_up || die "setupTestray.sh finished but ${TESTRAY_URL}/o/c/routines does not answer 200."
+	testray_is_up || die "setupTestray.sh finished but ${TESTRAY_URL} does not answer."
+	testray_objects_ready || die "${TESTRAY_URL} is up but /o/c/routines 404s — the Testray client extension did not install. ${SCRIPT_DIR}/TESTRAY-SETUP.md has the recovery steps."
 fi
 
 # --- step 2: this tool ------------------------------------------------------
@@ -248,12 +265,41 @@ step "step 5: triage client extension"
 if [ "${SKIP_CX}" == "true" ]; then
 	log "   --skip-cx — skipping"
 else
+	# Pass the branch explicitly: deployCx.sh only checks when the variable is
+	# set, and an unset one turns off the guard that stops a bundle built from
+	# the wrong branch — which deploys cleanly and leaves the Triage column
+	# blank with nothing to tell you why.
+	TESTRAY_EXPECT_BRANCH="${PORTAL_BRANCH}" \
 	"${SCRIPT_DIR}/deployCx.sh" liferay-testray-analytics-custom-element \
 		|| die "deployCx.sh failed. If it says 'tsc: not found', node_modules is gone:
        cd ${PORTAL_DIR}/workspaces/liferay-testray-workspace && yarn install --frozen-lockfile"
 fi
 
 # --- done -------------------------------------------------------------------
+#
+# The closing message walks all three moving parts, because installing them
+# proves nothing about whether they are wired together: two things can queue
+# work (the scanner, and the Run Triage button) and one thing drains it.
+# Testing only the button leaves the scheduled path — the one release-master
+# actually runs — unexercised.
+
+# Name the routines that exist, so the commands below can be copy-pasted
+# instead of guessed at. Local ids are not prod ids: whatever the loader
+# created here is what these need.
+ROUTINES="$(.venv/bin/python - <<-'PY' 2>/dev/null || true
+	import urllib.error
+	from testray_analytics.analysis.prepare import load_config, fetch_paginated, _testray_oauth_token
+	try:
+	    tr = load_config()["testray"]
+	    items = fetch_paginated("/o/c/routines", {"pageSize": "20"},
+	                            token=_testray_oauth_token(tr),
+	                            base_url=tr["base_url"])
+	    for r in items[:10]:
+	        print(f"          {r.get('id')}  {r.get('name')}")
+	except Exception:
+	    pass
+	PY
+)"
 
 cat <<-END
 
@@ -262,17 +308,57 @@ cat <<-END
 	   Testray:   ${TESTRAY_URL}
 	   Triage:    ${TESTRAY_URL}/web/liferay-testray/triage
 
-	   Try one analysis. This part is free:
+	   Two things queue work and one thing drains it. Exercise all three: the
+	   scanner is what release-master runs on a schedule, the button is what a
+	   person uses, and the drainer serves both.
 
-	       .venv/bin/testray-analysis scan --once --routine <id> --dry-run
+	   1. GIVE YOURSELF THE ROLE — needed for step 3, and its absence is
+	      invisible: the Triage options simply do not appear.
 
-	   That prints the build pairs it would analyse, and writes nothing. Then
-	   pick a pair and gather the evidence:
+	          ${TESTRAY_URL}
+	          Control Panel -> Users and Organizations -> Test Test
+	          -> Roles -> assign "Testray Administrator"
 
-	       ./scripts/triage_pipeline.sh -b <older> -t <newer> --no-classify
+	   2. TEST THE SCANNER. Free, and writes nothing:
 
-	   Getting verdicts calls a model and costs money; QUICKSTART-LOCAL-TESTRAY.md
-	   step 6 covers it, and \`classify --dry-run\` prices a run before you commit
-	   to it.
+	          .venv/bin/testray-analysis scan --once --routine <id> --dry-run
+	${ROUTINES:+
+	      Routines on this instance:
+	${ROUTINES}}
+	      It prints the build pairs it would queue and why. Drop \\`--dry-run\\`
+	      to actually queue them.
+
+	   3. TEST THE BUTTON. In a routine's build list, right-click the older
+	      build -> Select Triage Baseline, right-click the newer one ->
+	      Select Triage Target, then Run Triage on the target. Pick two builds
+	      that ran the same tests, or the comparison means nothing.
+
+	      That writes a queued run and nothing more.
+
+	   4. DRAIN whatever is queued, from either source:
+
+	          .venv/bin/testray-analysis watch --once --classify
+
+	      That runs the whole loop for each queued pair — reads the builds,
+	      diffs the commits, asks a model for verdicts, writes them back to
+	      Testray, renders the report and leaves a Slack message — then
+	      exits. Refresh the Triage page and the verdicts are there.
+
+	      \\`--classify\\` is what makes it a real run. Without it the drainer
+	      stops after the free half and prints two commands to finish by hand.
+
+	      It defaults to the \\`claude-code\\` engine, which uses your Claude
+	      Code subscription and needs the \\`claude\\` CLI installed and signed
+	      in. Add \\`--engine api\\` to bill the Anthropic API instead — that
+	      path is capped at \$15 per run, and a Stable-sized run is about
+	      \$0.27.
+
+	      To watch it happen live instead, drop \\`--once\\`: it polls every ten
+	      seconds until you stop it, and the build list shows each run as a
+	      coloured diamond while it works.
+
+	   If a queued run is never picked up, the drainer is pointed at a
+	   different instance or the row was never written:
+	   \\`.venv/bin/testray-analysis preflight\\` says which.
 
 END

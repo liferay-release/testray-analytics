@@ -65,6 +65,14 @@ confusing ways.
 ./scripts/local/setupTestray.sh --fresh
 ```
 
+Most of those 20 minutes is a single silent wait for the portal to answer. It
+looks identical to a hang, so watch what is actually happening in another
+terminal:
+
+```bash
+docker logs -f --tail 100 testray-liferay
+```
+
 `--fresh` destroys the database first. That wipes the OAuth application and
 every row you loaded before, so use it the first time and then avoid it.
 
@@ -179,9 +187,11 @@ It must finish with `DONE`. `DONE WITH GAPS` means rows are missing.
 Useful flags: `--build-limit N`, `--skip-caseresults` (structure only, ~1
 minute), `--project <id>`.
 
-> **Local ids are not prod ids.** The local twin of Stable is routine
-> **115520** in project **114660**, not 79529/35392. Use the local numbers when
-> you are working against localhost.
+> **Local ids are not prod ids, and they are not fixed.** `loadTestrayData.py`
+> creates its own rows, so the routine and project ids on your instance are
+> whatever it assigned — on one machine the Stable mirror came out as routine
+> 115520 in project 114660, but do not assume yours matches. Look them up after
+> loading (step 7 shows how) and use those numbers for anything local.
 
 ---
 
@@ -255,15 +265,92 @@ a build.
 
 ## Step 7 — try the unattended path
 
-What release-master runs every 30 minutes, against your local instance:
+Two producers can queue work, and one drainer does it. Try the button first —
+it is the part that proves the client extension, the Objects and the pipeline
+are wired to each other.
+
+**Start the drainer.** With `--classify` it runs the whole loop when work
+appears — verdicts, the write back to Testray, the report and the Slack
+message:
 
 ```bash
-.venv/bin/testray-analysis scan  --once --routine 115520 --dry-run
-.venv/bin/testray-analysis watch --once            # no --classify: free
+.venv/bin/testray-analysis watch --classify
 ```
 
-`scan` queues builds whose failures have no verdict yet; `watch` drains the
-queue. Running only `watch` does nothing, because nothing queued anything.
+It polls every ten seconds, so leave it running while you do the next two
+steps. Without `--classify` it stops after the free half and prints the two
+commands to finish by hand — useful when you only want to see the evidence.
+
+The default engine is `claude-code`, which uses your Claude Code subscription
+and needs the `claude` CLI signed in. `--engine api` bills the Anthropic API
+instead, where the $15 per-run cap applies.
+
+**Give yourself the role.** Run Triage is restricted to Testray Administrators,
+so on a fresh instance the option does not appear at all — the UI hides what you
+cannot do rather than failing when you try it:
+
+> `http://localhost:8080` → Control Panel → Users and Organizations → **Test
+> Test** → Roles → assign **Testray Administrator**
+
+**Pick a pair from the build list.** Right-click the older build → *Select
+Triage Baseline*; right-click the newer one → *Select Triage Target*. The Triage
+column then offers **Run Triage** on the target.
+
+Clicking it writes a queued run and nothing more. The drainer picks it up within
+ten seconds and prints each step; the build list shows the state as a coloured
+diamond meanwhile.
+
+**The scheduled path** is the same drainer with a scanner in front, which is
+what release-master runs every 30 minutes:
+
+```bash
+.venv/bin/testray-analysis scan --once --routine <local routine id> --dry-run
+```
+
+`scan` queues builds whose failures have no verdict yet. Running only `watch`
+does nothing on its own, because nothing has queued anything.
+
+### Why `scan` needs the routine id spelled out here
+
+`triage.scan.routines` in config names **prod** routines — 79529 is Stable on
+`testray.liferay.com`. Locally those ids do not exist. `loadTestrayData.py`
+creates its own rows, so the local Stable routine has whatever id this instance
+assigned it, and there is no way to know that id before the data is loaded.
+
+So a bare `.venv/bin/testray-analysis scan --once` on a local instance scans a
+routine that is not there and reports nothing red — which reads exactly like a
+healthy instance rather than a misconfiguration. It is the same trap as an
+incomparable build pair: quiet, and wrong.
+
+Two ways round it, and the order matters — **load the data first, then look up
+the id**:
+
+**Find the id.** `setup_local_testray.sh` prints the routines it finds when it
+finishes. Any time after that:
+
+```bash
+.venv/bin/python -c "
+from testray_analytics.analysis.prepare import load_config, fetch_paginated, _testray_oauth_token
+tr = load_config()['testray']
+for r in fetch_paginated('/o/c/routines', {'pageSize': '50'},
+                         token=_testray_oauth_token(tr), base_url=tr['base_url']):
+    print(r['id'], r.get('name'))"
+```
+
+**Then either:**
+
+- **Pass it per command** — `scan --once --routine <id>`. Simplest, and leaves
+  config alone. Use this for a quick test.
+- **Put it in config** — set `triage.scan.routines` to the local id in
+  `config/config.yml`. Do this when you want to exercise the scheduled path
+  *exactly* as release-master runs it, where nothing passes `--routine` and the
+  routine list comes from config alone. `config/config.yml` is gitignored, so a
+  local id cannot leak into the repo — but do not carry that file to a machine
+  pointed at prod.
+
+`git.routine_remotes` has the same shape of problem: it is keyed by routine id,
+so a local id needs its own entry naming the remote whose commits the mirrored
+builds actually carry (`brianchandotcom` for a Stable mirror).
 
 ---
 

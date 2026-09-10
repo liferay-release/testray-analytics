@@ -101,6 +101,14 @@ The environment always wins over the file.
 checkout** — not a URL. If it is wrong, nothing errors: every commit link falls
 back to `liferay/liferay-portal`, where Stable's commits do not exist yet.
 
+**Those three ids are prod. A local instance has different ones**, assigned by
+`loadTestrayData.py` when the data was copied down, and unknowable before that.
+So `scan --once` with no `--routine` scans nothing on a local instance and
+reports "nothing red", which reads like a healthy instance rather than a
+misconfiguration. When someone is working locally, look the ids up
+(`/o/c/routines`) rather than reusing the table above — QUICKSTART-LOCAL-TESTRAY.md
+§7 has the one-liner and the two ways to configure it.
+
 ## Running the tests
 
 ```bash
