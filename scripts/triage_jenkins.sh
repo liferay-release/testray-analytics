@@ -132,12 +132,24 @@ function main {
 
 	[ -d "${TRIAGE_REPO_PATH}" ] || die "TRIAGE_REPO_PATH=${TRIAGE_REPO_PATH} is not a directory. prepare needs a persistent liferay-portal checkout to diff against."
 
-	if [ "${_CLASSIFY}" == "true" ] && [ "${_ENGINE}" == "api" ] && [ -z "${ANTHROPIC_API_KEY}" ]
+	if [ "${_CLASSIFY}" == "true" ] && [ "${_ENGINE}" == "api" ]
 	then
-		# Named explicitly because the variable is easy to misspell, and the
-		# claude-code engine scrubs it deliberately — so "it worked before" is not
-		# evidence that it is set.
-		die "ANTHROPIC_API_KEY is not set, and --engine api needs it. (Check the binding name: ANTHROPIC, not ANTROPIC.)"
+		if [[ "$(hostname)" =~ ^release-slave-[1-4]$ ]]
+		then
+			export ANTHROPIC_API_KEY=$("${_PROJECT_DIR}/scripts/get-credential.sh" "Release Team Claude API Token" "credential")
+
+			trap 'unset ANTHROPIC_API_KEY' EXIT
+
+			if [ -z "${ANTHROPIC_API_KEY}" ]
+			then
+				die "Unable to fetch ANTHROPIC_API_KEY (item 'Release Team Claude API Token', field 'credential') from 1Password Connect, and --engine api needs it."
+			fi
+		else
+			if [ -z "${ANTHROPIC_API_KEY}" ]
+			then
+				die "ANTHROPIC_API_KEY is not set."
+			fi
+		fi
 	fi
 
 	# A wrong remote is the quiet one: github_slug() falls back to
