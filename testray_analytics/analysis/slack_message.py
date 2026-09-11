@@ -115,6 +115,19 @@ def _short_build_name(name: str) -> str:
     return s
 
 
+def _axis_label(url: str) -> str:
+    """`…/1493/modules-integration-postgresql163_stable/0/0/jenkins-console.txt.gz`
+    -> `modules-integration-postgresql163_stable/0/0`.
+
+    The axis is what a reader recognises — it is how the same failure is named
+    in Jenkins and in the batch that ran it. Falls back to a plain label rather
+    than guessing when the path is not this shape.
+    """
+    path = _text(url).split("?", 1)[0].rstrip("/")
+    parts = [seg for seg in path.split("/") if seg][:-1]  # drop the filename
+    return "/".join(parts[-3:]) if len(parts) >= 3 else "console"
+
+
 def _build_url(meta: dict, build_id) -> str:
     """Testray deep-link for a build. Same shape report.py uses."""
     base, project = _text(meta.get("testray_url")), _text(meta.get("project_id"))
@@ -287,6 +300,15 @@ def _block(meta: dict, n: int, result: dict, cluster: dict,
     reason = _trim(result.get("reason"), _REASON_MAX)
     if reason:
         lines.append(f"> *Reasoning:* {reason}")
+
+    # The axis console. Our error text stops at the assertion or at "a Gradle
+    # task failed"; this log is where the failing task and its cause are
+    # actually written, and it is the first thing a person opens when the
+    # verdict is NEEDS_REVIEW. Reading it still needs a GCS grant — the link is
+    # useful anyway, because a human following it has one.
+    console = _text(cluster.get("console_url"))
+    if console:
+        lines.append(f"> *Console:* {_link(console, _axis_label(console))}")
 
     components = [c for c in _text(cluster.get("components")).split("|") if c]
     if components:

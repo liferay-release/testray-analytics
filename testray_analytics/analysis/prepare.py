@@ -767,7 +767,11 @@ def fetch_build_caseresults_api(build_id: int, cfg: dict) -> pd.DataFrame:
             "filter": f"r_buildToCaseResult_c_buildId eq '{build_id}'",
             # gitHash is a Build property, not a CaseResult one — resolved
             # separately via fetch_build_metadata().
-            "fields": "id,dueStatus,errors,"
+            # `attachments` is what carries the axis console link. It is a
+            # JSON *string* of ~2 KB per row, so it roughly doubles this
+            # response — worth it, because it is the only route from a failure
+            # to the log that says which task actually broke.
+            "fields": "id,dueStatus,errors,attachments,"
                       "r_caseToCaseResult_c_caseId,"
                       "r_subtaskToCaseResults_c_subtaskId,"
                       "r_componentToCaseResult_c_componentId,"
@@ -795,6 +799,8 @@ def fetch_build_caseresults_api(build_id: int, cfg: dict) -> pd.DataFrame:
                            for it in items],
         "status":         [(it.get("dueStatus") or {}).get("key") for it in items],
         "errors":         [it.get("errors") for it in items],
+        "console_url":    [_axis_console_url(it.get("attachments"))
+                           for it in items],
         "jira_issue":     [None] * len(items),
         "subtask_id":     [it.get("r_subtaskToCaseResults_c_subtaskId") or 0
                            for it in items],
@@ -880,6 +886,52 @@ def _jenkins_report_url(description) -> str | None:
         return None
     m = _JENKINS_REPORT_RE.search(str(description))
     return m.group(1).strip() or None if m else None
+
+
+# A caseResult's `attachments` is a JSON *string* (not a list) holding the
+# artifacts Testray recorded for that result:
+#
+#   [{"name": "Jenkins Console",
+#     "value": "2026-09/test-1-42/…/1493/modules-integration-postgresql163_stable/0/0/jenkins-console.txt.gz?authuser=0",
+#     "url":   "https://storage.cloud.google.com/testray-results/…"}, …]
+#
+# The name is the discriminator and Testray spells the two consoles
+# differently: an AXIS result carries `Jenkins Console`, while the aggregate
+# `Top Level Build` row carries `Jenkins Console (Top Level)`.
+_AXIS_CONSOLE_NAME = "Jenkins Console"
+
+
+def _axis_console_url(attachments) -> str | None:
+    """The axis-level Jenkins console for one case result, or None.
+
+    **Deliberately does not fall back to the top-level console.** Measured
+    2026-09-04: the top-level console's deepest message on a broken build is
+    `Timeout waiting for update`, which is infrastructure language for a
+    compile failure — feeding it to the classifier would confirm the "this is
+    CI, not a commit" reading it already guesses wrong. Better no link than the
+    misleading one; the axis console is the artifact that names the failing
+    task.
+
+    Tolerant of junk: the field is free-form on some importers, and a triage
+    run must not die because one row's attachments did not parse.
+    """
+    if not attachments:
+        return None
+    try:
+        parsed = (json.loads(attachments) if isinstance(attachments, str)
+                  else attachments)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(parsed, list):
+        return None
+    for entry in parsed:
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("name") or "").strip() == _AXIS_CONSOLE_NAME:
+            url = str(entry.get("url") or "").strip()
+            if url:
+                return url
+    return None
 
 
 def fetch_routine_project(routine_id: int, cfg: dict) -> int | None:
@@ -1449,6 +1501,18 @@ def compute_test_diff(baseline: pd.DataFrame, target: pd.DataFrame,
         # Nullable Int64 so the id round-trips through diff_list.csv as an
         # integer rather than 5.05505733e+08.
         out["caseresult_id"] = pd.to_numeric(crid, errors="coerce").astype("Int64")
+
+    # Same suffix cases as caseresult_id: the console that matters is the one
+    # attached to build B's failure. The baseline's console describes a run
+    # that passed.
+    if "console_url_b" in diff.columns:
+        curl = diff["console_url_b"]
+    elif "console_url" in diff.columns and target_has_ids:
+        curl = diff["console_url"]
+    else:
+        curl = None
+    if curl is not None:
+        out["console_url"] = curl.fillna("")
 
     # Propagate target-side subtask_id when present. Column name depends on
     # which sides carried it through the merge: `subtask_id_b` when both
@@ -2938,6 +3002,12 @@ def compute_subtask_groups(df: pd.DataFrame,
             "case_ids":            [int(x) for x in sub["testray_case_id"].tolist()],
             "test_cases":          [str(x) if pd.notna(x) else "" for x in sub["test_case"].tolist()],
             "components":          components,
+            # First member that has one. A cluster shares an error signature,
+            # so any member's console shows the same failure; the first is the
+            # one the block is titled with.
+            "console_url":         next(
+                (str(u).strip() for u in sub.get("console_url", pd.Series(dtype=object)).tolist()
+                 if isinstance(u, str) and str(u).strip()), ""),
             "shared_error":        shared_error,
             "all_errors":          set(err_counts.keys()),
             "linked_issues":       jiras,
@@ -3001,6 +3071,7 @@ def write_diff_list_subtasks(run_dir: Path, groups: list[dict]) -> None:
             "member_test_cases":  "|".join(g["test_cases"]),
             "components":         "|".join(g["components"]),
             "shared_error":       g["shared_error"],
+            "console_url":        g.get("console_url", ""),
             "linked_issues":      "|".join(g["linked_issues"]),
             "any_known_flaky":    g["any_known_flaky"],
             "all_known_flaky":    g["all_known_flaky"],
@@ -3404,6 +3475,10 @@ def _finalize_bundle(
         diff_list_cols.append("caseresult_id")
     if "subtask_id" in df.columns:
         diff_list_cols.append("subtask_id")
+    # The link a reader opens when the diff explains nothing. Free to carry —
+    # fetching what is behind it needs a GCS grant this pipeline does not have.
+    if "console_url" in df.columns:
+        diff_list_cols.append("console_url")
     if "baseline_signature_count" in df.columns:
         diff_list_cols.append("baseline_signature_count")
     for col in ("history_depth", "history_fail_streak"):

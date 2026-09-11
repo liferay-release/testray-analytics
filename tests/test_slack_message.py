@@ -49,7 +49,7 @@ def bundle(tmp_path, results, clusters=None, meta=None):
                          "components": "Calendar", "signature": "boom"}
                         for i, r in enumerate(results)]
     fields = ["group_id", "case_count", "member_test_cases", "components",
-              "signature"]
+              "signature", "console_url"]
     with (d / "diff_list_subtasks.csv").open("w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=fields)
         w.writeheader()
@@ -176,3 +176,57 @@ def test_the_testray_link_is_opt_in(tmp_path):
 def test_the_testray_link_needs_a_build_and_a_base(tmp_path):
     d = bundle(tmp_path, [verdict(1, "BUG")], meta={"testray_url": ""})
     assert "*Triage Report:*" not in S.render(d, link_testray=True)
+
+
+AXIS_CONSOLE = ("https://storage.cloud.google.com/testray-results/2026-09/"
+                "test-1-42/test-portal-testsuite-upstream(master)/1493/"
+                "modules-integration-postgresql163_stable/0/0/"
+                "jenkins-console.txt.gz?authuser=0")
+
+
+def test_the_console_row_names_the_axis_and_escapes_its_parens(tmp_path):
+    """The console link is the one a reader opens when the verdict explains
+    nothing, so it has to be both labelled and clickable: labelled with the
+    axis, because that is how the same failure is named in Jenkins, and with
+    its parens encoded, because Slack ends a link at the first `)` and the job
+    name has two."""
+    d = bundle(tmp_path, [verdict(1, "BUG")],
+               clusters=[{"group_id": "1", "case_count": 1,
+                          "member_test_cases": "SomeTest#case0",
+                          "components": "Calendar", "signature": "boom",
+                          "console_url": AXIS_CONSOLE}])
+    text = S.render(d)
+    assert "> *Console:* <" in text
+    assert "|modules-integration-postgresql163_stable/0/0>" in text
+    assert "test-portal-testsuite-upstream%28master%29" in text
+    assert "upstream(master)" not in text
+
+
+def test_no_console_row_when_the_cluster_has_no_axis_console(tmp_path):
+    """`Top Level Build` carries only the TOP-LEVEL console, which prepare
+    deliberately declines to record: its deepest message on a broken build is
+    `Timeout waiting for update`, and offering that as *the* log confirms the
+    "this is CI, not a commit" reading the classifier already reaches wrongly.
+    An absent row is the honest rendering."""
+    d = bundle(tmp_path, [verdict(1, "NEEDS_REVIEW")],
+               clusters=[{"group_id": "1", "case_count": 1,
+                          "member_test_cases": "Top Level Build",
+                          "components": "Batch", "signature": "",
+                          "console_url": ""}])
+    assert "*Console:*" not in S.render(d)
+
+
+def test_the_cause_is_never_truncated(tmp_path):
+    """A cause cut mid-sentence loses the mechanism, which is the only part a
+    reader can use to judge whether the attribution is credible — and a
+    half-stated cause reads as a confident one."""
+    why = ("BundleSiteInitializerTest.setUp invokes the listener without "
+           "enabling the flag, so _validate re-checks it, finds it false and "
+           "throws RoleSubtypeException, which the listener logs at ERROR and "
+           "PortalLogAssertorTest then fails on. " * 3).strip()
+    r = verdict(1, "BUG")
+    r["candidates"] = [{"commit": "0c18989a6757c", "ticket": "LPD-103976",
+                        "explains": True, "why": why}]
+    text = S.render(bundle(tmp_path, [r]))
+    assert why in text
+    assert "…" not in text.split("*Reasoning:*")[0]
