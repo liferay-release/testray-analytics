@@ -148,7 +148,7 @@ function main {
 		command -v "${_PYTHON_BIN}" > /dev/null || die "${_PYTHON_BIN} not found. Set TRIAGE_PYTHON_BIN."
 		"${_PYTHON_BIN}" -m venv .venv || die "venv creation failed"
 		.venv/bin/pip install --quiet --upgrade pip || die "pip upgrade failed"
-		.venv/bin/pip install --editable --quiet . || die "pip install -e . failed"
+		.venv/bin/pip install --quiet --editable . || die "pip install -e . failed"
 	fi
 
 	export TRIAGE_LOG_DIR=${TRIAGE_LOG_DIR:-${project_dir}/logs}
