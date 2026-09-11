@@ -105,6 +105,17 @@ _SUBSTITUTIONS = (
     (re.compile(r"(?<=:)//([^/\s:]+):\d+"), r"//\1:<port>"),
     # Memory addresses
     (re.compile(r"\b0x[0-9a-f]+\b", re.IGNORECASE), "<addr>"),
+    # A docker-compose teardown, collapsed to one token. `docker compose down`
+    # stops containers CONCURRENTLY, so the same 16 containers are logged in a
+    # different order every run. The text carries no error-bearing line, so the
+    # signature is built from the whole blob and the cap keeps only the first
+    # 100 chars — which means whichever two containers finished first decide the
+    # cluster. Acceptance build 90645729 split ONE environment failure across
+    # 13 clusters that way (61 cases; all 13 carried the identical set of 16
+    # names). Deliberately countless: 15 containers vs 16 is the same teardown,
+    # and a count would only reintroduce the split it exists to remove.
+    (re.compile(r"(?:\[exec\]\s+Removing\s+\S+\s*\.\.\.\s*)+"),
+     "[exec] Removing <containers> ... "),
 )
 
 # Everything numeric that survives — line numbers, durations, build numbers,

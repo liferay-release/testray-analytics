@@ -265,3 +265,33 @@ def test_pr_remote_template_is_configurable():
         {'git': {'pr_remote_template': 'https://example.test/{owner}/lp.git'}})
 
     assert remote == 'https://example.test/bob/lp.git'
+
+
+def test_docker_teardown_order_does_not_split_clusters():
+    """`docker compose down` stops containers concurrently, so the same
+    teardown logs its containers in a different order every run.
+
+    The text carries no error-bearing line, so the signature is built from the
+    whole blob and the 100-char cap keeps only the head — which made whichever
+    two containers finished first decide the cluster. Acceptance build
+    90645729 split ONE environment failure across 13 clusters that way (61
+    cases; all 13 carried the identical set of 16 container names).
+    """
+    def teardown(*names):
+        body = "".join(f"     [exec] Removing {n}     ...      " for n in names)
+        return f"Failed prior to running test:  {body}   [exec] Network test-1-2-3  Removed"
+
+    a = teardown("osbasahstreamcurator", "osbasahpublisher", "faro", "mariadb")
+    b = teardown("mariadb", "faro", "osbasahpublisher", "osbasahstreamcurator")
+    c = teardown("faro", "mariadb", "osbasahstreamcurator", "osbasahpublisher")
+
+    assert es.normalize(a) == es.normalize(b) == es.normalize(c)
+    assert not es.signatures_differ(a, b)
+
+    # A count would reintroduce the split it exists to remove: a run that tore
+    # down one container fewer is the same failure.
+    assert es.normalize(teardown("faro", "mariadb")) == es.normalize(a)
+
+    # But a teardown is still not the same thing as a bare "didn't run" — those
+    # carry strictly less information and must stay their own cluster.
+    assert es.normalize(a) != es.normalize("Failed prior to running test")
