@@ -35,8 +35,25 @@
 set -o pipefail
 
 function die {
-	echo "$(date '+%Y-%m-%d %H:%M:%S') ! ${*}" >&2
+	local message="$(date '+%Y-%m-%d %H:%M:%S') ! ${*}"
+
+	echo "${message}" >&2
+
 	exit 1
+}
+
+function ensure_slack_fallback {
+	# The Slack message is only ever meant to exist on a SUCCESSFUL tick — a
+	# failure is left with no file on purpose, so the Jenkins Slack Notifier's
+	# ${FILE,path=...} template has nothing to read and notifyEveryFailure
+	# posts no summary. This only covers the "ran fine but queued nothing"
+	# success case, where submit never runs to write the real file itself.
+	local slack_file="${_PROJECT_DIR}/slack/testray_analyzer_slack_message.txt"
+
+	[ -f "${slack_file}" ] && return
+
+	mkdir --parents "$(dirname -- "${slack_file}")"
+	printf '%s\n' "${1}" > "${slack_file}"
 }
 
 function log {
@@ -45,10 +62,11 @@ function log {
 
 function main {
 	local script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-	local project_dir=$(dirname -- "${script_dir}")
 
-	# _CLASSIFY, _ENGINE and _PYTHON_BIN are read by print_help and tick below,
-	# so they stay shared globals rather than locals of main.
+	# _CLASSIFY, _ENGINE, _PYTHON_BIN and _PROJECT_DIR are read by die,
+	# print_help and tick below, so they stay shared globals rather than
+	# locals of main.
+	_PROJECT_DIR=$(dirname -- "${script_dir}")
 	_CLASSIFY="true"
 	_ENGINE=${TRIAGE_ENGINE:-api}
 	local check_only="false"
@@ -91,14 +109,13 @@ function main {
 				exit 0
 				;;
 			*)
-				echo "Unknown option: ${1}" >&2
 				print_help
-				exit 1
+				die "Unknown option: ${1}"
 				;;
 		esac
 	done
 
-	cd "${project_dir}" || die "cannot cd to ${project_dir}"
+	cd "${_PROJECT_DIR}" || die "cannot cd to ${_PROJECT_DIR}"
 
 	# --- preflight --------------------------------------------------------------
 	#
@@ -151,7 +168,7 @@ function main {
 		.venv/bin/pip install --quiet --editable . || die "pip install -e . failed"
 	fi
 
-	export TRIAGE_LOG_DIR=${TRIAGE_LOG_DIR:-${project_dir}/logs}
+	export TRIAGE_LOG_DIR=${TRIAGE_LOG_DIR:-${_PROJECT_DIR}/logs}
 	mkdir --parents "${TRIAGE_LOG_DIR}" || die "cannot create ${TRIAGE_LOG_DIR}"
 
 	# Step 0 is the whole preamble: everything a reader needs to find this run's
@@ -161,8 +178,8 @@ function main {
 	log "  routines: ${TRIAGE_SCAN_ROUTINES}   engine: ${_ENGINE}   classify: ${_CLASSIFY}"
 	log "  portal:   ${TRIAGE_REPO_PATH}  (${remote_name} -> ${remote_url})"
 	log "  logs:     ${TRIAGE_LOG_DIR}  (one file per pipeline step)"
-	log "  bundles:  ${project_dir}/runs"
-	log "  slack:    ${project_dir}/slack/testray_analyzer_slack_message.txt"
+	log "  bundles:  ${_PROJECT_DIR}/runs"
+	log "  slack:    ${_PROJECT_DIR}/slack/testray_analyzer_slack_message.txt"
 
 	log "step 0: checking credentials, scopes and the triage Objects"
 
@@ -219,8 +236,18 @@ function main {
 	# The Slack message is written by submit on every run, including one that
 	# concluded nothing. Naming it here means the job's console says where the
 	# post-build step should read from.
-	local slack_file="${project_dir}/slack/testray_analyzer_slack_message.txt"
-	[ -f "${slack_file}" ] || log "note: no Slack message was written — submit did not run"
+	local slack_file="${_PROJECT_DIR}/slack/testray_analyzer_slack_message.txt"
+
+	if [ ! -f "${slack_file}" ]
+	then
+		# submit only runs when a job was actually claimed — a tick that finds
+		# nothing new to queue (everything already registered, or no failures
+		# in the window) never calls it. Still a success, so the Jenkins Slack
+		# Notifier's ${FILE,path=...} template (notifySuccess) needs something
+		# to read even though nothing was analysed this time.
+		log "note: no Slack message was written — submit did not run"
+		ensure_slack_fallback "ℹ️ Triage tick completed — nothing was submitted this run (no new work queued)."
+	fi
 
 	log "done"
 }
