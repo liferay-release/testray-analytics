@@ -175,20 +175,24 @@ fi
 # shell variable. This has cost time twice, so refuse rather than warn.
 if [ -n "${TESTRAY_CLIENT_ID}" ] || [ -n "${TESTRAY_CLIENT_SECRET}" ]
 then
-	cat <<-END >&2
-	TESTRAY_CLIENT_ID / TESTRAY_CLIENT_SECRET are set in this shell and override
-	config.yml. If they hold prod values every request will 401 against
-	${TRIAGE_TARGET_HINT:-the configured instance}.
-
-	Re-run without them:
-	  env -u TESTRAY_CLIENT_ID -u TESTRAY_CLIENT_SECRET ${0} ${ORIGINAL_ARGS[*]}
-
-	Set TRIAGE_ALLOW_ENV_CREDENTIALS=1 to proceed anyway (e.g. on Jenkins, where
-	they are set deliberately).
-	END
-
+	# Only when we are about to refuse. triage_jenkins.sh always exports
+	# TRIAGE_ALLOW_ENV_CREDENTIALS, so printing this unconditionally put a
+	# "re-run without them" instruction in every Jenkins console log — advice
+	# that, followed there, would strip the credentials the run needs.
 	if [ -z "${TRIAGE_ALLOW_ENV_CREDENTIALS}" ]
 	then
+		cat <<-END >&2
+		TESTRAY_CLIENT_ID / TESTRAY_CLIENT_SECRET are set in this shell and override
+		config.yml. If they hold prod values every request will 401 against
+		${TRIAGE_TARGET_HINT:-the configured instance}.
+
+		Re-run without them:
+		  env -u TESTRAY_CLIENT_ID -u TESTRAY_CLIENT_SECRET ${0} ${ORIGINAL_ARGS[*]}
+
+		Set TRIAGE_ALLOW_ENV_CREDENTIALS=1 to proceed anyway (e.g. on Jenkins, where
+		they are set deliberately).
+		END
+
 		exit 1
 	fi
 fi

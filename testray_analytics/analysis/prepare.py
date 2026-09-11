@@ -42,7 +42,7 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from collections import Counter
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -2094,7 +2094,8 @@ def write_run_yml(run_dir: Path, *, run_id: str,
         "total_failures":      total_failures,
         "auto_classified":     auto_classified,
         "flaky_excluded":      flaky_excluded,
-        "prepared_at":         datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "prepared_at":         datetime.now(timezone.utc).replace(tzinfo=None)
+                               .isoformat(timespec="seconds") + "Z",
     }
     (run_dir / "run.yml").write_text(
         yaml.safe_dump(metadata, sort_keys=False), encoding="utf-8",
@@ -2613,12 +2614,20 @@ def write_tickets_in_range(run_dir: Path, tickets: list[str], *,
     return out
 
 
-def describe_git_range(git_repo: Path, hash_a: str, hash_b: str) -> str:
+def describe_git_range(git_repo: Path, hash_a: str, hash_b: str,
+                       check_commits: bool = True) -> str:
     """One line naming the checkout, its branch, and whether both ends resolve.
 
     Worth printing because a silent mis-resolution looks identical to a real
     empty diff: the checkout was on `master` while the pair was a 2026.q1
     release pair, and nothing in the output said so.
+
+    `check_commits=False` when this runs BEFORE `run_git_diff`, which fetches.
+    On a fresh agent — release-slave-4 — neither SHA is in the checkout until
+    that fetch, so checking here reported "NOT in this checkout" on every
+    single run of a job that was working perfectly. A warning that always
+    fires is a warning nobody reads, which costs more than it saves the day
+    the range really is wrong.
     """
     def _git(*args) -> str:
         try:
@@ -2629,7 +2638,8 @@ def describe_git_range(git_repo: Path, hash_a: str, hash_b: str) -> str:
             return ""
     branch = _git("rev-parse", "--abbrev-ref", "HEAD") or "?"
     missing = [h[:12] for h in (hash_a, hash_b)
-               if not _git("rev-parse", "--verify", "--quiet", f"{h}^{{commit}}")]
+               if check_commits
+               and not _git("rev-parse", "--verify", "--quiet", f"{h}^{{commit}}")]
     note = f"  !! NOT in this checkout: {', '.join(missing)}" if missing else ""
     return f"repo {_disp(git_repo)} (branch {branch}){note}"
 
@@ -3376,7 +3386,7 @@ def _finalize_bundle(
     # State the provenance before the diff runs. An empty or partial diff is
     # indistinguishable from a real "nothing changed" unless the range and the
     # checkout are on the record.
-    print(f"   {describe_git_range(git_repo, hash_a, hash_b)}")
+    print(f"   {describe_git_range(git_repo, hash_a, hash_b, check_commits=False)}")
     print(f"   range {hash_a[:12]}..{hash_b[:12]}")
     diff_lines = run_git_diff(git_repo, hash_a, hash_b, diff_path,
                               fetch_specs=fetch_specs, remote=git_remote)
@@ -3604,7 +3614,7 @@ def prepare(baseline: SideSpec, target: SideSpec, classifier: str,
     print(f"Testray:    {testray_target(cfg)}")
     git_repo    = Path(cfg["git"]["repo_path"]).expanduser()
 
-    ts      = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    ts      = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     run_id  = f"r_{ts}_{baseline.build_id}_{target.build_id}"
     runs_root = (out_dir or (Path.cwd() / DEFAULT_RUNS_DIRNAME)).expanduser().resolve()
     run_dir = runs_root / run_id
