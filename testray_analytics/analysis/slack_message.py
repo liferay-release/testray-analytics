@@ -60,14 +60,25 @@ ACTIONABLE = {"BUG", "POSSIBLE_BUG", "TEST_FIX"}
 # report is the right surface.
 MAX_BLOCKS = 6
 
-# Trim lengths. Slack soft-wraps long lines into unreadable walls, and the
-# reasoning is already on the report in full.
+# Trim length for the reasoning paragraph. Slack soft-wraps long lines into
+# unreadable walls, and the reasoning is already on the report in full.
+#
+# There is deliberately no cap on a candidate's `why`. It used to be cut at 200
+# characters, which reliably severed the sentence naming the mechanism — the
+# one thing a reader needs to judge whether the attribution is credible — and a
+# half-stated cause reads as a confident one. Length is the report's problem;
+# being wrong in public is this file's.
 _REASON_MAX = 700
-_WHY_MAX = 200
 
 
 def _text(value) -> str:
     return "" if value is None else str(value).strip()
+
+
+def _flat(text: str) -> str:
+    """Collapse whitespace without shortening. Slack renders a newline inside a
+    `>` quote as an unquoted line, so the text still has to be one line."""
+    return " ".join(_text(text).split())
 
 
 def _trim(text: str, cap: int) -> str:
@@ -89,6 +100,19 @@ def _link(url: str, label: str) -> str:
     if not u:
         return _text(label)
     return f"<{u.replace('(', '%28').replace(')', '%29')}|{_text(label)}>"
+
+
+def _short_build_name(name: str) -> str:
+    """`[master] ci:test:stable - 19505 - …` -> `ci:test:stable - 19505 - …`.
+
+    Only a LEADING bracket is stripped — the build name ends in a timestamp
+    like `[05:05:51]`, and a greedy strip would eat the part that distinguishes
+    two builds of the same routine on the same day.
+    """
+    s = _text(name)
+    if s.startswith("[") and "]" in s:
+        s = s.split("]", 1)[1].lstrip()
+    return s
 
 
 def _build_url(meta: dict, build_id) -> str:
@@ -218,7 +242,7 @@ def _cause_row(meta: dict, result: dict) -> str:
         if _text(cand.get("author")):
             bits.append(f"({_text(cand['author'])})")
         label = "Likely cause" if cand.get("explains") else "Closest in range"
-        why = _trim(cand.get("why"), _WHY_MAX)
+        why = _flat(cand.get("why"))
         return f"> *{label}:* {' '.join(bits)}{' — ' + why if why else ''}"
 
     culprit = _text(result.get("culprit_file"))
@@ -285,11 +309,7 @@ def render(run_dir: Path, *, report_url: str = "",
     meta, results, clusters, caseresult_ids = _load(run_dir)
 
     build_b = _text(meta.get("build_b_name")) or _text(meta.get("build_id_b"))
-    build_a = _text(meta.get("build_a_name")) or _text(meta.get("build_id_a"))
-    # Full names stay on the bullet row where there is space for them; the
-    # headline gets the short form.
-    head_b = _trim(build_b, 58)
-    routine = _text(meta.get("routine_id"))
+    head_b = _trim(_short_build_name(build_b), 58)
 
     # Worst first, then biggest: the same order the report leads with, so the
     # two artifacts cannot disagree about what the headline failure is.
@@ -306,8 +326,11 @@ def render(run_dir: Path, *, report_url: str = "",
     rollup = V.rollup([_verdict_of(r) for r in results]) if results else "PENDING"
     siren = "🚨" if rollup in ACTIONABLE else "🔍"
 
-    headline = (f"Testray triage — routine {routine} build {head_b}"
-                if routine else f"Testray triage — build {head_b}")
+    # The build name IS the link, and carries no `routine N build` preamble:
+    # the routine is implied by the channel the message lands in, and the two
+    # ids in front of the name pushed the build number — the only part a reader
+    # scans for — past where Slack truncates a notification preview.
+    headline = _link(_build_url(meta, meta.get("build_id_b")), head_b)
     compare = _compare_url(meta)
     head = f"{siren} *{headline}*"
     if compare:
@@ -316,9 +339,10 @@ def render(run_dir: Path, *, report_url: str = "",
 
     lines = [head]
 
-    lines.append(f"• *Baseline → Target:* "
-                 f"{_link(_build_url(meta, meta.get('build_id_a')), build_a)}"
-                 f" → {_link(_build_url(meta, meta.get('build_id_b')), build_b)}")
+    # No `Baseline → Target` row: the target is the headline link now, and the
+    # baseline's only real use is the commit range, which the compare link on
+    # the headline already spells out. Two build links that differ by one digit
+    # cost a reader more than they tell them.
 
     # The Jenkins job that produced the build. Named "Top Level Build" to
     # match Testray's own label for it, and worth a row of its own on Stable:
@@ -329,14 +353,11 @@ def render(run_dir: Path, *, report_url: str = "",
         lines.append(f"• *Top Level Build:* "
                      f"{_link(jenkins, jenkins.rstrip('/').rpartition('/job/')[2] or 'open in Jenkins')}")
 
-    total = _text(meta.get("total_failures"))
-    lines.append(f"• *Clusters:* {len(results)} classified"
-                 + (f" over {total} failure(s)" if total else ""))
-
     # Two report links, and they are not interchangeable. The Testray one is
     # where the team already works and where the verdicts now live; the
     # published one is the standalone HTML, which is what exists on an
-    # instance whose Objects are not deployed.
+    # instance whose Objects are not deployed. Both sit above the cluster count
+    # so the two "where do I read this" rows stay together under the build.
     if link_testray:
         tr = triage_url(meta)
         if tr:
@@ -345,6 +366,10 @@ def render(run_dir: Path, *, report_url: str = "",
     url = _text(report_url) or _text(meta.get("report_url"))
     if url:
         lines.append(f"• *Full Report:* {_link(url, 'report')}")
+
+    total = _text(meta.get("total_failures"))
+    lines.append(f"• *Clusters:* {len(results)} classified"
+                 + (f" over {total} failure(s)" if total else ""))
 
     # The verdict census. Stated even when it is all NEEDS_REVIEW — "the run
     # explained nothing" is the single most useful thing a reader can learn
