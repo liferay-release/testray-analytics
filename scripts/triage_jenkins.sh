@@ -70,6 +70,9 @@ function main {
 	# print_help and tick below, so they stay shared globals rather than
 	# locals of main.
 	_PROJECT_DIR=$(dirname -- "${script_dir}")
+
+	trap 'unset TESTRAY_CLIENT_ID TESTRAY_CLIENT_SECRET ANTHROPIC_API_KEY' EXIT
+
 	_CLASSIFY="true"
 	_ENGINE=${TRIAGE_ENGINE:-api}
 	local check_only="false"
@@ -130,14 +133,34 @@ function main {
 	# repo that does not have the commits, and a missing API key surfaces minutes
 	# into a run rather than at the start.
 
-	for var in TESTRAY_CLIENT_ID TESTRAY_CLIENT_SECRET TRIAGE_REPO_PATH \
-		TRIAGE_SCAN_ROUTINES
+	for var in TRIAGE_REPO_PATH TRIAGE_SCAN_ROUTINES
 	do
 		if [ -z "${!var}" ]
 		then
 			die "Unable to find ${var} in the environment. See --help."
 		fi
 	done
+
+	if [[ "$(hostname)" =~ ^release-slave-[1-4]$ ]]
+	then
+		export TESTRAY_CLIENT_ID=$("${_PROJECT_DIR}/scripts/get-credential.sh" "Testray OAuth - Liferay Release User" "username")
+		export TESTRAY_CLIENT_SECRET=$("${_PROJECT_DIR}/scripts/get-credential.sh" "Testray OAuth - Liferay Release User" "password")
+
+		if [ -z "${TESTRAY_CLIENT_ID}" ] || [ -z "${TESTRAY_CLIENT_SECRET}" ]
+		then
+			die "Unable to fetch Testray OAuth credentials from 1Password Connect."
+		fi
+	else
+		if [ -z "${TESTRAY_CLIENT_ID}" ]
+		then
+			die "Unable to find TESTRAY_CLIENT_ID in the environment. See --help."
+		fi
+
+		if [ -z "${TESTRAY_CLIENT_SECRET}" ]
+		then
+			die "Unable to find TESTRAY_CLIENT_SECRET in the environment. See --help."
+		fi
+	fi
 
 	if [ ! -d "${TRIAGE_REPO_PATH}" ]
 	then
@@ -149,8 +172,6 @@ function main {
 		if [[ "$(hostname)" =~ ^release-slave-[1-4]$ ]]
 		then
 			export ANTHROPIC_API_KEY=$("${_PROJECT_DIR}/scripts/get-credential.sh" "Release Team Claude API Token" "credential")
-
-			trap 'unset ANTHROPIC_API_KEY' EXIT
 
 			if [ -z "${ANTHROPIC_API_KEY}" ]
 			then
