@@ -34,8 +34,8 @@ run those commands in the right order. **Money is spent in exactly one place:
 `classify`.** Everything else is free; the steps above it only decide whether
 that one gets reached.
 
-`scripts/triage_jenkins.sh` — the entry point on **release-master**, run
-every 30 minutes:
+`scripts/triage_jenkins.sh` — the entry point on **release-master**, triggered
+by a hook on the Jenkins side when a Stable build fails:
 
 | Command | What it does |
 |---|---|

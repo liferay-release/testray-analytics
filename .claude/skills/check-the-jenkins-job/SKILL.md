@@ -1,11 +1,12 @@
 ---
 name: check-the-jenkins-job
-description: Diagnose the scheduled triage job on Jenkins — it failed, it posted nothing to Slack, it says "Nothing queued", no diamond appears in Testray, or the commit links point at the wrong repository. Use for any question about why the every-30-minutes triage job is not behaving. Each symptom here has one known cause and one fix.
+description: Diagnose the triage job on Jenkins — it failed, it posted nothing to Slack, it says "Nothing queued", no diamond appears in Testray, or the commit links point at the wrong repository. Use for any question about why the failure-triggered triage job is not behaving. Each symptom here has one known cause and one fix.
 ---
 
 # Check the Jenkins triage job
 
-The job runs `./scripts/triage_jenkins.sh` every 30 minutes. Its setup is
+The job runs `./scripts/triage_jenkins.sh` when a Stable build fails, triggered
+by a hook on the Jenkins side. Its setup is
 documented in [JENKINS-SETUP.md](../../../JENKINS-SETUP.md); this is for when it
 is already set up and something looks wrong.
 
@@ -34,7 +35,7 @@ anything.
 
 | Code | Meaning | What to do |
 |---|---|---|
-| 0 | ran, **or** skipped because another run still holds the lock | nothing. A skip is normal under a 30-minute trigger |
+| 0 | ran, **or** skipped because another run still holds the lock | nothing, unless skips repeat — the skipped build waits for the next Stable failure, not for half an hour |
 | 1 | preflight or usage — a missing secret, a bad git remote, no portal checkout, a missing OAuth scope | read the message; it names the fix |
 | 2 | a pipeline step failed | open the step's own log, named in the console |
 

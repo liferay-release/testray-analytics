@@ -11,8 +11,9 @@ already schedules recurring work:
 Three properties are borrowed verbatim, and they are the whole reason this
 module exists rather than the scanner just calling the pipeline directly:
 
-  1. **Cron never runs the work.** It enqueues a marker; something else drains.
-     A 30-minute tick and a 10-minute job stop being coupled.
+  1. **The trigger never runs the work.** It enqueues a marker; something else
+     drains. A hook that fires on a failing build and a job that takes ten
+     minutes stop being coupled.
   2. **Enqueue is idempotent.** Re-registering an already-pending job is a
      no-op, so a tick landing while the previous job is still running cannot
      stack duplicates up.

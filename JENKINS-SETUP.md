@@ -1,6 +1,6 @@
 # Running triage on release-master
 
-Every 30 minutes: find Stable builds whose failures nobody has accounted for,
+When a Stable build fails: find the builds whose failures nobody has accounted for,
 work out which commits caused them, write the verdicts back to Testray, and
 post a summary to `#portal-failures`.
 
@@ -79,9 +79,13 @@ including one that concluded nothing — silence and success are
 indistinguishable otherwise.
 
 A tick that finds the previous tick still running exits **0** and logs
-`skipped: another tick still holds …`. That is deliberate: under a 30-minute
-trigger with a classify run that can take longer, overlap is normal and should
-not read as a failure.
+`skipped: another tick still holds …`. That is deliberate — a job that notifies
+on failure must not be woken by it — but read it differently now that the job is
+triggered by a failing build rather than a timer: a skip means *that* failing
+build went unanalysed. It is not lost, because the next trigger's `--catch-up`
+examines several failing builds rather than only the newest. It just waits for
+the next Stable failure instead of for the next half hour, which on a quiet week
+is days. A skip that repeats is worth opening.
 
 ---
 

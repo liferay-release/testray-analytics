@@ -119,8 +119,8 @@ Where waiting work sits. Two possible places, chosen automatically:
   queued or failed run is invisible outside the logs.
 
 **Tick**
-One pass of the release-master job: scan once, drain once. It runs a tick every
-30 minutes.
+One pass of the release-master job: scan once, drain once. A tick runs when a
+Stable build fails, not on a timer.
 
 **Dry run**
 A run that does everything except spend money. `classify --dry-run` reports what

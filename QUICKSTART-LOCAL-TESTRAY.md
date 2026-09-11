@@ -301,7 +301,7 @@ ten seconds and prints each step; the build list shows the state as a coloured
 diamond meanwhile.
 
 **The scheduled path** is the same drainer with a scanner in front, which is
-what release-master runs every 30 minutes:
+what release-master runs when a Stable build fails:
 
 ```bash
 .venv/bin/testray-analysis scan --once --routine <local routine id> --dry-run

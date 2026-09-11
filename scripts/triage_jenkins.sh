@@ -2,7 +2,8 @@
 #
 # triage_jenkins.sh — find newly broken builds and explain what broke them.
 #
-# Runs on a schedule — every 30 minutes on Jenkins. Each run looks for builds
+# Triggered by a hook on the Jenkins side when a Stable build fails — not on a
+# timer. Each run looks for builds
 # whose test failures nobody has accounted for yet, then analyses them: it reads
 # the failures out of Testray, works out which commits could have caused them,
 # writes the verdicts back so the team can see them in Testray, and leaves a
@@ -28,9 +29,10 @@
 # originally specified — drains an empty queue forever.
 #
 # Exit codes: 0 ok (including a tick skipped because another is still
-# running — under a 30-minute trigger that is the healthy case, not a failure,
-# and a job that notifies on failure must not be woken by it), 1 usage or
-# preflight, 2 a step failed.
+# running — a job that notifies on failure must not be woken by an overlap), 1
+# usage or preflight, 2 a step failed. A skip is recoverable rather than free:
+# the build that triggered it waits for the NEXT Stable failure to be picked up
+# by --catch-up, which is no longer half an hour away.
 
 set -o pipefail
 
@@ -272,10 +274,10 @@ function main {
 	# --- one tick, under a lock -------------------------------------------------
 	#
 	# The lock is here rather than left to the job's "do not allow concurrent
-	# builds" checkbox because the cost of getting it wrong is money: a classify
-	# run can outlast the 30-minute trigger, and nothing in the queue stops two
-	# drainers claiming the same work. A second tick exits 3 immediately, which
-	# reads as "skipped", not as a failure.
+	# builds" checkbox because the cost of getting it wrong is money: two Stable
+	# builds can fail inside one classify run, firing the hook twice, and nothing
+	# in the queue stops two drainers claiming the same work. A second tick exits
+	# 3 immediately, which reads as "skipped", not as a failure.
 	local lock_file=${TRIAGE_LOCK_FILE:-${TMPDIR:-/tmp}/triage_jenkins.lock}
 
 	local rc
