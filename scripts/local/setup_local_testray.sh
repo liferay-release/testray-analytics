@@ -75,18 +75,31 @@ while [ ${#} -gt 0 ]; do
 	esac
 done
 
-cd "${REPO_ROOT}" || die "cannot cd to ${REPO_ROOT}"
+if ! cd "${REPO_ROOT}"
+then
+	die "Unable to cd to ${REPO_ROOT}"
+fi
 
 # --- step 0: the things that fail late if you do not check them early -------
 
 step "step 0: prerequisites"
 
-command -v docker >/dev/null || die "docker is not installed."
-docker info >/dev/null 2>&1 || die "docker is installed but not running. Start it and re-run."
+if ! command -v docker >/dev/null
+then
+	die "Unable to find docker on this machine. Install it and re-run."
+fi
+
+if ! docker info >/dev/null 2>&1
+then
+	die "Unable to reach docker (installed but not running). Start it and re-run."
+fi
 
 if [ -z "${PYTHON_BIN}" ]; then
 	for candidate in python3.13 python3.12 python3.11 python3; do
-		command -v "${candidate}" >/dev/null || continue
+		if ! command -v "${candidate}" >/dev/null
+		then
+			continue
+		fi
 		if "${candidate}" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null; then
 			PYTHON_BIN="${candidate}"
 			break
@@ -94,29 +107,38 @@ if [ -z "${PYTHON_BIN}" ]; then
 	done
 fi
 
-[ -n "${PYTHON_BIN}" ] || die "no python 3.11+ found (looked for python3.13, python3.12, python3.11, python3).
+if [ -z "${PYTHON_BIN}" ]
+then
+	die "Unable to find python 3.11+ (looked for python3.13, python3.12, python3.11, python3).
    Install one, or point at it: TRIAGE_PYTHON_BIN=/path/to/python $(basename "${0}")"
+fi
 
 for d in "${PORTAL_DIR}" "${TESTRAY2_DIR}"; do
-	[ -d "${d}" ] || die "missing ${d}
+	if [ ! -d "${d}" ]
+	then
+		die "Unable to find ${d}
    Expected the repos side by side. Clone what is missing:
        git clone git@github.com:liferay-release/liferay-portal.git ${PORTAL_DIR}
        git clone https://github.com/dxpcloud/testray2 ${TESTRAY2_DIR}
    Or point at them: TESTRAY_PORTAL_DIR=… TESTRAY2_DIR=… $(basename "${0}")"
+	fi
 done
 
 # The build patches three Testray source files and restores them afterwards. It
 # refuses to touch a file you have already modified — and then the patch does
 # not apply and the failure surfaces later, as a 500 on a page.
 DIRTY="$(git -C "${PORTAL_DIR}" status --porcelain -- workspaces/ 2>/dev/null)"
-[ -z "${DIRTY}" ] || die "${PORTAL_DIR}/workspaces has local modifications:
+if [ -n "${DIRTY}" ]
+then
+	die "Unable to build: ${PORTAL_DIR}/workspaces has local modifications:
 ${DIRTY}
    The setup patches three files there and needs a clean tree. Discard them:
        git -C ${PORTAL_DIR} checkout -- workspaces/"
+fi
 
 ON_BRANCH="$(git -C "${PORTAL_DIR}" rev-parse --abbrev-ref HEAD 2>/dev/null)"
 if [ "${ON_BRANCH}" != "${PORTAL_BRANCH}" ]; then
-	die "${PORTAL_DIR} is on '${ON_BRANCH}', not '${PORTAL_BRANCH}'.
+	die "Unable to build from ${PORTAL_DIR}: on '${ON_BRANCH}', not '${PORTAL_BRANCH}'.
    That branch carries the triage client extensions. Building from another one
    deploys a bundle with the Triage column missing — and nothing tells you:
        git -C ${PORTAL_DIR} checkout ${PORTAL_BRANCH}"
@@ -163,14 +185,31 @@ if [ "${FRESH}" == "false" ] && testray_is_up; then
 	log "   already answering at ${TESTRAY_URL} — skipping (pass --fresh to rebuild)"
 else
 	args=()
-	[ "${FRESH}" == "true" ] && args+=(--fresh)
+
+	if [ "${FRESH}" == "true" ]
+	then
+		args+=(--fresh)
+	fi
+
 	log "   running setupTestray.sh ${args[*]} — about 20 minutes"
 	log "   most of that is one silent wait for the portal to answer."
 	log "   Watch it in another terminal:"
 	log "       docker logs -f --tail 100 testray-liferay"
-	"${SCRIPT_DIR}/setupTestray.sh" "${args[@]}" || die "setupTestray.sh failed. Its output is above, and ${SCRIPT_DIR}/logs/ has the detail."
-	testray_is_up || die "setupTestray.sh finished but ${TESTRAY_URL} does not answer."
-	testray_objects_ready || die "${TESTRAY_URL} is up but /o/c/routines 404s — the Testray client extension did not install. ${SCRIPT_DIR}/TESTRAY-SETUP.md has the recovery steps."
+
+	if ! "${SCRIPT_DIR}/setupTestray.sh" "${args[@]}"
+	then
+		die "Unable to run setupTestray.sh. Its output is above, and ${SCRIPT_DIR}/logs/ has the detail."
+	fi
+
+	if ! testray_is_up
+	then
+		die "Unable to reach ${TESTRAY_URL} after setupTestray.sh finished."
+	fi
+
+	if ! testray_objects_ready
+	then
+		die "Unable to confirm the Testray client extension installed: ${TESTRAY_URL} is up but /o/c/routines 404s. ${SCRIPT_DIR}/TESTRAY-SETUP.md has the recovery steps."
+	fi
 fi
 
 # --- step 2: this tool ------------------------------------------------------
@@ -181,15 +220,28 @@ if [ -x .venv/bin/testray-analysis ]; then
 	log "   .venv already built — skipping"
 else
 	log "   building .venv with ${PYTHON_BIN}"
-	"${PYTHON_BIN}" -m venv .venv || die "venv creation failed"
-	.venv/bin/pip install --quiet --upgrade pip || die "pip upgrade failed"
-	.venv/bin/pip install --quiet -e . || die "pip install -e . failed"
+
+	if ! "${PYTHON_BIN}" -m venv .venv
+	then
+		die "Unable to create the venv"
+	fi
+
+	if ! .venv/bin/pip install --quiet --upgrade pip
+	then
+		die "Unable to upgrade pip"
+	fi
+
+	if ! .venv/bin/pip install --quiet -e .
+	then
+		die "Unable to run pip install -e ."
+	fi
 fi
 
-[ -f config/config.yml ] || {
+if [ ! -f config/config.yml ]
+then
 	cp config/config.yml.example config/config.yml
 	log "   wrote config/config.yml from the example (gitignored)"
-}
+fi
 
 # --- step 3: the one manual step -------------------------------------------
 #
@@ -238,7 +290,10 @@ if ! has_credentials; then
 fi
 
 log "   credentials present — verifying what the token actually carries"
-.venv/bin/testray-analysis preflight || die "preflight failed. The output above says which scope or object is missing."
+if ! .venv/bin/testray-analysis preflight
+then
+	die "Unable to complete preflight. The output above says which scope or object is missing."
+fi
 
 # --- step 4: real data ------------------------------------------------------
 
@@ -253,8 +308,11 @@ else
 		log "   ${BUILD_COUNT} build(s) already loaded — skipping (safe to re-run by hand)"
 	else
 		log "   copying builds down from prod — about 10 minutes"
-		.venv/bin/python "${SCRIPT_DIR}/loadTestrayData.py" \
-			|| die "loadTestrayData.py failed. Prod credentials go in config/config.yml as prod_client_id / prod_client_secret."
+
+		if ! .venv/bin/python "${SCRIPT_DIR}/loadTestrayData.py"
+		then
+			die "Unable to run loadTestrayData.py. Prod credentials go in config/config.yml as prod_client_id / prod_client_secret."
+		fi
 	fi
 fi
 
@@ -269,10 +327,12 @@ else
 	# set, and an unset one turns off the guard that stops a bundle built from
 	# the wrong branch — which deploys cleanly and leaves the Triage column
 	# blank with nothing to tell you why.
-	TESTRAY_EXPECT_BRANCH="${PORTAL_BRANCH}" \
-	"${SCRIPT_DIR}/deployCx.sh" liferay-testray-analytics-custom-element \
-		|| die "deployCx.sh failed. If it says 'tsc: not found', node_modules is gone:
+	if ! TESTRAY_EXPECT_BRANCH="${PORTAL_BRANCH}" \
+		"${SCRIPT_DIR}/deployCx.sh" liferay-testray-analytics-custom-element
+	then
+		die "Unable to run deployCx.sh. If it says 'tsc: not found', node_modules is gone:
        cd ${PORTAL_DIR}/workspaces/liferay-testray-workspace && yarn install --frozen-lockfile"
+	fi
 fi
 
 # --- done -------------------------------------------------------------------

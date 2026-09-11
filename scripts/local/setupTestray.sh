@@ -122,7 +122,7 @@ die()  { printf '\n\033[31mFAILED: %s\033[0m\n' "$*" | tee -a "$LOG_FILE" >&2; e
 # pipefail` is on, so piping through here still surfaces the command's failure.
 sink() { if (( VERBOSE )); then tee -a "$LOG_FILE"; else cat >>"$LOG_FILE"; fi; }
 
-trap 'die "aborted at line $LINENO — see $LOG_FILE"' ERR
+trap 'die "Unable to continue — aborted at line $LINENO. See $LOG_FILE"' ERR
 
 # Sources are patched in place just long enough to build them, then restored on
 # any exit — success, failure or Ctrl-C — so a patch can never be left behind
@@ -131,8 +131,15 @@ PATCHED_FILES=()
 restore_patch() {
   local f
   for f in "${PATCHED_FILES[@]:-}"; do
-    [[ -n "$f" ]] || continue
-    git -C "$PORTAL" checkout -- "$f" 2>/dev/null && info "restored $(basename "$f")"
+    if [[ -z "$f" ]]
+    then
+      continue
+    fi
+
+    if git -C "$PORTAL" checkout -- "$f" 2>/dev/null
+    then
+      info "restored $(basename "$f")"
+    fi
   done
   PATCHED_FILES=()
 }
@@ -164,10 +171,16 @@ patch_file() {
 # deploy needs, whatever route it took to get there. Upstream fixing the bug
 # themselves is a pass; upstream moving the code is a loud failure.
 assert_present() {
-  grep -q "$2" "$1" 2>/dev/null || info "WARNING: $3  [$(basename "$1")]"
+  if ! grep -q "$2" "$1" 2>/dev/null
+  then
+    info "WARNING: $3  [$(basename "$1")]"
+  fi
 }
 assert_absent() {
-  grep -q "$2" "$1" 2>/dev/null && info "WARNING: $3  [$(basename "$1")]" || true
+  if grep -q "$2" "$1" 2>/dev/null
+  then
+    info "WARNING: $3  [$(basename "$1")]"
+  fi
 }
 
 # patch_with <path> <function> <description>
@@ -243,7 +256,7 @@ wait_for_portal() {
     fi
     sleep 5
   done
-  die "portal did not respond within 10 minutes"
+  die "Unable to reach the portal within 10 minutes"
 }
 
 # gradle exiting 0 only means the artifact was handed to the container; the
@@ -251,7 +264,13 @@ wait_for_portal() {
 artifact_mtime() {
   local kind="$1" pattern="$2" f
   f=$(ls -t "$BUNDLES/osgi/$kind/"*"$pattern"* 2>/dev/null | head -1) || true
-  [[ -n "${f:-}" ]] && stat -c %Y "$f" || echo 0
+
+  if [[ -n "${f:-}" ]]
+  then
+    stat -c %Y "$f"
+  else
+    echo 0
+  fi
 }
 
 # Client-extension zips keep the directory name (liferay-testray-etc-cron.zip),
@@ -265,8 +284,15 @@ artifact_pattern() {
 deploy_component() {
   local name="$1" relpath="$2" javahome="$3" kind="$4"
   local dir="$WORKSPACE/$relpath"
-  [[ -d "$dir" ]] || die "missing component directory: $dir"
-  [[ -d "$javahome" ]] || die "missing JDK: $javahome"
+  if [[ ! -d "$dir" ]]
+  then
+    die "Unable to find component directory: $dir"
+  fi
+
+  if [[ ! -d "$javahome" ]]
+  then
+    die "Unable to find JDK: $javahome"
+  fi
 
   local artifact before after
   artifact=$(artifact_pattern "$kind" "${relpath##*/}")
@@ -274,11 +300,14 @@ deploy_component() {
 
   log "Deploying $name  (JDK $(basename "$javahome"))"
   info "$dir"
-  (
+  if ! (
     cd "$dir"
     JAVA_HOME="$javahome" PATH="$javahome/bin:$PATH" \
       "$WORKSPACE/gradlew" deploy -Ddeploy.docker.container.id="$CONTAINER"
-  ) 2>&1 | sink || die "$name deploy failed — tail $LOG_FILE"
+  ) 2>&1 | sink
+  then
+    die "Unable to deploy $name — tail $LOG_FILE"
+  fi
 
   # Liferay's client-extension watcher keys off the artifact's mtime, and
   # gradle PRESERVES the source timestamp when it copies. So an unchanged build
@@ -393,9 +422,20 @@ deploy_site_initializer() {
 # --- preflight --------------------------------------------------------------
 
 log "Preflight"
-[[ -f "$COMPOSE_DIR/docker-compose.yaml" ]] || die "no docker-compose.yaml in $COMPOSE_DIR"
-[[ -x "$WORKSPACE/gradlew" ]] || die "no gradlew in $WORKSPACE"
-command -v docker >/dev/null || die "docker not on PATH"
+if [[ ! -f "$COMPOSE_DIR/docker-compose.yaml" ]]
+then
+  die "Unable to find docker-compose.yaml in $COMPOSE_DIR"
+fi
+
+if [[ ! -x "$WORKSPACE/gradlew" ]]
+then
+  die "Unable to find gradlew in $WORKSPACE"
+fi
+
+if ! command -v docker >/dev/null
+then
+  die "Unable to find docker on PATH"
+fi
 
 branch=$(git -C "$PORTAL" rev-parse --abbrev-ref HEAD)
 info "liferay-portal branch: $branch"
@@ -405,7 +445,7 @@ info "liferay-portal branch: $branch"
 # the analytics CX does not exist there at all. Continuing only buys a
 # confusing failure ten minutes later.
 if [[ "$branch" != "$EXPECTED_BRANCH" && "${ALLOW_ANY_BRANCH:-0}" != "1" ]]; then
-  die "liferay-portal is on '$branch', expected '$EXPECTED_BRANCH'.
+  die "Unable to build: liferay-portal is on '$branch', expected '$EXPECTED_BRANCH'.
 
     git -C $PORTAL switch $EXPECTED_BRANCH
 
@@ -437,7 +477,11 @@ fi
 matched=0
 for entry in "${COMPONENTS[@]}"; do
   IFS='|' read -r name relpath javahome kind <<<"$entry"
-  [[ -n "$ONLY" && "$ONLY" != "$name" ]] && continue
+  if [[ -n "$ONLY" && "$ONLY" != "$name" ]]
+  then
+    continue
+  fi
+
   matched=1
   case "$name" in
     rest-impl)        deploy_rest_impl "$relpath" "$javahome" "$kind" ;;
@@ -446,7 +490,10 @@ for entry in "${COMPONENTS[@]}"; do
     *)                deploy_component "$name" "$relpath" "$javahome" "$kind" ;;
   esac
 done
-[[ -n "$ONLY" && $matched -eq 0 ]] && die "unknown component '$ONLY' (see --list)"
+if [[ -n "$ONLY" && $matched -eq 0 ]]
+then
+  die "Unable to find component '$ONLY' (see --list)"
+fi
 
 # --- done -------------------------------------------------------------------
 

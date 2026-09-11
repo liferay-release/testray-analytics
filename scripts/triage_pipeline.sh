@@ -85,7 +85,7 @@ function run_step {
 
 	if [ "${exit_code}" -ne 0 ]
 	then
-		log "! ${name} failed after ${seconds}s (exit ${exit_code})"
+		log "! Unable to complete ${name} after ${seconds}s (exit ${exit_code})"
 		echo
 		# The tail is almost always the actual cause, and a Jenkins operator
 		# should not have to go fetch a file to see it.
@@ -149,7 +149,7 @@ do
 			break
 			;;
 		*)
-			echo "Unknown option: ${1}" >&2
+			echo "Unable to recognize option: ${1}" >&2
 			print_help
 			exit 1
 			;;
@@ -158,14 +158,14 @@ done
 
 if [ -z "${BASELINE_BUILD_ID}" ] || [ -z "${TARGET_BUILD_ID}" ]
 then
-	echo "Both --baseline-build-id and --target-build-id are required." >&2
+	echo "Unable to proceed: both --baseline-build-id and --target-build-id are required." >&2
 	print_help
 	exit 1
 fi
 
 if [ ! -x "${PYTHON}" ]
 then
-	echo "No interpreter at ${PYTHON}. Set TRIAGE_PYTHON." >&2
+	echo "Unable to find an interpreter at ${PYTHON}. Set TRIAGE_PYTHON." >&2
 	exit 1
 fi
 
@@ -187,7 +187,10 @@ then
 	they are set deliberately).
 	END
 
-	[ -z "${TRIAGE_ALLOW_ENV_CREDENTIALS}" ] && exit 1
+	if [ -z "${TRIAGE_ALLOW_ENV_CREDENTIALS}" ]
+	then
+		exit 1
+	fi
 fi
 
 mkdir -p "${TRIAGE_LOG_DIR}"
@@ -196,13 +199,16 @@ log "triage pipeline ${BASELINE_BUILD_ID} -> ${TARGET_BUILD_ID}"
 log "  mode=${MODE} classify=${CLASSIFY} engine=${ENGINE}"
 log "  logs=${TRIAGE_LOG_DIR}"
 
-run_step "prepare" \
+if ! run_step "prepare" \
 	"${PYTHON}" -m testray_analytics.analysis.prepare \
 	--baseline-build-id "${BASELINE_BUILD_ID}" \
 	--target-build-id "${TARGET_BUILD_ID}" \
 	--mode "${MODE}" \
 	--out "${OUT_DIR}" \
-	"${EXTRA_ARGS[@]}" || exit 2
+	"${EXTRA_ARGS[@]}"
+then
+	exit 2
+fi
 
 # prepare prints this line when the bundle is complete; it is the handoff to
 # every later step, so it is re-emitted on stdout as a parseable contract for
@@ -239,9 +245,12 @@ fi
 # A dry run first: it makes no model calls, takes seconds, and its log records
 # the batch plan and token estimate for the run that is about to happen. That is
 # the standing rule for anything that spends model usage — never fire blind.
-run_step "classify_dry_run" \
+if ! run_step "classify_dry_run" \
 	"${PYTHON}" -m testray_analytics.analysis.classify \
-	"${BUNDLE}" --engine "${ENGINE}" --dry-run || exit 2
+	"${BUNDLE}" --engine "${ENGINE}" --dry-run
+then
+	exit 2
+fi
 
 # Nothing classifiable means nothing to ask. Skipping is not an optimisation
 # detail: a run with zero classifiable clusters used to send its auto-only
@@ -267,18 +276,32 @@ then
 	log "  submit will still run so the report and coverage are written."
 	SKIPPED_CLASSIFY=true
 else
-	run_step "classify" \
+	if ! run_step "classify" \
 		"${PYTHON}" -m testray_analytics.analysis.classify \
-		"${BUNDLE}" --engine "${ENGINE}" || exit 2
+		"${BUNDLE}" --engine "${ENGINE}"
+	then
+		exit 2
+	fi
 fi
 
 SUBMIT_ARGS=()
-[ "${SUBMIT_DRY_RUN}" == "true" ] && SUBMIT_ARGS+=("--dry-run")
-[ "${SUBMIT_NO_WRITE}" == "true" ] && SUBMIT_ARGS+=("--no-write")
 
-run_step "submit" \
+if [ "${SUBMIT_DRY_RUN}" == "true" ]
+then
+	SUBMIT_ARGS+=("--dry-run")
+fi
+
+if [ "${SUBMIT_NO_WRITE}" == "true" ]
+then
+	SUBMIT_ARGS+=("--no-write")
+fi
+
+if ! run_step "submit" \
 	"${PYTHON}" -m testray_analytics.analysis.submit "${BUNDLE}" \
-	"${SUBMIT_ARGS[@]}" || exit 2
+	"${SUBMIT_ARGS[@]}"
+then
+	exit 2
+fi
 
 # Exit 3, distinct from both success and a step failure: the pipeline behaved
 # correctly but explained nothing about a build that is red. Under unattended

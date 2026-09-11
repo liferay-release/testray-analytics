@@ -70,8 +70,17 @@ function main {
 	local ce_dir="${workspace}/${name}"
 	local deployed="${bundles}/osgi/client-extensions/${name}.zip"
 
-	[ -d "${ce_dir}" ] || { echo "No such client extension: ${ce_dir}" >&2; exit 1; }
-	[ -f "${deployed}" ] || { echo "Not currently deployed, so there is no config to reuse: ${deployed}" >&2; exit 1; }
+	if [ ! -d "${ce_dir}" ]
+	then
+		echo "Unable to find client extension: ${ce_dir}" >&2
+		exit 1
+	fi
+
+	if [ ! -f "${deployed}" ]
+	then
+		echo "Unable to find a deployed config to reuse (not currently deployed): ${deployed}" >&2
+		exit 1
+	fi
 
 	local work=$(mktemp --directory)
 	trap 'rm --force --recursive "${work}"' EXIT
@@ -89,7 +98,7 @@ function main {
 
 	if [ -n "${TESTRAY_EXPECT_BRANCH:-}" ] && [ "${branch}" != "${TESTRAY_EXPECT_BRANCH}" ]
 	then
-		echo "   !! expected branch ${TESTRAY_EXPECT_BRANCH}, found ${branch}." >&2
+		echo "   !! Unable to confirm branch: expected ${TESTRAY_EXPECT_BRANCH}, found ${branch}." >&2
 		echo "      Refusing: building from the wrong branch can deploy a bundle" >&2
 		echo "      that silently drops features present on the other one." >&2
 		exit 1
@@ -148,13 +157,17 @@ PY
 	# AutoDeploy normally consumes it in a few seconds.
 	for _ in $(seq 1 30)
 	do
-		[ -f "${bundles}/deploy/${name}.zip" ] || break
+		if [ ! -f "${bundles}/deploy/${name}.zip" ]
+		then
+			break
+		fi
+
 		sleep 2
 	done
 
 	if [ -f "${bundles}/deploy/${name}.zip" ]
 	then
-		echo "   !! still sitting in deploy/ after 60s — is the container up?" >&2
+		echo "   !! Unable to confirm the deploy landed — still sitting in deploy/ after 60s. Is the container up?" >&2
 		exit 2
 	fi
 
@@ -178,7 +191,7 @@ PY
 		sleep 2
 	done
 
-	echo "   !! served asset still differs from the build after 60s" >&2
+	echo "   !! Unable to confirm the new build is being served — still differs after 60s" >&2
 	echo "      check ${bundles}/logs/ for a STOPPED/STARTED pair for this bundle" >&2
 	exit 2
 }

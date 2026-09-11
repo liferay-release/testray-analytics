@@ -50,7 +50,10 @@ function ensure_slack_fallback {
 	# success case, where submit never runs to write the real file itself.
 	local slack_file="${_PROJECT_DIR}/slack/testray_analyzer_slack_message.txt"
 
-	[ -f "${slack_file}" ] && return
+	if [ -f "${slack_file}" ]
+	then
+		return
+	fi
 
 	mkdir --parents "$(dirname -- "${slack_file}")"
 	printf '%s\n' "${1}" > "${slack_file}"
@@ -110,12 +113,15 @@ function main {
 				;;
 			*)
 				print_help
-				die "Unknown option: ${1}"
+				die "Unable to recognize option: ${1}"
 				;;
 		esac
 	done
 
-	cd "${_PROJECT_DIR}" || die "cannot cd to ${_PROJECT_DIR}"
+	if ! cd "${_PROJECT_DIR}"
+	then
+		die "Unable to cd to ${_PROJECT_DIR}"
+	fi
 
 	# --- preflight --------------------------------------------------------------
 	#
@@ -127,10 +133,16 @@ function main {
 	for var in TESTRAY_CLIENT_ID TESTRAY_CLIENT_SECRET TRIAGE_REPO_PATH \
 		TRIAGE_SCAN_ROUTINES
 	do
-		[ -n "${!var}" ] || die "${var} is not set. See --help."
+		if [ -z "${!var}" ]
+		then
+			die "Unable to find ${var} in the environment. See --help."
+		fi
 	done
 
-	[ -d "${TRIAGE_REPO_PATH}" ] || die "TRIAGE_REPO_PATH=${TRIAGE_REPO_PATH} is not a directory. prepare needs a persistent liferay-portal checkout to diff against."
+	if [ ! -d "${TRIAGE_REPO_PATH}" ]
+	then
+		die "Unable to use TRIAGE_REPO_PATH=${TRIAGE_REPO_PATH}: not a directory. prepare needs a persistent liferay-portal checkout to diff against."
+	fi
 
 	if [ "${_CLASSIFY}" == "true" ] && [ "${_ENGINE}" == "api" ]
 	then
@@ -147,7 +159,7 @@ function main {
 		else
 			if [ -z "${ANTHROPIC_API_KEY}" ]
 			then
-				die "ANTHROPIC_API_KEY is not set."
+				die "Unable to find ANTHROPIC_API_KEY in the environment, and --engine api needs it. (Check the binding name: ANTHROPIC, not ANTROPIC.)"
 			fi
 		fi
 	fi
@@ -160,12 +172,15 @@ function main {
 	remote_name=${remote_name:-origin}
 	local remote_url=$(git -C "${TRIAGE_REPO_PATH}" remote get-url "${remote_name}" 2> /dev/null)
 
-	[ -n "${remote_url}" ] || die "no git remote '${remote_name}' in ${TRIAGE_REPO_PATH}. TRIAGE_ROUTINE_REMOTES names a REMOTE, not a URL."
+	if [ -z "${remote_url}" ]
+	then
+		die "Unable to find git remote '${remote_name}' in ${TRIAGE_REPO_PATH}. TRIAGE_ROUTINE_REMOTES names a REMOTE, not a URL."
+	fi
 
 	case "${remote_url}" in
 		*"${expect_remote}"*) ;;
 		*)
-			die "remote '${remote_name}' is ${remote_url}, which does not contain '${expect_remote}'. Stable's commits live on brianchandotcom; the wrong remote yields links to commits that are not there. Override with TRIAGE_EXPECT_REMOTE."
+			die "Unable to confirm remote '${remote_name}' (${remote_url}) points at '${expect_remote}'. Stable's commits live on brianchandotcom; the wrong remote yields links to commits that are not there. Override with TRIAGE_EXPECT_REMOTE."
 			;;
 	esac
 
@@ -174,14 +189,34 @@ function main {
 	if [ ! -x .venv/bin/testray-analysis ]
 	then
 		log "> building venv with ${_PYTHON_BIN}"
-		command -v "${_PYTHON_BIN}" > /dev/null || die "${_PYTHON_BIN} not found. Set TRIAGE_PYTHON_BIN."
-		"${_PYTHON_BIN}" -m venv .venv || die "venv creation failed"
-		.venv/bin/pip install --quiet --upgrade pip || die "pip upgrade failed"
-		.venv/bin/pip install --quiet --editable . || die "pip install -e . failed"
+
+		if ! command -v "${_PYTHON_BIN}" > /dev/null
+		then
+			die "Unable to find ${_PYTHON_BIN}. Set TRIAGE_PYTHON_BIN."
+		fi
+
+		if ! "${_PYTHON_BIN}" -m venv .venv
+		then
+			die "Unable to create the venv"
+		fi
+
+		if ! .venv/bin/pip install --quiet --upgrade pip
+		then
+			die "Unable to upgrade pip"
+		fi
+
+		if ! .venv/bin/pip install --quiet --editable .
+		then
+			die "Unable to run pip install -e ."
+		fi
 	fi
 
 	export TRIAGE_LOG_DIR=${TRIAGE_LOG_DIR:-${_PROJECT_DIR}/logs}
-	mkdir --parents "${TRIAGE_LOG_DIR}" || die "cannot create ${TRIAGE_LOG_DIR}"
+
+	if ! mkdir --parents "${TRIAGE_LOG_DIR}"
+	then
+		die "Unable to create ${TRIAGE_LOG_DIR}"
+	fi
 
 	# Step 0 is the whole preamble: everything a reader needs to find this run's
 	# output before any of it exists. On a failure twenty minutes in, the console
@@ -196,10 +231,16 @@ function main {
 	log "step 0: checking credentials, scopes and the triage Objects"
 
 	local preflight_args=()
-	[ "${require_objects}" == "true" ] && preflight_args+=(--require-objects)
 
-	.venv/bin/testray-analysis preflight "${preflight_args[@]}" \
-		|| die "preflight failed — fix the above before running the pipeline. A 403 on an /o/c/ endpoint is a missing OAuth scope, NOT a missing deploy: the queue cannot tell them apart, so it would silently fall back to marker files and every write would be refused."
+	if [ "${require_objects}" == "true" ]
+	then
+		preflight_args+=(--require-objects)
+	fi
+
+	if ! .venv/bin/testray-analysis preflight "${preflight_args[@]}"
+	then
+		die "Unable to complete preflight — fix the above before running the pipeline. A 403 on an /o/c/ endpoint is a missing OAuth scope, NOT a missing deploy: the queue cannot tell them apart, so it would silently fall back to marker files and every write would be refused."
+	fi
 
 	if [ "${check_only}" == "true" ]
 	then
@@ -220,7 +261,10 @@ function main {
 
 	if command -v flock > /dev/null
 	then
-		exec 9> "${lock_file}" || die "cannot open lock ${lock_file}"
+		if ! exec 9> "${lock_file}"
+		then
+			die "Unable to open lock ${lock_file}"
+		fi
 		if ! flock --nonblock 9
 		then
 			# Success on purpose: the previous tick is still working, which is
@@ -310,16 +354,33 @@ function tick {
 
 	# Producer. Cheap, and never spends: REST reads plus a git diff.
 	log "step 1: scan"
-	.venv/bin/testray-analysis scan --once || return 2
+
+	if ! .venv/bin/testray-analysis scan --once
+	then
+		return 2
+	fi
+
 	log "step 1: scan ok"
 
 	# Consumer. This is the step that costs money when --classify is on.
 	local watch_args=(--once --engine "${_ENGINE}")
-	[ "${_CLASSIFY}" == "true" ] && watch_args+=(--classify)
+
+	if [ "${_CLASSIFY}" == "true" ]
+	then
+		watch_args+=(--classify)
+	fi
 
 	log "step 2: watch ${watch_args[*]}"
-	.venv/bin/testray-analysis watch "${watch_args[@]}" || rc=2
-	[[ "${rc}" -eq 0 ]] && log "step 2: watch ok"
+
+	if ! .venv/bin/testray-analysis watch "${watch_args[@]}"
+	then
+		rc=2
+	fi
+
+	if [[ "${rc}" -eq 0 ]]
+	then
+		log "step 2: watch ok"
+	fi
 
 	return "${rc}"
 }
