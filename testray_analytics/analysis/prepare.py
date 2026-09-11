@@ -1900,14 +1900,18 @@ RESULTS_SCHEMA_SUBTASK = {
             "type": "array",
             "items": {
                 "type": "object",
+                # group_id is always emitted by prepare (by-cluster: a 1-based
+                # index; by-subtask: the Testray subtask id) — see the comment
+                # at its assignment above. `anyOf` used to allow either
+                # group_id or subtask_id, for bundles written before group_id
+                # existed, but Anthropic's structured-outputs subset rejects
+                # `anyOf` as a sibling of `additionalProperties`/`properties`/
+                # `required`/`type` on the same node ("output_config.format.
+                # schema: For 'anyOf', ... is not supported"), so it is folded
+                # into `required` instead — every bundle prepare writes today
+                # already satisfies this.
                 "required": ["case_ids", "classification",
-                             "confidence", "reason"],
-                # A result must identify its group. by-cluster emits group_id;
-                # by-subtask bundles written before group_id existed emit
-                # subtask_id, so either satisfies the schema and old bundles
-                # keep validating.
-                "anyOf": [{"required": ["group_id"]},
-                          {"required": ["subtask_id"]}],
+                             "confidence", "reason", "group_id"],
                 "additionalProperties": False,
                 "properties": {
                     "group_id":        {"type": ["integer", "null"]},
