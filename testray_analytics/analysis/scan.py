@@ -48,10 +48,10 @@ DEFAULT_IMPORT_POLL_INTERVAL = 60
 # Measured live 2026-09-15 on a real trigger: hook fired at 13:40, Testray did
 # not even create the Build row until 13:43:59, and did not finish importing
 # it until ~14:04 — about 24 minutes end to end. 900s (15 min) would have
-# given up before that row ever appeared. 40 minutes leaves headroom above
-# the measured 24 without blocking the Jenkins job indefinitely on a Testray
-# outage.
-DEFAULT_IMPORT_WAIT_TIMEOUT = 2400
+# given up before that row ever appeared. 1 hour leaves generous headroom
+# above the measured 24 minutes without blocking the Jenkins job
+# indefinitely on a Testray outage.
+DEFAULT_IMPORT_WAIT_TIMEOUT = 3600
 
 # How many recent builds to consider as baseline candidates. Comfortably past
 # the measured worst case (20 builds back) without pulling whole history.

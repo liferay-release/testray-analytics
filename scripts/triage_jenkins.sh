@@ -394,7 +394,7 @@ function print_help {
 	                        (default 60) while scan --wait-for-import waits
 	                        for a just-failed build to finish importing
 	  TRIAGE_IMPORT_WAIT_TIMEOUT   seconds to wait before giving up on that
-	                        build for this tick (default 2400 = 40 min — measured
+	                        build for this tick (default 3600 = 1 hour — measured
 	                        import lag on a real trigger has been ~24 minutes)
 	END
 }

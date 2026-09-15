@@ -64,14 +64,14 @@ does both.
 - It prints `Routine …: build … is PENDING/INPROGRESS — waiting …` or
   `newest build on file is …, already DONE — watching for a newer build to
   appear …`, then `still waiting: newest is … (…) after …s` a few times, then
-  `gave up after 2400s` → this is the build that fired the hook, and Testray
+  `gave up after 3600s` → this is the build that fired the hook, and Testray
   had not finished importing it (or had not even created its row yet — see
   below) before the wait timeout. Not a bug: `--wait-for-import` (a flag on
   `triage_jenkins.sh` itself, which the failure-triggered build step should
   pass — see JENKINS-SETUP.md) polls for exactly this, and a give-up just
   means the build waits for the next Stable failure's `--catch-up`, same as
   before that flag existed. If this repeats every run, Testray's import lag
-  is longer than `TRIAGE_IMPORT_WAIT_TIMEOUT` (default 2400s = 40 min) —
+  is longer than `TRIAGE_IMPORT_WAIT_TIMEOUT` (default 3600s = 1 hour) —
   raise it in the job's environment rather than treating it as broken.
 - If the console shows none of these lines at all, check whether the build
   step is actually passing `--wait-for-import` to `triage_jenkins.sh` — it is

@@ -685,7 +685,7 @@ The flag makes `scan` poll `newest_build()` — the routine's newest build,
 unfiltered by import status, one request rather than `recent_done_builds()`'s
 whole-window fetch — before running its own pass, sleeping
 `TRIAGE_IMPORT_POLL_INTERVAL` seconds (default 60) between checks up to
-`TRIAGE_IMPORT_WAIT_TIMEOUT` (default 2400 = 40 min). Both are read from the
+`TRIAGE_IMPORT_WAIT_TIMEOUT` (default 3600 = 1 hour). Both are read from the
 environment rather than hardcoded because import lag is a property of
 Testray's queue, not of this tool — release-master can widen the timeout
 without a code change if lag grows. A timeout is a give-up, not a failure:
@@ -705,9 +705,9 @@ reference; it is satisfied only when that same build finishes importing, or a
 build with a **different id** appears already DONE — never by "whatever is
 newest right now says DONE", which is true both before and after the row
 nobody has seen yet appears. `DEFAULT_IMPORT_WAIT_TIMEOUT` was raised from the
-original 900, to 1800, to 2400 (40 min) — the measured 24-minute lag left too
-little margin under either earlier default, and 40 minutes was chosen
-deliberately over just matching the measurement.
+original 900, to 1800, to 2400, to 3600 (1 hour) — the measured 24-minute lag
+left too little margin under any of the earlier defaults, and 1 hour was
+chosen deliberately over just matching the measurement.
 
 ### Two queues, one drainer
 

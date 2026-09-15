@@ -66,10 +66,10 @@ waiting left. Instead it records whichever build is newest **the moment it is
 called** as a baseline and never updates that reference; it only proceeds once
 either that same build finishes importing, or a build with a *different* id
 shows up already DONE. It checks every `TRIAGE_IMPORT_POLL_INTERVAL` seconds
-(default 60) for up to `TRIAGE_IMPORT_WAIT_TIMEOUT` seconds (default 2400 =
-40 min — the ~24-minute measurement above, plus headroom) before giving up
-and scanning anyway. A give-up is not a failure: the build then waits for the
-next Stable
+(default 60) for up to `TRIAGE_IMPORT_WAIT_TIMEOUT` seconds (default 3600 =
+1 hour — the ~24-minute measurement above, plus generous headroom) before
+giving up and scanning anyway. A give-up is not a failure: the build then
+waits for the next Stable
 failure's `--catch-up`, same as before this flag existed.
 
 ---
