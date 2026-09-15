@@ -29,12 +29,29 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import ledger as L
-from .prepare import (_testray_oauth_token, fetch_paginated, load_config,
-                      testray_target)
+from .prepare import (_testray_oauth_token, fetch_one_page, fetch_paginated,
+                      load_config, testray_target)
 from .queue import Job, open_queue, queue_path
 
 # Cadence lives in the environment, like the job-runner's crontab expression.
 SCAN_INTERVAL_ENV = "TRIAGE_SCAN_INTERVAL"
+
+# The failure-triggered Jenkins hook (LPD-95845) fires the moment Stable's
+# build fails, which is BEFORE Testray finishes importing that build's
+# results. Queried right then, the just-failed build fails `importStatus eq
+# 'DONE'` and simply does not appear to recent_done_builds() — indistinguishable
+# from "no failures here", not "come back in a minute". These give
+# await_import() (below) somewhere to wait before scan() ever runs.
+IMPORT_POLL_INTERVAL_ENV = "TRIAGE_IMPORT_POLL_INTERVAL"
+IMPORT_WAIT_TIMEOUT_ENV = "TRIAGE_IMPORT_WAIT_TIMEOUT"
+DEFAULT_IMPORT_POLL_INTERVAL = 60
+# Measured live 2026-09-15 on a real trigger: hook fired at 13:40, Testray did
+# not even create the Build row until 13:43:59, and did not finish importing
+# it until ~14:04 — about 24 minutes end to end. 900s (15 min) would have
+# given up before that row ever appeared. 40 minutes leaves headroom above
+# the measured 24 without blocking the Jenkins job indefinitely on a Testray
+# outage.
+DEFAULT_IMPORT_WAIT_TIMEOUT = 2400
 
 # How many recent builds to consider as baseline candidates. Comfortably past
 # the measured worst case (20 builds back) without pulling whole history.
@@ -75,6 +92,100 @@ def recent_done_builds(cfg: dict, routine_id: int,
     )
     items.sort(key=lambda b: (b.get("dueDate") or ""), reverse=True)
     return items[:limit]
+
+
+def _import_status(build: dict) -> str | None:
+    """`importStatus` comes back as the bare key when it drove an OData
+    filter and as `{"key": ..., "name": ...}` from a plain read — same
+    picklist field, two shapes depending on which endpoint answered."""
+    value = build.get("importStatus")
+    return value.get("key") if isinstance(value, dict) else value
+
+
+def newest_build(tr: dict, routine_id: int) -> dict | None:
+    """The single most-recently-run build for a routine, DONE or not.
+
+    Deliberately not recent_done_builds(): that filters on `importStatus eq
+    'DONE'` server-side, so a build still PENDING or INPROGRESS is invisible
+    to it. This is the one place that has to see it anyway, to know whether
+    to keep waiting. One request, one page — not fetch_paginated, which would
+    walk the routine's whole build history to answer "what's newest" on every
+    poll.
+    """
+    items = fetch_one_page(
+        "/o/c/builds",
+        {"filter": f"r_routineToBuilds_c_routineId eq '{routine_id}'",
+         "sort": "dueDate:desc", "pageSize": 1},
+        token=_testray_oauth_token(tr), base_url=tr["base_url"],
+    )
+    return items[0] if items else None
+
+
+def await_import(tr: dict, routine_id: int, *,
+                 poll_interval: int = DEFAULT_IMPORT_POLL_INTERVAL,
+                 timeout: int = DEFAULT_IMPORT_WAIT_TIMEOUT) -> None:
+    """Block until a build newer than the one on file when this started is
+    `importStatus` DONE, or give up after `timeout` seconds.
+
+    The build the hook fired for often does not exist as a Build row AT ALL
+    yet — observed live 2026-09-15: the Jenkins job fired the hook at 13:40,
+    Testray did not create the row until 13:43:59, and did not finish
+    importing it until ~14:04. Queried at 13:40, newest_build() returns the
+    PREVIOUS build, which is long since DONE. An earlier version of this
+    function read that as "nothing to wait for" and returned immediately —
+    exactly backwards, since that IS the case with the most waiting left to
+    do. So the id seen on the FIRST call is recorded as a baseline and never
+    updated; "ready" requires either that same build finishing (the ordinary
+    PENDING/INPROGRESS-when-we-arrived case) or a build with a different id
+    showing up DONE (the row-not-created-yet case) — never "whatever is
+    newest right now happens to say DONE", which is true before AND after the
+    row nobody has seen yet appears.
+
+    Never raises and never signals failure either way: giving up just leaves
+    scan() unable to see the build this tick, exactly as if this function did
+    not exist. The backstop is the next Stable failure's `--catch-up`, not an
+    error here — a build that never finishes importing is a Testray problem,
+    not a reason to fail an otherwise-healthy triage run.
+    """
+    baseline = newest_build(tr, routine_id)
+    if baseline is None:
+        print(f"Routine {routine_id}: no builds yet — nothing to wait for.")
+        return
+
+    baseline_id = baseline["id"]
+    baseline_status = _import_status(baseline)
+    name = baseline.get("name") or baseline_id
+
+    if baseline_status == "DONE":
+        print(f"Routine {routine_id}: newest build on file is {baseline_id} "
+              f"({name}), already DONE — watching for a newer build to "
+              f"appear and finish importing, checking every {poll_interval}s "
+              f"(up to {timeout}s)", flush=True)
+    else:
+        print(f"Routine {routine_id}: build {baseline_id} ({name}) is "
+              f"{baseline_status or 'unknown'} — waiting for it, or a newer "
+              f"build, to finish importing, checking every {poll_interval}s "
+              f"(up to {timeout}s)", flush=True)
+
+    waited = 0
+    while waited < timeout:
+        time.sleep(poll_interval)
+        waited += poll_interval
+        current = newest_build(tr, routine_id)
+        status = _import_status(current) if current else None
+        is_new = current is not None and current["id"] != baseline_id
+        if status == "DONE" and (is_new or baseline_status != "DONE"):
+            which = f"new build {current['id']}" if is_new else \
+                    f"build {current['id']}"
+            print(f"  {which} imported after {waited}s", flush=True)
+            return
+        cur_id = current["id"] if current else baseline_id
+        print(f"  still waiting: newest is {cur_id} ({status or 'unknown'}) "
+              f"after {waited}s", flush=True)
+
+    print(f"  gave up after {timeout}s — scan will not see a new build this "
+          f"tick; the next Stable failure's --catch-up will pick it up",
+          flush=True)
 
 
 # Counter fields on a Build (caseResultFailed/Passed/…) are computed by Testray
@@ -266,6 +377,22 @@ def main() -> None:
                          "Object is deployed — that queue is rows, not files.")
     ap.add_argument("--dry-run", action="store_true",
                     help="report what would be queued and write nothing.")
+    ap.add_argument("--wait-for-import", action="store_true",
+                    help="before each routine's tick, poll its newest build "
+                         "until Testray reports importStatus DONE (env "
+                         "TRIAGE_WAIT_FOR_IMPORT=1). For the failure-triggered "
+                         "Jenkins hook, which fires before Testray has "
+                         "finished importing the build that failed.")
+    ap.add_argument("--import-poll-interval", type=int, default=None,
+                    metavar="SECONDS",
+                    help="how often to re-check while waiting (default "
+                         f"{DEFAULT_IMPORT_POLL_INTERVAL}, env "
+                         f"{IMPORT_POLL_INTERVAL_ENV})")
+    ap.add_argument("--import-wait-timeout", type=int, default=None,
+                    metavar="SECONDS",
+                    help="give up waiting after this long and scan anyway "
+                         f"(default {DEFAULT_IMPORT_WAIT_TIMEOUT}, env "
+                         f"{IMPORT_WAIT_TIMEOUT_ENV})")
     args = ap.parse_args()
 
     cfg = load_config()
@@ -278,11 +405,35 @@ def main() -> None:
     if args.once:
         interval = None
 
+    wait_for_import = (args.wait_for_import
+                       or os.environ.get("TRIAGE_WAIT_FOR_IMPORT") == "1")
+    import_poll_interval = (args.import_poll_interval
+                            or int(os.environ.get(IMPORT_POLL_INTERVAL_ENV,
+                                                   DEFAULT_IMPORT_POLL_INTERVAL)))
+    import_wait_timeout = (args.import_wait_timeout
+                           or int(os.environ.get(IMPORT_WAIT_TIMEOUT_ENV,
+                                                  DEFAULT_IMPORT_WAIT_TIMEOUT)))
+
     while True:
         if interval:
             print(f"\n=== {datetime.now(timezone.utc):%Y-%m-%d %H:%M:%S} UTC ===")
 
         for routine_id in routines:
+            if wait_for_import:
+                try:
+                    await_import(cfg["testray"], routine_id,
+                                 poll_interval=import_poll_interval,
+                                 timeout=import_wait_timeout)
+                except Exception as e:                           # noqa: BLE001
+                    # A broken wait must degrade to "did not wait", not to
+                    # "did not scan" — this routine's own try/except below is
+                    # what actually decides whether scan() runs, and a bug
+                    # here should never be the reason a real scan gets
+                    # skipped for the tick.
+                    print(f"! routine {routine_id} await_import failed: "
+                          f"{type(e).__name__}: {e} — scanning anyway",
+                          file=sys.stderr)
+
             try:
                 scan(cfg, routine_id, queue_dir=queue_dir,
                      catch_up=args.catch_up, window=args.window,

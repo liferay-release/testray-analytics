@@ -20,8 +20,12 @@ export TRIAGE_ROUTINE_REMOTES="79529=origin"
 export TRIAGE_SCAN_ROUTINES=79529
 export TRIAGE_QUEUE=/var/lib/triage/queue
 
-./scripts/triage_jenkins.sh
+./scripts/triage_jenkins.sh --wait-for-import
 ```
+
+`--wait-for-import` is a flag on `triage_jenkins.sh` itself, not always on —
+see below for what it does and why the failure-triggered build step should
+pass it.
 
 The script sets the rest itself: the Testray URLs, `--engine api`, the venv
 (`python3.13`, editable install), the log directory, and a lock. It prints
@@ -32,7 +36,7 @@ Two commands run inside it, and the order matters:
 
 | Step | Command | Cost |
 |---|---|---|
-| 1 | `testray-analysis scan --once` | free — REST reads and a git diff |
+| 1 | `testray-analysis scan --once [--wait-for-import]` | free — REST reads and a git diff |
 | 2 | `testray-analysis watch --once --classify --engine api` | **money** — one Anthropic call per batch |
 
 `scan` is the producer: it queues a build when the build is `importStatus` DONE,
@@ -43,6 +47,31 @@ producer — the scanner, or someone clicking **Run Triage** in Testray.
 **Running only `watch` does nothing.** With no producer the queue is always
 empty and every tick prints `Nothing queued.`
 
+**`--wait-for-import` — pass it because the hook fires before Testray is ready
+for it.** The hook that starts this job reacts to the Stable build *failing*,
+which happens before Testray finishes importing that build's results. Queried
+right then,
+the just-failed build fails `importStatus eq 'DONE'` and is invisible to
+`scan` — indistinguishable from "this build has no failures", not "come back
+in a minute". Measured live 2026-09-15: the hook fired at 13:40, but Testray
+did not even **create the Build row** until 13:43:59, and did not finish
+importing it until ~14:04 — the row can be entirely absent for several
+minutes, not just mid-import.
+
+That is why `--wait-for-import` does not simply poll "is the newest build
+DONE": at 13:40 the newest build would have been the *previous* one, already
+DONE, and a naive check would have read that as "nothing to wait for" and
+returned instantly — backwards, since that is exactly the state with the most
+waiting left. Instead it records whichever build is newest **the moment it is
+called** as a baseline and never updates that reference; it only proceeds once
+either that same build finishes importing, or a build with a *different* id
+shows up already DONE. It checks every `TRIAGE_IMPORT_POLL_INTERVAL` seconds
+(default 60) for up to `TRIAGE_IMPORT_WAIT_TIMEOUT` seconds (default 2400 =
+40 min — the ~24-minute measurement above, plus headroom) before giving up
+and scanning anyway. A give-up is not a failure: the build then waits for the
+next Stable
+failure's `--catch-up`, same as before this flag existed.
+
 ---
 
 ## Jenkins configuration
@@ -51,7 +80,7 @@ empty and every tick prints `Nothing queued.`
 |---|---|
 | Git > Repository URL | `https://github.com/liferay/liferay-testray-analytics` |
 | Git > Branch Specifier | `master` |
-| Build Triggers | Build periodically, `H/30 * * * *` |
+| Build Triggers | Triggered by a hook on the Stable job's failure — no periodic schedule |
 | Execute shell | the block above |
 | Concurrent builds | **disabled** |
 | Slack Notifications | notify on **every build** |

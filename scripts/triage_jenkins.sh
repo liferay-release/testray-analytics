@@ -18,7 +18,7 @@
 # the lock live here rather than in a text field in a job config, so they can be
 # reviewed, tested and fixed like the rest of the pipeline.
 #
-#   Build step:  ./scripts/triage_jenkins.sh
+#   Build step:  ./scripts/triage_jenkins.sh --wait-for-import
 #   First run:   ./scripts/triage_jenkins.sh --no-classify   # free; proves the wiring
 #   Preflight:   ./scripts/triage_jenkins.sh --check         # read-only, no spend
 #
@@ -33,6 +33,12 @@
 # usage or preflight, 2 a step failed. A skip is recoverable rather than free:
 # the build that triggered it waits for the NEXT Stable failure to be picked up
 # by --catch-up, which is no longer half an hour away.
+#
+# The hook fires the instant Stable's build fails, which is before Testray has
+# finished importing that build's results. --wait-for-import (opt-in — see
+# the Build step above) makes tick() poll for that before scanning, so THIS
+# trigger can catch the build instead of leaving it for the next one's
+# --catch-up.
 
 set -o pipefail
 
@@ -68,15 +74,19 @@ function log {
 function main {
 	local script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
-	# _CLASSIFY, _ENGINE, _PYTHON_BIN and _PROJECT_DIR are read by die,
-	# print_help and tick below, so they stay shared globals rather than
-	# locals of main.
+	# _CLASSIFY, _ENGINE, _WAIT_FOR_IMPORT, _PYTHON_BIN and _PROJECT_DIR are
+	# read by die, print_help and tick below, so they stay shared globals
+	# rather than locals of main.
 	_PROJECT_DIR=$(dirname -- "${script_dir}")
 
 	trap 'unset TESTRAY_CLIENT_ID TESTRAY_CLIENT_SECRET ANTHROPIC_API_KEY' EXIT
 
 	_CLASSIFY="true"
 	_ENGINE=${TRIAGE_ENGINE:-api}
+	# Off by default: only the failure-triggered hook run needs this, and
+	# a manual `--no-classify`/`--check` call to prove the wiring should not
+	# be made to sit through up to TRIAGE_IMPORT_WAIT_TIMEOUT for nothing.
+	_WAIT_FOR_IMPORT="false"
 	local check_only="false"
 	local require_objects="false"
 	_PYTHON_BIN=${TRIAGE_PYTHON_BIN:-python3.13}
@@ -110,6 +120,10 @@ function main {
 				;;
 			--require-objects)
 				require_objects="true"
+				shift
+				;;
+			--wait-for-import)
+				_WAIT_FOR_IMPORT="true"
 				shift
 				;;
 			-h|--help)
@@ -245,7 +259,7 @@ function main {
 	# output before any of it exists. On a failure twenty minutes in, the console
 	# has already said where to look.
 	log "step 0: preflight ok"
-	log "  routines: ${TRIAGE_SCAN_ROUTINES}   engine: ${_ENGINE}   classify: ${_CLASSIFY}"
+	log "  routines: ${TRIAGE_SCAN_ROUTINES}   engine: ${_ENGINE}   classify: ${_CLASSIFY}   wait_for_import: ${_WAIT_FOR_IMPORT}"
 	log "  portal:   ${TRIAGE_REPO_PATH}  (${remote_name} -> ${remote_url})"
 	log "  logs:     ${TRIAGE_LOG_DIR}  (one file per pipeline step)"
 	log "  bundles:  ${_PROJECT_DIR}/runs"
@@ -346,6 +360,13 @@ function print_help {
 	                     the analytics CX is deployed on the target instance,
 	                     so a broken deploy is caught instead of silently
 	                     degrading to marker files.
+	  --wait-for-import  before scanning, wait for a build newer than the one
+	                     on file to finish importing (TRIAGE_IMPORT_POLL_INTERVAL
+	                     / TRIAGE_IMPORT_WAIT_TIMEOUT below). Pass this on the
+	                     failure-triggered hook, where the tick can fire before
+	                     Testray has even created the build's row. Off by
+	                     default so a manual run to prove the wiring does not
+	                     sit through the wait for nothing.
 	  -h, --help         this.
 
 	Required environment:
@@ -369,6 +390,12 @@ function print_help {
 	                        (default brianchandotcom)
 	  TRIAGE_PYTHON_BIN     interpreter used to build the venv (default
 	                        ${_PYTHON_BIN})
+	  TRIAGE_IMPORT_POLL_INTERVAL  seconds between import-status checks
+	                        (default 60) while scan --wait-for-import waits
+	                        for a just-failed build to finish importing
+	  TRIAGE_IMPORT_WAIT_TIMEOUT   seconds to wait before giving up on that
+	                        build for this tick (default 2400 = 40 min — measured
+	                        import lag on a real trigger has been ~24 minutes)
 	END
 }
 
@@ -376,9 +403,27 @@ function tick {
 	local rc=0
 
 	# Producer. Cheap, and never spends: REST reads plus a git diff.
-	log "step 1: scan"
+	#
+	# --wait-for-import (opt-in via the script's own --wait-for-import flag):
+	# for the case where this tick was fired by the Stable build failing,
+	# which is BEFORE Testray finishes importing that build's results.
+	# Without it, scan queries `importStatus eq 'DONE'`, the just-failed build
+	# fails that filter, and the tick reads exactly like "nothing red" — the
+	# build then waits for the NEXT Stable failure's --catch-up, which on a
+	# quiet week is days away. Polling here (still free: REST reads only)
+	# lets THIS trigger catch it instead. Left off by default so a manual
+	# `--no-classify`/`--check` run to prove the wiring does not sit through
+	# up to TRIAGE_IMPORT_WAIT_TIMEOUT for a build that was never coming.
+	local scan_args=(--once)
 
-	if ! .venv/bin/testray-analysis scan --once
+	if [ "${_WAIT_FOR_IMPORT}" == "true" ]
+	then
+		scan_args+=(--wait-for-import)
+	fi
+
+	log "step 1: scan ${scan_args[*]}"
+
+	if ! .venv/bin/testray-analysis scan "${scan_args[@]}"
 	then
 		return 2
 	fi

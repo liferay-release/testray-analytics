@@ -15,6 +15,8 @@ the properties that make a tick safe to run on a short interval.
 No network: the build list and the signature source are both injected.
 """
 
+import sys
+
 import pytest
 
 from testray_analytics.analysis import ledger as L
@@ -188,6 +190,134 @@ def test_counters_absent_falls_back_to_reading_case_results(offline):
     summary = S.scan(CFG, 79529, queue_dir=queue_dir)
 
     assert summary["queued"] == 1, "counters unusable, so ask the case results"
+
+
+def _build_row(build_id, import_status):
+    """A raw /o/c/builds row shaped the way a plain (non-filtered) read
+    returns importStatus — {"key": ..., "name": ...}, not the bare string."""
+    return {"id": build_id, "name": f"build-{build_id}",
+            "importStatus": {"key": import_status, "name": import_status}}
+
+
+def test_newest_build_reads_import_status_regardless_of_value(monkeypatch):
+    """newest_build() must see PENDING/INPROGRESS builds recent_done_builds
+    filters out — that's the whole point of it existing separately."""
+    monkeypatch.setattr(S, "_testray_oauth_token", lambda tr: "token")
+    monkeypatch.setattr(S, "fetch_one_page",
+                        lambda endpoint, params, token, base_url:
+                            [_build_row(9, "INPROGRESS")])
+
+    result = S.newest_build(CFG["testray"], 79529)
+
+    assert result["id"] == 9
+    assert S._import_status(result) == "INPROGRESS"
+
+
+def test_newest_build_returns_none_when_routine_has_no_builds(monkeypatch):
+    monkeypatch.setattr(S, "_testray_oauth_token", lambda tr: "token")
+    monkeypatch.setattr(S, "fetch_one_page",
+                        lambda endpoint, params, token, base_url: [])
+
+    assert S.newest_build(CFG["testray"], 79529) is None
+
+
+def test_await_import_waits_out_the_timeout_when_no_new_build_ever_appears(monkeypatch):
+    """The newest build being DONE on the very first check is NOT, by itself,
+    a reason to return immediately: it is also exactly what the trigger race
+    looks like before the build it fired for even exists as a row (observed
+    live 2026-09-15 — the hook fired minutes before Testray created the row).
+    With nothing ever showing up newer than the baseline, this can only give
+    up after the full timeout — same as the PENDING-forever case."""
+    monkeypatch.setattr(S, "newest_build",
+                        lambda tr, rid: _build_row(9, "DONE"))
+    sleeps = []
+    monkeypatch.setattr(S.time, "sleep", lambda s: sleeps.append(s))
+
+    S.await_import(CFG["testray"], 79529, poll_interval=10, timeout=20)
+
+    assert sleeps == [10, 10]
+
+
+def test_await_import_polls_until_done(monkeypatch):
+    """PENDING, then DONE on the next check, same build: one sleep, then it
+    returns — the ordinary case where the row already existed when this
+    started and just needed to finish importing."""
+    statuses = iter(["PENDING", "DONE"])
+    monkeypatch.setattr(S, "newest_build",
+                        lambda tr, rid: _build_row(9, next(statuses)))
+    sleeps = []
+    monkeypatch.setattr(S.time, "sleep", lambda s: sleeps.append(s))
+
+    S.await_import(CFG["testray"], 79529, poll_interval=10, timeout=900)
+
+    assert sleeps == [10]
+
+
+def test_await_import_detects_a_new_build_after_baseline_was_already_done(monkeypatch):
+    """The race this function exists for: at trigger time the build that
+    just failed has no row yet, so the baseline is some OLDER, already-DONE
+    build. A same-id DONE reading must not satisfy it — only a build with a
+    DIFFERENT id, itself DONE, may."""
+    rows = iter([
+        _build_row(9, "DONE"),        # baseline: the old build, unrelated
+        _build_row(9, "DONE"),        # still nothing new — must keep waiting
+        _build_row(10, "PENDING"),    # the new row finally appears...
+        _build_row(10, "DONE"),       # ...and finishes importing
+    ])
+    monkeypatch.setattr(S, "newest_build", lambda tr, rid: next(rows))
+    sleeps = []
+    monkeypatch.setattr(S.time, "sleep", lambda s: sleeps.append(s))
+
+    S.await_import(CFG["testray"], 79529, poll_interval=10, timeout=900)
+
+    assert sleeps == [10, 10, 10]
+
+
+def test_await_import_gives_up_after_timeout_without_raising(monkeypatch):
+    """A build that never finishes importing must not fail the tick — it just
+    leaves scan() unable to see it, same as before this existed."""
+    monkeypatch.setattr(S, "newest_build",
+                        lambda tr, rid: _build_row(9, "PENDING"))
+    sleeps = []
+    monkeypatch.setattr(S.time, "sleep", lambda s: sleeps.append(s))
+
+    S.await_import(CFG["testray"], 79529, poll_interval=10, timeout=20)
+
+    assert sleeps == [10, 10]
+
+
+def test_await_import_with_no_builds_does_not_poll(monkeypatch):
+    monkeypatch.setattr(S, "newest_build", lambda tr, rid: None)
+    monkeypatch.setattr(S.time, "sleep",
+                        lambda *_: pytest.fail("nothing to wait for"))
+
+    S.await_import(CFG["testray"], 79529)
+
+
+def test_wait_for_import_failure_does_not_block_the_real_scan(offline, monkeypatch, capsys):
+    """A bug in await_import must degrade to "did not wait", never to "did
+    not scan" — the two are wired through separate try/excepts in main()."""
+    queue_dir = offline(
+        builds=[build(3, failed=1), build(2), build(1)],
+        signatures={3: {SIG_A: [10]}, 2: {}, 1: {}},
+    )
+    monkeypatch.setattr(S, "load_config", lambda: CFG)
+    monkeypatch.setattr(S, "queue_path", lambda cfg: queue_dir)
+
+    def boom(tr, rid, **kwargs):
+        raise RuntimeError("malformed query")
+    monkeypatch.setattr(S, "await_import", boom)
+
+    monkeypatch.setattr(sys, "argv",
+                        ["testray-analysis scan", "--routine", "79529",
+                         "--once", "--wait-for-import"])
+
+    S.main()
+
+    err = capsys.readouterr().err
+    assert "await_import failed" in err
+    pending = Q.FileQueue(queue_dir).pending()
+    assert len(pending) == 1, "scan() must still have run despite the failure"
 
 
 def test_a_pair_already_analysed_here_is_not_queued_again(offline):

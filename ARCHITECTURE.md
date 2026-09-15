@@ -664,6 +664,51 @@ keeps its schedule in crontab and not in the job. Poll rather than schedule to a
 clock: builds arrive on a drifting one and Testray imports them hours later, so a
 fixed time hits an empty window as often as not.
 
+**`--wait-for-import` closes the gap the failure-triggered hook opened.**
+Added 2026-09-14. Once the Jenkins job started firing on the Stable build
+*failing* (LPD-95845) rather than on a 30-minute timer, the tick often landed
+before Testray finished importing that exact build: queried at that moment the
+build fails `importStatus eq 'DONE'` the same way a build with no failures at
+all does, so `scan` saw nothing wrong with it. That is not a bug in `scan` —
+DONE is still the right rule — but it meant the build that caused the hook to
+fire was routinely the one thing that tick could not see, left to wait for the
+next Stable failure's `--catch-up`, which on a quiet week is days.
+
+`testray-analysis scan --wait-for-import` is a flag on `scan` itself.
+`triage_jenkins.sh` mirrors it as its own `--wait-for-import` flag, off by
+default, which the build step passes explicitly — deliberately not baked
+into every `scan` call from `tick()`, so a manual `--no-classify`/`--check`
+run to prove the wiring is not made to sit through
+`TRIAGE_IMPORT_WAIT_TIMEOUT` for a build that was never coming.
+
+The flag makes `scan` poll `newest_build()` — the routine's newest build,
+unfiltered by import status, one request rather than `recent_done_builds()`'s
+whole-window fetch — before running its own pass, sleeping
+`TRIAGE_IMPORT_POLL_INTERVAL` seconds (default 60) between checks up to
+`TRIAGE_IMPORT_WAIT_TIMEOUT` (default 2400 = 40 min). Both are read from the
+environment rather than hardcoded because import lag is a property of
+Testray's queue, not of this tool — release-master can widen the timeout
+without a code change if lag grows. A timeout is a give-up, not a failure:
+`scan` still runs afterwards and, same as before this flag existed, the build
+just waits for `--catch-up`.
+
+**"Newest build is DONE" is not, by itself, evidence there is nothing to wait
+for.** Measured live 2026-09-15: the hook fired at 13:40; Testray did not
+create the Build row until 13:43:59 and did not finish importing it until
+~14:04 — about 24 minutes where the row the hook fired for simply does not
+exist. Queried during that window, `newest_build()` returns the *previous*
+build, long since DONE, which an earlier version of `await_import()` read as
+"ready" and returned in zero seconds — precisely the moment with the most
+waiting still ahead of it. `await_import()` now records whichever build is
+newest on its **first** call as a fixed baseline and never moves that
+reference; it is satisfied only when that same build finishes importing, or a
+build with a **different id** appears already DONE — never by "whatever is
+newest right now says DONE", which is true both before and after the row
+nobody has seen yet appears. `DEFAULT_IMPORT_WAIT_TIMEOUT` was raised from the
+original 900, to 1800, to 2400 (40 min) — the measured 24-minute lag left too
+little margin under either earlier default, and 40 minutes was chosen
+deliberately over just matching the measurement.
+
 ### Two queues, one drainer
 
 The TriageRun Object exists only where the analytics client extension is

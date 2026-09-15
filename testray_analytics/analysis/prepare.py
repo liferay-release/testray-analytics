@@ -350,6 +350,28 @@ def fetch_paginated(endpoint: str, params: dict, token: str, base_url: str,
     return _testray_fetch_paginated(endpoint, params, token, base_url, **kwargs)
 
 
+def fetch_one_page(endpoint: str, params: dict, token: str,
+                   base_url: str) -> list[dict]:
+    """A single unpaginated page — for a caller that only ever wants the
+    newest few rows of a sorted query.
+
+    `fetch_paginated` always walks to `lastPage`, which is right when the
+    goal is every matching row but wrong for "what's newest right now": a
+    poll re-run every minute (see scan.await_import) must not re-fetch a
+    routine's entire build history on every tick just to look at the top row.
+    """
+    base = base_url.rstrip("/")
+    q = dict(params)
+    q.setdefault("page", 1)
+    url = f"{base}{endpoint}?{urllib.parse.urlencode(q)}"
+    req = urllib.request.Request(
+        url, headers={"Authorization": f"Bearer {token}"},
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        data = json.loads(resp.read())
+    return data.get("items", [])
+
+
 # How many times a page fetch is attempted before giving up (1 try + retries).
 _FETCH_RETRIES = 4
 
