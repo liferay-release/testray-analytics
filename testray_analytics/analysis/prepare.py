@@ -2204,7 +2204,8 @@ judge whether each failure is caused by a hunk in the diff.
 |---|---|
 | `diff_list.csv` | One row per failure with component/team, error text, linked Jira, and `pre_classification` (non-null = already auto-classified, skip) |
 | `hunks.txt` | Git diff filtered to files matching failing tests — your first look, not your last |
-| `commits/<sha>.diff` | **One full diff per commit in range.** The authoritative evidence for any candidate — see "Read the candidate's diff" below |
+| **Candidate commits — diffs** (below) | The diffs of the commits whose changed files mention what failed. **Embedded in this prompt** — read them there |
+| `commits/<sha>.diff` | One full diff per commit in range, on disk. Only openable if you have a file-reading tool; the section above is the same evidence and always available |
 | `git_diff_full.diff` | Full unfiltered diff — consult if `hunks.txt` looks too narrow |
 | `results.schema.json` | JSON schema for the `results.json` you will write |
 
@@ -2269,10 +2270,16 @@ Rows in `diff_list.csv` with `pre_classification` already set (BUILD_FAILURE, EN
 
 ### Read the candidate's diff before you attribute
 
-`hunks.txt` is matched on path tokens, so it tells you *where to look*, not
-*what changed*. **Once a commit looks like a candidate, open
-`commits/<sha>.diff` and read it in full before attributing to it.** The diff
-is what confirms or rejects the connection; a changed-files list cannot.
+A changed-files list tells you a module was touched. Only the diff tells you
+what changed in it, and that difference is the whole verdict. **The
+"Candidate commits — diffs" section below carries the diffs of the commits whose
+files mention what failed — read them before attributing to any of them, and
+cite the line you relied on.**
+
+Do not attribute to a commit on its subject line or its changed-files list
+alone. If a commit you suspect has no diff in that section, say so in `reason`
+rather than guessing at its contents — that is a low-confidence verdict with a
+named gap, which is useful, and inventing the change is not.
 
 This is the difference between the two answers below, on a real Stable failure:
 
@@ -2306,12 +2313,12 @@ name costs a person an afternoon, and it poisons the attribution training data.
 
 1. Read `error_message` in `diff_list.csv`.
 2. Scan `hunks.txt` for files whose path contains tokens from `component_name` or `test_case`.
-3. If a hunk plausibly causes the error, find the commit that made it in "Commits in this range" and **read `commits/<sha>.diff` in full**. If that diff confirms a genuine defect → **BUG**, name `culprit_file` = the specific file path from the diff, and cite the actual change (the line, the renamed symbol, the changed version) in `specific_change`.
+3. If a hunk plausibly causes the error, find that commit's diff in **"Candidate commits — diffs"** and read it. If the diff confirms a genuine defect → **BUG**, name `culprit_file` = the specific file path from it, and cite the actual change (the line, the renamed symbol, the changed version) in `specific_change`.
 4. If a hunk shows the production change was **intentional** and the test simply asserts on the old behavior (renamed label, changed selector/element/API the diff deliberately changed) → **TEST_FIX**. Leave `culprit_file` null (or name the stale test file); describe the test change in `specific_change`.
 5. If a hunk is thematically related but not clearly the cause → **NEEDS_REVIEW**.
 6. If no per-failure hunk matches, **check the changed-files manifest and commit cluster sections below** for transitive candidates (test class name → likely importee in a changed module). Note the candidate in `specific_change` and classify NEEDS_REVIEW.
 7. If the error is a classic flake pattern (timeout, element-not-present, concurrent-thread assertion, setup error) AND no hunk touches the relevant module AND no transitive candidate exists → **FALSE_POSITIVE**.
-8. When the filtered `hunks.txt` seems too narrow, consult `git_diff_full.diff` — and `commits/<sha>.diff` for any commit it turns up.
+8. When the filtered `hunks.txt` seems too narrow, work from **"Candidate commits — diffs"**, which is selected on the error text rather than on test-name tokens and is often the only diff evidence on a routine whose test names are shard ids.
 
 ## Output
 
@@ -2369,7 +2376,8 @@ every member case-row in `fact_triage_results`.
 | `diff_list.csv` | One row per failure (case-grain) — same as per-test mode |
 | `diff_list_subtasks.csv` | One row per {unit} — `group_id`, `subtask_id`, `case_count`, `member_case_ids`, shared `error`, `pre_classification` if every member auto-classified |
 | `hunks.txt` | Git diff filtered to files matching failing tests — your first look, not your last |
-| `commits/<sha>.diff` | **One full diff per commit in range.** The authoritative evidence for any candidate — see "Read the candidate's diff" below |
+| **Candidate commits — diffs** (below) | The diffs of the commits whose changed files mention what failed. **Embedded in this prompt** — read them there |
+| `commits/<sha>.diff` | One full diff per commit in range, on disk. Only openable if you have a file-reading tool; the section above is the same evidence and always available |
 | `git_diff_full.diff` | Full unfiltered diff — consult if `hunks.txt` looks too narrow |
 | `results.schema.json` | JSON schema for the `results.json` you will write (grouped-mode shape) |
 
@@ -2419,10 +2427,16 @@ Leave `candidates` empty **only** when nothing in range touches the failing area
 
 ### Read the candidate's diff before you attribute
 
-`hunks.txt` is matched on path tokens, so it tells you *where to look*, not
-*what changed*. **Once a commit looks like a candidate, open
-`commits/<sha>.diff` and read it in full before attributing to it.** The diff
-is what confirms or rejects the connection; a changed-files list cannot.
+A changed-files list tells you a module was touched. Only the diff tells you
+what changed in it, and that difference is the whole verdict. **The
+"Candidate commits — diffs" section below carries the diffs of the commits whose
+files mention what failed — read them before attributing to any of them, and
+cite the line you relied on.**
+
+Do not attribute to a commit on its subject line or its changed-files list
+alone. If a commit you suspect has no diff in that section, say so in `reason`
+rather than guessing at its contents — that is a low-confidence verdict with a
+named gap, which is useful, and inventing the change is not.
 
 This is the difference between the two answers below, on a real Stable failure:
 
@@ -2461,7 +2475,7 @@ name costs a person an afternoon, and it poisons the attribution training data.
 5. Hunk thematically related but not the clear cause → **NEEDS_REVIEW**.
 6. No per-member hunk matches, **check the changed-files manifest and commit cluster sections below** for transitive candidates (member class names → likely importees in changed modules). Note the candidate in `specific_change` and classify NEEDS_REVIEW.
 7. Classic flake pattern (timeout, element-not-present, concurrent-thread assertion, TEST_SETUP_ERROR) AND no hunk touches a relevant module AND no transitive candidate → **FALSE_POSITIVE**.
-8. When the filtered `hunks.txt` seems too narrow, consult `git_diff_full.diff` — and `commits/<sha>.diff` for any commit it turns up.
+8. When the filtered `hunks.txt` seems too narrow, work from **"Candidate commits — diffs"**, which is selected on the error text rather than on test-name tokens and is often the only diff evidence on a routine whose test names are shard ids.
 
 ## Output
 
@@ -2913,6 +2927,164 @@ def write_commit_diffs(run_dir: Path, git_repo: Path,
     return written, out_dir
 
 
+# Inlined candidate diffs. `commits/<sha>.diff` is only reachable by an engine
+# with a Read tool, and the release-master job runs `--engine api`, which has
+# none. Telling that engine to open a file it cannot open is worse than not
+# offering it: it hedges, or it claims to have read what it has not. So the
+# evidence for the commits that look like candidates is embedded in the prompt
+# instead, and the files remain for the claude-code engine and for humans.
+#
+# Budgeted, because prompt size IS the bill: measured at ~$8.00 per MB of
+# prompt (R2 = 0.992) across the classified runs in /runs. Inlining the whole
+# range would cost more than the answer is worth on every run, most of it for
+# commits nothing suspects.
+CANDIDATE_DIFF_BUDGET_CHARS     = 80_000
+CANDIDATE_DIFF_PER_COMMIT_CHARS = 20_000
+CANDIDATE_DIFF_MAX_COMMITS      = 5
+
+# Hyphenated identifiers: `site-staticexport-api`, `site-cms-site-initializer`.
+# These are what module directories are actually named, so a token lifted from
+# an error message matches a changed-file path directly.
+_MODULE_TOKEN_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)+")
+
+
+def candidate_tokens(texts) -> set[str]:
+    """Module-shaped tokens naming what failed, for matching against commits.
+
+    Reads the ERROR TEXT as well as the test and component names, and that is
+    the point. Stable's test names are shard ids — `semantic-versioning/0/0`
+    tells you nothing and matches no path, which is why `hunks.txt` comes back
+    empty on that routine and the prompt carried no diff at all. The error
+    text, though, names the module outright:
+
+        Execution failed for task ':apps:site:site-staticexport-api:baseline'
+
+    Splitting that on non-token characters yields `site-staticexport-api`,
+    which matches `modules/apps/site/site-staticexport-api/bnd.bnd` in the
+    commit that broke it.
+    """
+    out: set[str] = set()
+    for v in texts or ():
+        if _is_blank(v):
+            continue
+        for tok in _MODULE_TOKEN_RE.findall(str(v).lower()):
+            # Two-segment tokens like `not-found` are noise; module names in
+            # this repo are longer and more specific.
+            if len(tok) >= 12:
+                out.add(tok)
+    return out
+
+
+def candidate_texts_from_df(df) -> list[str]:
+    """Error text, test names and components, for candidate_tokens."""
+    if df is None or not len(df):
+        return []
+    out: list[str] = []
+    for col in ("error_message", "test_case", "component_name"):
+        if col in df.columns:
+            out.extend(str(v) for v in df[col])
+    return out
+
+
+def candidate_texts_from_groups(groups) -> list[str]:
+    """The same three signals, off the grouped-mode group dicts."""
+    out: list[str] = []
+    for g in groups or ():
+        out.append(str(g.get("shared_error") or ""))
+        out.extend(str(t) for t in (g.get("test_cases") or []))
+        out.extend(str(c) for c in (g.get("components") or []))
+    return out
+
+
+def rank_candidate_commits(commits: list, tokens: set[str]) -> list[dict]:
+    """Commits whose changed files mention what failed, best first.
+
+    Scored by how many distinct tokens a commit's files match — a commit
+    touching the one module named in the error outranks one that happens to
+    share a common word. Ties break toward the SMALLER commit: a focused change
+    is both likelier to be the cause and cheaper to inline.
+    """
+    if not commits or not tokens:
+        return []
+
+    scored = []
+    for c in commits:
+        if not isinstance(c, dict):
+            continue
+        files = " ".join(c.get("files") or c.get("modules") or []).lower()
+        if not files:
+            continue
+        hits = {t for t in tokens if t in files}
+        if hits:
+            scored.append((len(hits), -len(files), c))
+
+    scored.sort(key=lambda t: (-t[0], t[1]))
+    return [c for _s, _n, c in scored[:CANDIDATE_DIFF_MAX_COMMITS]]
+
+
+def render_candidate_diffs_section(run_dir: Path, candidates: list) -> list[str]:
+    """The candidate commits' diffs, inline and budgeted.
+
+    Reads what `write_commit_diffs` already put on disk rather than shelling
+    out again, so the inlined text and the file cannot disagree.
+    """
+    if not candidates:
+        return []
+
+    lines: list[str] = []
+    spent = 0
+    shown = 0
+    for c in candidates:
+        sha = c.get("hash")
+        src = run_dir / "commits" / f"{sha}.diff"
+        if not sha or not src.exists():
+            continue
+        try:
+            body = src.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+
+        room = min(CANDIDATE_DIFF_PER_COMMIT_CHARS,
+                   CANDIDATE_DIFF_BUDGET_CHARS - spent)
+        if room <= 0:
+            break
+        truncated = len(body) > room
+        if truncated:
+            body = body[:room]
+
+        subject = str(c.get("subject") or "").strip()
+        author  = str(c.get("author") or "").strip()
+        lines += [
+            f"### `{sha}` {subject}" + (f" — {author}" if author else ""),
+            "",
+            "```diff",
+            body.rstrip("\n"),
+            "```",
+            ("\n_(diff truncated — the rest is in "
+             f"`commits/{sha}.diff`)_" if truncated else ""),
+            "",
+        ]
+        spent += len(body)
+        shown += 1
+
+    if not shown:
+        return []
+
+    return [
+        "## Candidate commits — diffs",
+        "",
+        f"_The {shown} commit(s) in this range whose changed files mention what "
+        f"failed, highest overlap first. **This is the evidence** — a "
+        f"changed-files list says a module was touched, a diff says what "
+        f"changed in it. Read these before attributing to any of them, and "
+        f"cite the actual line you relied on. A commit being listed here is "
+        f"not a claim that it caused anything: it is the shortlist, and "
+        f"concluding that none of them explains the failure is a legitimate "
+        f"answer._",
+        "",
+    ] + lines
+
+
 def render_commits_section(commits: list) -> list[str]:
     """Commits in this range, grouped by ticket, WITH the author and the
     modules each group touched.
@@ -3107,6 +3279,9 @@ def write_prompt(run_dir: Path, *, run_id: str, classifier: str,
                 if hash_a and hash_b else [])
     manifest_lines = render_changed_files_section(manifest)
     commit_lines   = render_commits_section(commits)
+    candidate_lines = render_candidate_diffs_section(
+        run_dir, rank_candidate_commits(
+            commits, candidate_tokens(candidate_texts_from_df(df_to_classify))))
 
     parts = [header]
     if chrome_lines:
@@ -3115,6 +3290,8 @@ def write_prompt(run_dir: Path, *, run_id: str, classifier: str,
         parts.append("\n".join(manifest_lines))
     if commit_lines:
         parts.append("\n".join(commit_lines))
+    if candidate_lines:
+        parts.append("\n".join(candidate_lines))
     parts.append(_FAILURES_HEADER)
     parts.append("\n".join(body_lines))
     (run_dir / "prompt.md").write_text("".join(parts), encoding="utf-8")
@@ -3534,6 +3711,10 @@ def write_prompt_grouped(run_dir: Path, *, run_id: str, classifier: str,
                 if hash_a and hash_b else [])
     manifest_lines = render_changed_files_section(manifest)
     commit_lines   = render_commits_section(commits)
+    candidate_lines = render_candidate_diffs_section(
+        run_dir, rank_candidate_commits(
+            commits,
+            candidate_tokens(candidate_texts_from_groups(groups_to_classify))))
 
     parts = [header]
     if chrome_lines:
@@ -3542,6 +3723,8 @@ def write_prompt_grouped(run_dir: Path, *, run_id: str, classifier: str,
         parts.append("\n".join(manifest_lines))
     if commit_lines:
         parts.append("\n".join(commit_lines))
+    if candidate_lines:
+        parts.append("\n".join(candidate_lines))
     parts.append(_FAILURES_HEADER)
     parts.append("\n".join(body_lines))
     (run_dir / "prompt.md").write_text("".join(parts), encoding="utf-8")
