@@ -922,6 +922,62 @@ def _jenkins_report_url(description) -> str | None:
 # `Top Level Build` row carries `Jenkins Console (Top Level)`.
 _AXIS_CONSOLE_NAME = "Jenkins Console"
 
+# Testray's per-build aggregate row. It is not a test: it carries no error text
+# of its own, it is FAILED whenever anything under it failed, and on prod it is
+# flagged flaky, so it arrived as a triage row that could never be classified.
+# Matched on the LABEL and not the case id — that id is 42588 on prod and is
+# assigned per instance by loadTestrayData, so an id check silently stops
+# matching the moment anyone runs this against a local mirror or UAT.
+AGGREGATE_ROW_LABEL = "top level build"
+
+
+def is_aggregate_row(test_name) -> bool:
+    """True for Testray's whole-build row. One definition, imported by
+    slack_message, so the message and the analysis cannot disagree about what
+    counts as a failure."""
+    return str(test_name or "").strip().lower() == AGGREGATE_ROW_LABEL
+
+
+def drop_aggregate_rows(df) -> tuple:
+    """Remove the aggregate row from the triage set. Returns `(df, dropped)`.
+
+    `dropped` is `{transition: count}` for the rows removed, because the
+    transition counters were computed by `compute_test_diff` BEFORE this runs
+    and reach Testray as the TriageRun's `transitionCounts`. Left alone they
+    disagreed with `totalFailures` by exactly the aggregate row — a build with
+    one real pre-existing failure reported `same_failure: 2` against
+    `totalFailures: 1`, and the Testray CX reads that field to say how many
+    pre-existing failures there were.
+
+    It was already excluded from CLASSIFICATION twice over — no error text, and
+    flagged flaky — but it stayed in the frame, so it counted toward
+    `total_failures`, took a slot in the report and the cluster census, and got
+    a "known flaky" line in submit's write-policy breakdown. A build whose only
+    real failure was one test therefore reported two, and the Slack headline
+    said `0 classified over 2 failure(s)` when there was one failure and it was
+    explained. Dropping it here rather than filtering at each consumer means
+    every count downstream is about tests.
+
+    Runs AFTER enrich_api_case_names: api case results carry no case name, so
+    before that backfill there is no label to match on.
+    """
+    if "test_case" not in df.columns or df.empty:
+        return df, {}
+    mask = df["test_case"].map(is_aggregate_row)
+    n = int(mask.sum())
+    if not n:
+        return df, {}
+
+    dropped: dict[str, int] = {}
+    if "transition" in df.columns:
+        for t in df.loc[mask, "transition"]:
+            key = str(t or "").strip()
+            if key:
+                dropped[key] = dropped.get(key, 0) + 1
+    print(f"   dropped {n} aggregate '{AGGREGATE_ROW_LABEL}' row(s) — "
+          f"Testray's per-build row, not a test")
+    return df.loc[~mask].reset_index(drop=True), dropped
+
 
 def _axis_console_url(attachments) -> str | None:
     """The axis-level Jenkins console for one case result, or None.
@@ -3697,6 +3753,11 @@ def prepare(baseline: SideSpec, target: SideSpec, classifier: str,
     # Testray case object so the fragment matcher has something to anchor on
     # (and so prompt.md doesn't say `### N. \`\`` with no test name).
     df = enrich_api_case_names(df, cfg["testray"])
+    df, dropped_aggregate = drop_aggregate_rows(df)
+    for _t, _n in dropped_aggregate.items():
+        # Keep `transitions` describing the same row set as `df`. The CX reads
+        # this as transitionCounts; see drop_aggregate_rows.
+        transitions[_t] = max(0, transitions.get(_t, 0) - _n)
 
     # How often each failure's error signature already occurred in the BASELINE
     # build. 0 = the baseline never produced this error. Reuses the case
