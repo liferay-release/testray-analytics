@@ -2203,7 +2203,8 @@ judge whether each failure is caused by a hunk in the diff.
 | File | What it is |
 |---|---|
 | `diff_list.csv` | One row per failure with component/team, error text, linked Jira, and `pre_classification` (non-null = already auto-classified, skip) |
-| `hunks.txt` | Git diff filtered to files matching failing tests — your primary evidence |
+| `hunks.txt` | Git diff filtered to files matching failing tests — your first look, not your last |
+| `commits/<sha>.diff` | **One full diff per commit in range.** The authoritative evidence for any candidate — see "Read the candidate's diff" below |
 | `git_diff_full.diff` | Full unfiltered diff — consult if `hunks.txt` looks too narrow |
 | `results.schema.json` | JSON schema for the `results.json` you will write |
 
@@ -2266,16 +2267,51 @@ Leave `candidates` empty **only** when nothing in the range touches the failing 
 
 Rows in `diff_list.csv` with `pre_classification` already set (BUILD_FAILURE, ENV_*, NO_ERROR) are auto-classified upstream and should **not** appear in `results.json`.
 
+### Read the candidate's diff before you attribute
+
+`hunks.txt` is matched on path tokens, so it tells you *where to look*, not
+*what changed*. **Once a commit looks like a candidate, open
+`commits/<sha>.diff` and read it in full before attributing to it.** The diff
+is what confirms or rejects the connection; a changed-files list cannot.
+
+This is the difference between the two answers below, on a real Stable failure:
+
+- Without the diff: *"a module in this area was changed in range."*
+- With it: *"`00df34b` bumps `site-staticexport-api/bnd.bnd` from
+  `Bundle-Version: 1.0.0` to `1.1.0` and the matching `packageinfo` to `1.1.0`.
+  The `baseline` task then resolves `(,1.1.0)` looking for a prior release, and
+  that module has never been published."*
+
+Only the second names a fix. Read the diffs of the two or three commits that
+look plausible — **not** every commit in range: a commit whose files and subject
+show no connection to any failure stays unread.
+
+### If confidence is `low`, say what would raise it
+
+A low-confidence verdict must state, in `reason`, the specific thing that would
+settle it — the file you could not read, the log line the error text truncated,
+the prior build you would compare against. "Unclear" on its own wastes the
+reader's time twice: once when they read it, again when they redo your work to
+find out what you were missing.
+
+### "Nothing in range explains this" is a real answer
+
+Do not speculate beyond the evidence in the diffs. If no commit's changes line
+up with a failure, say so and classify NEEDS_REVIEW — that is an expected,
+legitimate outcome, not a failure of the run, and it is worth more than a
+forced attribution. Never invent a candidate to avoid an empty one: a wrong
+name costs a person an afternoon, and it poisons the attribution training data.
+
 ## How to classify, per row
 
 1. Read `error_message` in `diff_list.csv`.
 2. Scan `hunks.txt` for files whose path contains tokens from `component_name` or `test_case`.
-3. If a hunk plausibly causes the error AND it looks like a genuine defect → **BUG**, name `culprit_file` = the specific file path from the diff.
+3. If a hunk plausibly causes the error, find the commit that made it in "Commits in this range" and **read `commits/<sha>.diff` in full**. If that diff confirms a genuine defect → **BUG**, name `culprit_file` = the specific file path from the diff, and cite the actual change (the line, the renamed symbol, the changed version) in `specific_change`.
 4. If a hunk shows the production change was **intentional** and the test simply asserts on the old behavior (renamed label, changed selector/element/API the diff deliberately changed) → **TEST_FIX**. Leave `culprit_file` null (or name the stale test file); describe the test change in `specific_change`.
 5. If a hunk is thematically related but not clearly the cause → **NEEDS_REVIEW**.
 6. If no per-failure hunk matches, **check the changed-files manifest and commit cluster sections below** for transitive candidates (test class name → likely importee in a changed module). Note the candidate in `specific_change` and classify NEEDS_REVIEW.
 7. If the error is a classic flake pattern (timeout, element-not-present, concurrent-thread assertion, setup error) AND no hunk touches the relevant module AND no transitive candidate exists → **FALSE_POSITIVE**.
-8. When the filtered `hunks.txt` seems too narrow, consult `git_diff_full.diff`.
+8. When the filtered `hunks.txt` seems too narrow, consult `git_diff_full.diff` — and `commits/<sha>.diff` for any commit it turns up.
 
 ## Output
 
@@ -2332,7 +2368,8 @@ every member case-row in `fact_triage_results`.
 |---|---|
 | `diff_list.csv` | One row per failure (case-grain) — same as per-test mode |
 | `diff_list_subtasks.csv` | One row per {unit} — `group_id`, `subtask_id`, `case_count`, `member_case_ids`, shared `error`, `pre_classification` if every member auto-classified |
-| `hunks.txt` | Git diff filtered to files matching failing tests — your primary evidence |
+| `hunks.txt` | Git diff filtered to files matching failing tests — your first look, not your last |
+| `commits/<sha>.diff` | **One full diff per commit in range.** The authoritative evidence for any candidate — see "Read the candidate's diff" below |
 | `git_diff_full.diff` | Full unfiltered diff — consult if `hunks.txt` looks too narrow |
 | `results.schema.json` | JSON schema for the `results.json` you will write (grouped-mode shape) |
 
@@ -2380,6 +2417,41 @@ Leave `candidates` empty **only** when nothing in range touches the failing area
 
 {units_title} where every member already has `pre_classification` set are auto-classified upstream and **must not** appear in `results.json` — they are listed in this prompt for traceability only.
 
+### Read the candidate's diff before you attribute
+
+`hunks.txt` is matched on path tokens, so it tells you *where to look*, not
+*what changed*. **Once a commit looks like a candidate, open
+`commits/<sha>.diff` and read it in full before attributing to it.** The diff
+is what confirms or rejects the connection; a changed-files list cannot.
+
+This is the difference between the two answers below, on a real Stable failure:
+
+- Without the diff: *"a module in this area was changed in range."*
+- With it: *"`00df34b` bumps `site-staticexport-api/bnd.bnd` from
+  `Bundle-Version: 1.0.0` to `1.1.0` and the matching `packageinfo` to `1.1.0`.
+  The `baseline` task then resolves `(,1.1.0)` looking for a prior release, and
+  that module has never been published."*
+
+Only the second names a fix. Read the diffs of the two or three commits that
+look plausible — **not** every commit in range: a commit whose files and subject
+show no connection to any failure stays unread.
+
+### If confidence is `low`, say what would raise it
+
+A low-confidence verdict must state, in `reason`, the specific thing that would
+settle it — the file you could not read, the log line the error text truncated,
+the prior build you would compare against. "Unclear" on its own wastes the
+reader's time twice: once when they read it, again when they redo your work to
+find out what you were missing.
+
+### "Nothing in range explains this" is a real answer
+
+Do not speculate beyond the evidence in the diffs. If no commit's changes line
+up with a failure, say so and classify NEEDS_REVIEW — that is an expected,
+legitimate outcome, not a failure of the run, and it is worth more than a
+forced attribution. Never invent a candidate to avoid an empty one: a wrong
+name costs a person an afternoon, and it poisons the attribution training data.
+
 ## How to classify, per {unit}
 
 1. Read the **shared error** at the top of the {unit} block — {shared_error_origin}
@@ -2389,7 +2461,7 @@ Leave `candidates` empty **only** when nothing in range touches the failing area
 5. Hunk thematically related but not the clear cause → **NEEDS_REVIEW**.
 6. No per-member hunk matches, **check the changed-files manifest and commit cluster sections below** for transitive candidates (member class names → likely importees in changed modules). Note the candidate in `specific_change` and classify NEEDS_REVIEW.
 7. Classic flake pattern (timeout, element-not-present, concurrent-thread assertion, TEST_SETUP_ERROR) AND no hunk touches a relevant module AND no transitive candidate → **FALSE_POSITIVE**.
-8. When the filtered `hunks.txt` seems too narrow, consult `git_diff_full.diff`.
+8. When the filtered `hunks.txt` seems too narrow, consult `git_diff_full.diff` — and `commits/<sha>.diff` for any commit it turns up.
 
 ## Output
 
@@ -2782,6 +2854,63 @@ def render_changed_files_section(manifest: dict[str, int]) -> list[str]:
     lines.append("---")
     lines.append("")
     return lines
+
+
+# A single commit's diff is capped before it is written. A bulk formatting or
+# generated-code commit can be tens of MB, which helps nobody and costs the
+# classifier its whole context if it reads one. The cap is per FILE, not per
+# run: the point is that any one candidate stays readable.
+MAX_COMMIT_DIFF_BYTES = 400_000
+
+
+def write_commit_diffs(run_dir: Path, git_repo: Path,
+                       commits: list) -> tuple[int, Path | None]:
+    """One `commits/<sha>.diff` per commit in range. Returns (count, dir).
+
+    Mirrors the layout the jenkins-results-parser `failure-cause-report` skill
+    reads, and for its reason: attribution is only as good as the evidence, and
+    a changed-files list is not evidence. That skill's rule is explicit — read
+    the candidate commit's diff IN FULL before attributing, because the diff is
+    what confirms or rejects the connection. Our prompt previously offered only
+    `hunks.txt` (path-token matched, and empty on any routine whose test names
+    do not look like file paths) plus one giant `git_diff_full.diff` that is
+    impractical to read end to end.
+
+    Written lazily-consumable rather than inlined: these files exist to be
+    opened for the two or three commits that look like candidates, not to be
+    pasted into the prompt. That keeps the prompt the same size while making
+    the deep evidence reachable.
+
+    Never fatal. A commit whose diff cannot be produced is skipped — a missing
+    file reads as "no deeper evidence for this one", which is true.
+    """
+    if not commits or not (git_repo / ".git").is_dir():
+        return 0, None
+
+    out_dir = run_dir / "commits"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    written = 0
+    for c in commits:
+        sha = c["hash"] if isinstance(c, dict) else c[0]
+        if not sha:
+            continue
+        try:
+            body = subprocess.run(
+                ["git", "-C", str(git_repo), "show", "--format=fuller",
+                 "--no-color", sha],
+                capture_output=True, text=True, check=True, timeout=60,
+            ).stdout
+        except (subprocess.SubprocessError, FileNotFoundError):
+            continue
+        if len(body) > MAX_COMMIT_DIFF_BYTES:
+            body = (body[:MAX_COMMIT_DIFF_BYTES]
+                    + f"\n\n[... truncated at {MAX_COMMIT_DIFF_BYTES} bytes."
+                      f" Read the full commit on GitHub if this one matters.]\n")
+        (out_dir / f"{sha}.diff").write_text(body, encoding="utf-8")
+        written += 1
+
+    return written, out_dir
 
 
 def render_commits_section(commits: list) -> list[str]:
@@ -3487,6 +3616,17 @@ def _finalize_bundle(
                                               hash_a=hash_a, hash_b=hash_b)
         print(f"   {len(tickets)} unique ticket(s) in range "
               f"→ {_disp(tickets_path)}")
+
+    # Per-commit diffs, for the classifier to open on a candidate. See
+    # write_commit_diffs: a changed-files list is not evidence, and this is the
+    # gap between "a module in this area changed" and "this commit bumped
+    # bnd.bnd from 1.0.0 to 1.1.0 with no published version to baseline".
+    n_commit_diffs, commit_dir = write_commit_diffs(
+        run_dir, git_repo,
+        fetch_commit_details(git_repo, hash_a, hash_b)
+        if hash_a and hash_b else [])
+    if n_commit_diffs:
+        print(f"   {n_commit_diffs} per-commit diff(s) → {_disp(commit_dir)}/")
 
     print(f"→ Step 4/6 fragments + filtered hunks …")
     fragments = derive_test_fragments(df)
