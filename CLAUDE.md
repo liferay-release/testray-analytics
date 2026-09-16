@@ -40,7 +40,7 @@ by a hook on the Jenkins side when a Stable build fails:
 | Command | What it does |
 |---|---|
 | `preflight` | checks the credentials, the OAuth scopes and whether the Testray Objects answer |
-| `scan` | queues builds that have failures nobody has explained yet |
+| `scan` | queues builds that have failures nobody has explained yet, and skips any build pair that already has a finished TriageRun |
 | `watch` | if anything is queued, runs the pipeline below on each queued build pair. Without `--classify` it stops after `prepare`, so it spends nothing |
 
 `scripts/triage_pipeline.sh` — one build pair, start to finish. `watch` calls
@@ -73,6 +73,15 @@ want to spend more. It also stops between batches if measured spend crosses the
 limit, keeping the verdicts already paid for. Raise it deliberately with
 `TRIAGE_MAX_COST_USD=<n>`; the release-master job can lower it the same way.
 Never raise it to get a run through without saying so.
+
+**A pair that has already been analysed is never analysed again.** `scan` reads
+the DONE `TriageRun` rows and skips those pairs, because a verdict store alone
+cannot tell: a pair whose clusters are all dropped by the write policy never
+gains a `TriageResult`, so it reads as new forever and the job re-pays on every
+trigger. That row is also the only record that survives the release-master job's
+fresh checkout of both repos. `scan --force` re-queues one deliberately, and
+costs a full classify — it is for a prompt or rubric change, never for getting a
+run through.
 
 **Always run `preflight` first against an instance you have not used before.** It
 tells the difference between "the client extension is not deployed" (404, fine,

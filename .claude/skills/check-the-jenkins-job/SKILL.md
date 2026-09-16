@@ -55,7 +55,15 @@ Two different causes. Tell them apart:
   failures.
 - It prints clusters but `2 skipped for want of a baseline` → those failures are
   present in **every** build in the window. A permanently red test has no
-  baseline to compare against, so it is deliberately not analysed.
+  baseline to compare against, so it is deliberately not analysed. Note the
+  message names `MAX_BASELINE_WALK` (40) even when `--window` is smaller, so a
+  smaller window can report "no baseline within 40 builds" having looked at
+  far fewer. Re-check with `--window 40` before believing it.
+- It prints `already analysed <routine>-<baseline>-<target>` → the pair has a
+  finished TriageRun. This is the normal steady state on a routine whose
+  failures are all known: the job runs, finds nothing new, and spends nothing.
+  It is **not** distinguishable from a healthy tick by looking at Slack, which
+  is why the run also reports `Jobs: 0 queued, N already analysed`.
 
 If the build step only calls `watch`, that is the cause: `watch` consumes work,
 it does not create it. The build step must call `scan` first. `triage_jenkins.sh`
@@ -150,18 +158,47 @@ or a bypassed check.
 
 ## Symptom: the same failure is analysed again and again
 
-Each analysis costs money, so this matters. The tool skips a failure that
-already has a verdict and a build pair that has already been analysed. On an
-instance **without** the Testray Objects there is no verdict store, so the only
-record is the marker directory:
+Each analysis costs money, so this matters. Two records stop a repeat, and they
+answer different questions:
+
+- a **TriageResult** row means *this signature has a verdict*
+- a **DONE TriageRun** row means *this build pair has been looked at*
+
+The second one exists because the first is not enough. A pair whose clusters
+are all dropped by the write policy — never-ran, pre-existing, flaky,
+auto-classified — never gains a TriageResult at all, so the verdict store
+cannot see it, every scan calls its signatures new, and the pipeline re-prepares
+and re-pays on every trigger. Stable pair `522890829 -> 522894597` was
+classified twice in 100 minutes that way, writing one row each time.
+
+Check what scan thinks has been done:
+
+```bash
+.venv/bin/testray-analysis scan --once --dry-run
+```
+
+`Runs on file: N pair(s) already analysed` is the count, and a skipped pair
+prints `already analysed <routine>-<baseline>-<target>`. If that count is zero
+on an instance that has been running for a while, the TriageRun Object is not
+readable — check `preflight`, because a 403 there looks identical to "nothing
+recorded yet".
+
+**On a file-queue instance** (no Testray Objects) the record is the marker
+directory instead:
 
 ```bash
 ls "$TRIAGE_QUEUE/done" | wc -l
 ```
 
 That count must grow and survive between builds. If it keeps resetting to zero,
-`TRIAGE_QUEUE` is inside the Jenkins workspace and the workspace is being
-wiped. Move it somewhere persistent, for example `/var/lib/triage/queue`.
+`TRIAGE_QUEUE` is inside the Jenkins workspace and the workspace is being wiped.
+Move it somewhere persistent, for example `/var/lib/triage/queue`. Note the
+release-master job checks out both repos fresh on every run, so `done/` cannot
+survive there — that agent depends on the TriageRun rows, not on markers.
+
+To deliberately re-analyse a pair after a prompt or rubric change, pass
+`--force` to `scan`. It costs a full classify: the bundle is prepared fresh and
+nothing is reused. Never add it to the job to get a run through.
 
 ## Symptom: two runs at the same time
 

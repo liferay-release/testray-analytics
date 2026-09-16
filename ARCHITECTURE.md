@@ -1626,3 +1626,202 @@ works end to end; these are the quality findings that feed later tuning tickets.
   retarget.
 - **LLM output fidelity** — a few duplicate / out-of-batch / absent case_ids per run
   (handled gracefully: keep-first / drop / default to NEEDS_REVIEW). 729/736.
+
+---
+
+## 16. Stable analysis (2026-09-15/16)
+
+Everything here came out of running the failure-triggered job against routine
+**79529** (`ci:test:stable`) on prod and reading what it actually produced.
+Stable is the hardest routine for this tool and the one the job runs on, so
+several assumptions that held elsewhere broke here first.
+
+### 16.1 A finished run is a record, not just a verdict
+
+`scan` used to decide "has this been dealt with?" purely from the verdict store:
+a signature is done when a `TriageResult` holds a verdict for its `clusterKey`.
+That is necessary and not sufficient.
+
+The write policy (§9) deliberately drops rows nobody concluded anything about —
+never-ran, pre-existing, known-flaky, auto-classified, high-confidence
+`FALSE_POSITIVE`. A pair whose clusters are *all* dropped therefore produces
+**no TriageResult at all**, so `attributions()` can never see it and every scan
+calls its signatures new. Worse, `submit` deletes the pair-keyed *request* row
+when it finishes (so the build does not end up with two runs, one of them
+countless), while `RowQueue.register()` dedupes on exactly that key — so the
+pair looked brand new the moment its own analysis succeeded.
+
+Measured: Stable pair `522890829 -> 522894597` was prepared, classified and
+submitted twice in 100 minutes, writing one row each time. The per-run `$15`
+cap never fires, because each run is individually cheap.
+
+`scan.analysed_pairs()` now reads **DONE TriageRun rows** for the routine and
+skips any pair already there. Three properties matter:
+
+- **Keyed on the pair, not the target build.** The baseline walk gives different
+  signatures in the same build different baselines, so skipping by target alone
+  strands every group but the first. Build 525046181 legitimately queued two
+  jobs with different ranges.
+- **Server-side.** The release-master job checks out *both* repos fresh on every
+  Stable failure, so the file queue's `done/` markers, the `runs/` tree and
+  `results.partial.jsonl` are all gone before the next tick. The row in Testray
+  is the only memory that survives. This is also why classify never resumes and
+  always pays full price there.
+- **Escapable.** `scan --force` re-queues an analysed pair, for a prompt or
+  rubric change. It costs a full classify. It must never be added to the job.
+
+Gated on the row backend; a file-queue instance keeps using `done/`.
+
+### 16.2 The aggregate row is not a test
+
+Testray emits a per-build `Top Level Build` row. It has no error text of its
+own, it is FAILED whenever anything under it failed, and on prod it is flagged
+flaky. It was already unclassifiable twice over, but it stayed in the frame, so
+it counted toward `total_failures`, took a slot in the report and the cluster
+census, and earned a "known flaky" line in the write-policy breakdown. A build
+whose only real failure was one test reported two.
+
+`prepare.drop_aggregate_rows()` removes it, and **decrements the transition
+counters**, which are computed before it runs and reach Testray as the
+TriageRun's `transitionCounts` — the field the CX reads to say how many
+pre-existing failures a build had. Left alone they disagreed with
+`totalFailures` by exactly this row.
+
+Matched on the **label**, never the case id: that id is 42588 on prod and is
+assigned per instance by `loadTestrayData`, so an id check silently stops
+matching against a local mirror or UAT. The jenkins-results-parser
+`failure-cause-report` skill excludes the same row, for the same reasons.
+
+### 16.3 Auto-classification can hide a real defect
+
+`ENV_DEPENDENCY` matched a bare `repository-cdn.liferay.com`. When Gradle
+cannot resolve an artifact it prints **the list of repositories it searched**,
+which always names Nexus — so every unresolvable module read as infrastructure
+and was dropped *before the prompt was built*. The run then reported
+`0 to classify` and cost nothing, which is indistinguishable from a healthy
+build.
+
+Caught on Stable 19704: `site-staticexport-api:baseline` failed because
+LPD-105774 bumped the module to 1.1.0 with no published 1.0.0 to baseline
+against. A real defect with a named culprit in range, filed as a CDN outage.
+
+The rule now has to name a *transport* failure — `Could not GET … repository-cdn`,
+a 502/503/504, a read timeout, a connection reset. The regression is pinned with
+that build's real 1719-character error text in `tests/test_auto_classify.py`.
+
+**Any historical Stable run reporting `0 to classify` is suspect.** The general
+lesson is that an auto-classify pattern matching a *hostname* rather than a
+*failure mode* will eventually swallow something real, silently.
+
+### 16.4 Evidence: the classifier needs diffs, not file lists
+
+Benchmarked against the `failure-cause-report` skill in
+`jenkins-tools-private/jenkins-results-parser-tools`, which reaches better
+answers from the same commit range. Its rule is explicit: read the candidate
+commit's diff **in full** before attributing, because a changed-files list is
+not evidence. That is the difference between *"a module in this area changed"*
+and *"`00df34b` bumps `bnd.bnd` from 1.0.0 to 1.1.0 with no published version
+to baseline against"* — only the second names a fix.
+
+Two things were added:
+
+1. `prepare.write_commit_diffs()` writes `commits/<sha>.diff` per commit,
+   capped at 400 KB each so one bulk-formatting commit cannot eat the
+   classifier's context.
+2. `prepare.render_candidate_diffs_section()` **inlines** the diffs of the
+   commits that look like candidates into `prompt.md`.
+
+Step 2 is not a convenience. `commits/<sha>.diff` is only reachable by an engine
+with a file-reading tool, and **release-master runs `--engine api`, which has
+none** — the same reason it cannot open `hunks.txt` or `git_diff_full.diff`,
+which the prompt had been pointing it at for some time. An engine told to read
+what it cannot either hedges or claims it did; neither belongs in attribution
+data.
+
+**Candidates are selected on the ERROR TEXT**, not on test-name tokens, and that
+is the load-bearing choice. Stable's test names are shard ids:
+`semantic-versioning/0/0` matches no path, so `hunks.txt` comes back empty and
+the prompt carried *zero* diff content — verified, no `@@` or `+++ b/` anywhere
+in a real Stable `prompt.md`. The error text names the module outright:
+
+```
+Execution failed for task ':apps:site:site-staticexport-api:baseline'
+```
+
+`candidate_tokens()` lifts hyphenated identifiers of 12+ characters from the
+error, the test name and the component; `site-staticexport-api` matches
+`modules/apps/site/site-staticexport-api/bnd.bnd` in the commit that broke it.
+On that pair it shortlists exactly one commit. This is the Poshi/Playwright
+hunk-matching blind spot solved from the other direction.
+
+Budget: 80 KB total, 20 KB per commit, 5 commits. Prompt size is the bill. The
+section lands in the **cached** header, so later batches re-read it at ~10%.
+
+Three prompt rules came from the same skill: read the candidate's diff before
+attributing and cite the line; a low-confidence verdict must say what would
+raise it; and *"nothing in range explains this"* is an expected answer, not a
+failed run.
+
+### 16.5 A build that explains nothing still has something to say
+
+A build whose failures are all inherited produced no verdicts, and the message
+said *"no verdicts were produced — needs a human"*. That is worse than silence:
+it sends someone to re-investigate a failure explained days earlier.
+
+`recurrence.py` walks the routine's **own** build history — not the verdict
+store, which on Stable meant inheriting a verdict recorded against a release
+build on a different branch and range — and reports how long a failure has been
+failing and in which build it started. `slack_message` renders a
+`🔁 Still failing` block; `report.py` replaces its empty `No rows.` table with a
+pointer to the run that already explained it.
+
+The prior verdict is looked up by **`(build_id, case_id)`**, split out of the
+TriageResult ERC. Deliberately *not* by `clusterKey`: the writer computes
+`cluster_key(culprit_file, test_case, error)` while the ledger computes
+`cluster_key(None, f"case{id}", errors)`, so any verdict naming a culprit file
+has a key the ledger can never reproduce (measured: stored
+`v3:e85e41e872b43d34`, ledger `v3:ca61ca98281c6797`). Build and case id are the
+two things both sides agree on. **That mismatch is still unfixed** and remains
+the reason `scan` re-offers file-attributed failures.
+
+`submit` performs the recurrence lookup **once** and hands the result to both
+renderers. Two independent lookups is how a report and a message start
+disagreeing about when a failure began.
+
+### 16.6 Naming a person
+
+The Slack message named an author the classifier chose out of the prompt's
+commit list. On a ticket grouping several authors it picks the wrong one —
+survivable as prose, not as a notification.
+
+Trust the classifier for **which commit**; ask git **who**.
+`prepare.fetch_commit_authors()` resolves `%an`/`%ae` from the sha, and a
+`@liferay.com` address renders as `<@local-part>`: the same transform the
+`failure-cause-fix` skill uses, needing no Slack API, no token and no user
+cache. An address outside the domain renders raw rather than as a handle nobody
+owns.
+
+Only a candidate flagged `explains: true` is mentioned. Telling someone their
+commit is merely the closest change in range to a build they did not break is
+how an alert gets muted.
+
+The lookup is **opt-in** (`render(..., resolve_authors=...)`), because doing it
+lazily inside `render()` made a unit test's output depend on whether the
+developer happened to have `liferay-portal` cloned — it passed locally and
+would have failed on a clean machine.
+
+### 16.7 Still open
+
+- **No run is prepared for a repeat build.** `scan` queues `(baseline,
+  first_seen)`, so a build that merely inherits a failure never becomes a
+  target and the `Still failing` block never renders unattended. It only
+  appears when someone runs the pair by hand.
+- **The `clusterKey` mismatch** (§16.5). Every culprit-bearing verdict is
+  invisible to the ledger.
+- **The CX empty state.** `report.py` and Slack now point at the earlier run;
+  the Testray triage page still renders blank, because the page reads
+  TriageResults and a pre-existing failure correctly has none. The data it needs
+  — `transitionCounts.same_failure` and the baseline build id — is already on
+  the run row. Deferred to the next CX deployment rather than raising one.
+- **Two DONE TriageRun rows** can exist for one build after a re-run, and the
+  report page takes the first one it is handed, unordered.
