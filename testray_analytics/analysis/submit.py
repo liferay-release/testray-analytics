@@ -913,6 +913,13 @@ def main() -> None:
     if report_url:
         meta = dict(meta, report_url=str(report_url).strip())
 
+    # ONE recurrence lookup for the whole run, handed to both artifacts. It is
+    # a network call, and the report and the Slack message must not reach
+    # different conclusions about when a failure started — two independent
+    # lookups is exactly how that drifts.
+    from . import recurrence
+    meta = dict(meta, _repeats=recurrence.repeats_for_run(run_dir, meta))
+
     report_path = render_run(run_dir, df, meta)
     print(f"Report:     {report_path}")
 

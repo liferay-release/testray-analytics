@@ -230,3 +230,63 @@ def test_the_cause_is_never_truncated(tmp_path):
     text = S.render(bundle(tmp_path, [r]))
     assert why in text
     assert "…" not in text.split("*Reasoning:*")[0]
+
+
+# --- "Still failing": the build that inherited every one of its failures -----
+
+from testray_analytics.analysis.recurrence import Repeat
+
+
+def _repeat(**kw):
+    base = dict(cluster_key="v3:aaaa", occurrences=2, builds_ago=1,
+                first_build_id=524997126,
+                first_build_name="[master] ci:test:stable - 19704 - "
+                                 "2026-09-15[08:06:43]",
+                first_build_time="", test_name="semantic-versioning/0/0",
+                error="boom")
+    base.update(kw)
+    return Repeat(**base)
+
+
+META = {"routine_id": 79529, "project_id": 35392,
+        "testray_url": "https://testray.liferay.com/web/testray"}
+
+
+def test_a_repeat_names_the_build_it_started_in():
+    out = "\n".join(S._still_failing(META, {"1": _repeat()}))
+
+    assert "Still failing" in out
+    assert "occurrence #2" in out
+    assert "19704" in out, "the reader needs the build, not just a count"
+
+
+def test_a_repeat_carries_the_verdict_from_when_it_was_analysed():
+    """The point of the block: 'this is old AND here is what we decided'."""
+    out = "\n".join(S._still_failing(META, {"1": _repeat(
+        prior_verdict="POSSIBLEBUG",
+        prior_culprit="modules/apps/mcp/mcp-server-rest-impl/ToolSetUtil.java",
+        prior_reason="compileJava FAILED on a module rewritten in range.")}))
+
+    assert "Likely cause" in out
+    assert "ToolSetUtil.java" in out
+    assert "compileJava FAILED" in out
+
+
+def test_a_repeat_with_no_verdict_says_so_rather_than_going_quiet():
+    """Silence reads as a missing answer; the exclusion was deliberate."""
+    out = "\n".join(S._still_failing(META, {"1": _repeat()}))
+
+    assert "No verdict on file" in out
+    assert "Likely cause" not in out
+
+
+def test_no_repeats_renders_nothing():
+    assert S._still_failing(META, {}) == []
+
+
+def test_the_build_aggregate_row_is_never_a_repeat():
+    """`Top Level Build` is Testray's whole-build row, not a test. Matched on
+    the label because its case id differs per instance."""
+    assert S._is_aggregate_row("Top Level Build")
+    assert S._is_aggregate_row("top level build")
+    assert not S._is_aggregate_row("semantic-versioning/0/0")

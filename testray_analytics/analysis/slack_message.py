@@ -35,6 +35,7 @@ import argparse
 import csv
 import json
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
@@ -324,11 +325,94 @@ def _block(meta: dict, n: int, result: dict, cluster: dict,
     return lines
 
 
+def _repeats_for(run_dir: Path, meta: dict) -> dict:
+    """Repeats for this run. `submit` does the lookup once and passes it in on
+    `meta`; this only falls back to its own call when the message is
+    re-rendered standalone (`testray-analysis slack <bundle>`), where there is
+    nobody to have done it."""
+    cached = meta.get("_repeats")
+    if cached is not None:
+        return cached
+    from . import recurrence
+    return recurrence.repeats_for_run(run_dir, meta)
+
+
+def _is_aggregate_row(test_name: str) -> bool:
+    """Testray's whole-build row. `prepare.drop_aggregate_rows` removes it from
+    new bundles; this stays because a bundle prepared before that change still
+    carries the row, and re-rendering an old run must not resurrect it."""
+    from .prepare import is_aggregate_row
+    return is_aggregate_row(test_name)
+
+
+def _ago(iso: str) -> str:
+    """"1h", "3d" — how long before now. Empty when the time is unusable, and
+    the caller drops the clause rather than printing a wrong age."""
+    if not iso:
+        return ""
+    try:
+        when = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    except ValueError:
+        return ""
+    secs = (datetime.now(timezone.utc) - when).total_seconds()
+    if secs < 0:
+        return ""
+    if secs < 3600:
+        return f"{int(secs // 60)}m"
+    if secs < 86400:
+        return f"{int(secs // 3600)}h"
+    return f"{int(secs // 86400)}d"
+
+
+def _still_failing(meta: dict, repeats: dict) -> list[str]:
+    """The ":repeat: Still failing" section.
+
+    It replaces "no verdicts were produced — needs a human" on a build that
+    inherited every one of its failures. That line sent people to
+    re-investigate a failure explained days earlier, which is worse than
+    silence: it spends someone's morning to reach a conclusion already on file.
+    """
+    if not repeats:
+        return []
+
+    lines = ["", "🔁 *Still failing* — every failure here was inherited, "
+                 "nothing new in this build."]
+
+    for rep in sorted(repeats.values(),
+                      key=lambda r: (-r.occurrences, r.test_name))[:MAX_BLOCKS]:
+        where = _link(_build_url(meta, rep.first_build_id),
+                      _short_build_name(rep.first_build_name)
+                      or str(rep.first_build_id))
+        ago = _ago(rep.first_build_time)
+        lines += ["", f"• *{_trim(rep.test_name, 90)}* — occurrence "
+                      f"#{rep.occurrences}, first seen in {where}"
+                      + (f" ({ago} ago)" if ago else "")]
+
+        # The verdict from when this episode WAS analysed. Naming it is the
+        # difference between "this is old" and "this is old AND here is what
+        # we already decided about it".
+        if rep.prior_reason or rep.prior_culprit:
+            if rep.prior_culprit:
+                lines.append(f"  *Likely cause:* `{_trim(rep.prior_culprit, 80)}`")
+            if rep.prior_reason:
+                lines.append(f"  {_trim(rep.prior_reason, 320)}")
+        else:
+            # Said out loud rather than left blank. A repeat with no verdict on
+            # file is the write policy working as intended — the cluster was
+            # flaky, auto-classified or never ran — and a reader who is not
+            # told that reads the empty space as a missing answer.
+            lines.append("  _No verdict on file — the original run excluded "
+                         "this cluster from triage._")
+
+    return lines
+
+
 def render(run_dir: Path, *, report_url: str = "",
            link_testray: bool = False) -> str:
     """The message body. Plain text — the poster adds nothing."""
     run_dir = Path(run_dir)
     meta, results, clusters, caseresult_ids = _load(run_dir)
+    repeats = _repeats_for(run_dir, meta) if not results else {}
 
     build_b = _text(meta.get("build_b_name")) or _text(meta.get("build_id_b"))
     head_b = _trim(_short_build_name(build_b), 58)
@@ -401,9 +485,14 @@ def render(run_dir: Path, *, report_url: str = "",
                             for v in V.VERDICT_ORDER if counts.get(v))
         lines += ["", f"*Analysis:* {census}."]
     else:
-        lines += ["", "*Analysis:* no verdicts were produced for this pair — "
-                      "every failure was auto-classified or excluded upstream. "
-                      "Needs a human."]
+        # Only reached when recurrence found nothing either — a pair with no
+        # verdicts AND no history is genuinely unexplained.
+        if not repeats:
+            lines += ["", "*Analysis:* no verdicts were produced for this pair "
+                          "— every failure was auto-classified or excluded "
+                          "upstream. Needs a human."]
+
+    lines += _still_failing(meta, repeats)
 
     for i, result in enumerate(ordered[:MAX_BLOCKS], start=1):
         cluster = clusters.get(_text(result.get("group_id")), {})
