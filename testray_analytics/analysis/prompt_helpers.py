@@ -114,8 +114,22 @@ DEFAULT_AUTO_CLASSIFY = {
     ],
     "ENV_DEPENDENCY": [
         "org.tensorflow",
-        "repository-cdn.liferay.com",
-        "Downloaded https://repository-cdn",
+        # A bare `repository-cdn.liferay.com` used to live here and matched far
+        # too much. Gradle prints the list of repositories it SEARCHED when it
+        # cannot resolve an artifact, and that list always contains the Nexus
+        # host — so every unresolvable module looked like a CDN outage and was
+        # auto-excluded before a classifier ever saw it. Measured on Stable
+        # 19704: `site-staticexport-api:baseline` failed because LPD-105774
+        # bumped the module to 1.1.0 with no published 1.0.0 to baseline
+        # against — a real defect, in range, silently filed as infrastructure.
+        # These patterns must therefore name a TRANSPORT failure, never just
+        # the host that appears in a "searched in the following locations"
+        # list.
+        r"Could not (GET|HEAD|PUT) '?https://repository-cdn",
+        r"Downloaded https://repository-cdn",
+        r"repository-cdn\.liferay\.com.{0,120}"
+        r"(Connection (reset|refused|timed out)|Read timed out|"
+        r"502 Bad Gateway|503 Service Unavailable|504 Gateway)",
     ],
     "ENV_DATE": [
         r"data-startdate,'11/\d{2}/20\d{2}'",
