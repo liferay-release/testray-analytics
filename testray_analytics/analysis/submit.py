@@ -920,6 +920,20 @@ def main() -> None:
     from . import recurrence
     meta = dict(meta, _repeats=recurrence.repeats_for_run(run_dir, meta))
 
+    # Who to ping, resolved from the commit the classifier named rather than
+    # from the `author` field it emitted alongside it. See
+    # prepare.fetch_commit_authors: on a multi-author ticket the model picks
+    # the wrong person, which is survivable as prose and is not as a mention.
+    _repo = (full_cfg.get("git") or {}).get("repo_path")
+    _shas = {str(c.get("commit")).strip()
+             for r in (payload.get("results") or [])
+             for c in (r.get("candidates") or [])
+             if isinstance(c, dict) and c.get("commit")}
+    if _repo and _shas:
+        from .prepare import fetch_commit_authors
+        meta = dict(meta, _commit_authors=fetch_commit_authors(
+            Path(str(_repo)).expanduser(), _shas))
+
     report_path = render_run(run_dir, df, meta)
     print(f"Report:     {report_path}")
 

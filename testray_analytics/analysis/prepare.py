@@ -2877,6 +2877,37 @@ def render_changed_files_section(manifest: dict[str, int]) -> list[str]:
 MAX_COMMIT_DIFF_BYTES = 400_000
 
 
+def fetch_commit_authors(git_repo: Path, shas) -> dict[str, tuple[str, str]]:
+    """`{sha: (name, email)}` for the commits named, resolved from the checkout.
+
+    Deliberately keyed on the SHA rather than taken from the classifier's own
+    `author` field. The model picks that one out of the prompt's commit list,
+    and where a ticket groups several authors it picks wrong — which was
+    survivable while the name was prose, and is not once the name becomes a
+    Slack ping. Trust the model for WHICH COMMIT; ask git WHO.
+
+    The short sha the classifier emits resolves fine: `git show` expands any
+    unambiguous prefix. One call per sha, but only for the handful a verdict
+    actually named.
+    """
+    out: dict[str, tuple[str, str]] = {}
+    if not shas or not git_repo or not (Path(git_repo) / ".git").is_dir():
+        return out
+    for sha in {str(x).strip() for x in shas if str(x or "").strip()}:
+        try:
+            line = subprocess.run(
+                ["git", "-C", str(git_repo), "show", "-s",
+                 "--format=%an\t%ae", sha],
+                capture_output=True, text=True, check=True, timeout=20,
+            ).stdout.strip().split("\n")[0]
+        except (subprocess.SubprocessError, FileNotFoundError):
+            continue
+        name, _, email = line.partition("\t")
+        if name or email:
+            out[sha] = (name.strip(), email.strip())
+    return out
+
+
 def write_commit_diffs(run_dir: Path, git_repo: Path,
                        commits: list) -> tuple[int, Path | None]:
     """One `commits/<sha>.diff` per commit in range. Returns (count, dir).

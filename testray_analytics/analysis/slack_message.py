@@ -237,7 +237,59 @@ def _verdict_of(result: dict) -> str:
                              _text(result.get("specific_change")))
 
 
-def _cause_row(meta: dict, result: dict) -> str:
+# Slack resolves `<@handle>` against the workspace. Liferay's handles are the
+# local part of the corporate address, so no API call, no token and no user
+# cache is needed — the same transform the jenkins-results-parser
+# failure-cause-fix skill uses. An address outside the domain has no handle to
+# guess, so it renders raw: a visible email still carries the attribution,
+# where a fabricated `<@...>` would either silently fail to link or, worse,
+# ping whoever does own that handle.
+_LIFERAY_EMAIL = "@liferay.com"
+
+
+def _slack_mention(email: str) -> str:
+    e = _text(email)
+    if not e:
+        return ""
+    return f"<@{e[:-len(_LIFERAY_EMAIL)]}>" if e.lower().endswith(_LIFERAY_EMAIL) else e
+
+
+def _commit_authors(run_dir: Path, meta: dict, resolve: bool = False) -> dict:
+    """`{sha: (name, email)}` for the commits the verdicts named.
+
+    `submit` resolves this once and passes it on `meta`. `resolve` asks for the
+    lookup instead, for a standalone re-render (`testray-analysis slack
+    <bundle>`) where nobody has done it.
+
+    It is opt-in rather than automatic because the lookup shells into the
+    configured checkout, and hidden filesystem access inside a pure render is
+    the wrong shape: it made a unit test's output depend on whether the
+    developer happened to have liferay-portal cloned, passing here and failing
+    on a clean machine.
+
+    Never fatal — no checkout means no mention, and the row falls back to the
+    classifier's own author text.
+    """
+    cached = meta.get("_commit_authors")
+    if cached is not None:
+        return cached
+    if not resolve:
+        return {}
+    try:
+        from .prepare import fetch_commit_authors, load_config
+        shas = set()
+        payload = json.loads((run_dir / "results.json").read_text(encoding="utf-8"))
+        for r in payload.get("results") or []:
+            for c in (r.get("candidates") or []):
+                if isinstance(c, dict) and c.get("commit"):
+                    shas.add(str(c["commit"]).strip())
+        repo = (load_config().get("git") or {}).get("repo_path")
+        return fetch_commit_authors(Path(str(repo)).expanduser(), shas) if repo else {}
+    except Exception:                                            # noqa: BLE001
+        return {}
+
+
+def _cause_row(meta: dict, result: dict, authors: dict | None = None) -> str:
     """`*Likely cause:*` — only when the classifier actually named one.
 
     A candidate flagged `explains: false` is the closest change in range, not
@@ -253,8 +305,22 @@ def _cause_row(meta: dict, result: dict) -> str:
         bits = [_link(f"https://github.com/{slug}/commit/{sha}", sha[:9])]
         if _text(cand.get("ticket")):
             bits.append(_text(cand["ticket"]))
-        if _text(cand.get("author")):
-            bits.append(f"({_text(cand['author'])})")
+
+        # Ping only when the classifier says this commit EXPLAINS the failure.
+        # A candidate flagged `explains: false` is the closest change in range,
+        # and notifying someone that their commit is the nearest thing to a
+        # build they did not break is how a useful alert becomes one people
+        # mute. Same reason the skill drops its Authors row on unattributed
+        # clusters.
+        name, email = (authors or {}).get(_text(cand.get("commit")), ("", ""))
+        who = _slack_mention(email) if cand.get("explains") else ""
+        if not who:
+            # git's name beats the classifier's: it named the commit, not the
+            # person, and on a multi-author ticket it picks the wrong one.
+            who = name or _text(cand.get("author"))
+        if who:
+            bits.append(f"({who})")
+
         label = "Likely cause" if cand.get("explains") else "Closest in range"
         why = _flat(cand.get("why"))
         return f"> *{label}:* {' '.join(bits)}{' — ' + why if why else ''}"
@@ -264,7 +330,8 @@ def _cause_row(meta: dict, result: dict) -> str:
 
 
 def _block(meta: dict, n: int, result: dict, cluster: dict,
-           caseresult_ids: dict | None = None) -> list[str]:
+           caseresult_ids: dict | None = None,
+           authors: dict | None = None) -> list[str]:
     """One `Failure --- N` block."""
     verdict = _verdict_of(result)
     confidence = _text(result.get("confidence")).lower()
@@ -294,7 +361,7 @@ def _block(meta: dict, n: int, result: dict, cluster: dict,
 
     lines = [f"*Failure --- {n}:* *{_link(href, title) if href else title}*"]
 
-    cause = _cause_row(meta, result)
+    cause = _cause_row(meta, result, authors)
     if cause:
         lines.append(cause)
 
@@ -408,11 +475,13 @@ def _still_failing(meta: dict, repeats: dict) -> list[str]:
 
 
 def render(run_dir: Path, *, report_url: str = "",
-           link_testray: bool = False) -> str:
+           link_testray: bool = False, resolve_authors: bool = False) -> str:
     """The message body. Plain text — the poster adds nothing."""
     run_dir = Path(run_dir)
     meta, results, clusters, caseresult_ids = _load(run_dir)
     repeats = _repeats_for(run_dir, meta) if not results else {}
+    authors = (_commit_authors(run_dir, meta, resolve_authors)
+               if results else {})
 
     build_b = _text(meta.get("build_b_name")) or _text(meta.get("build_id_b"))
     head_b = _trim(_short_build_name(build_b), 58)
@@ -496,7 +565,8 @@ def render(run_dir: Path, *, report_url: str = "",
 
     for i, result in enumerate(ordered[:MAX_BLOCKS], start=1):
         cluster = clusters.get(_text(result.get("group_id")), {})
-        lines += [""] + _block(meta, i, result, cluster, caseresult_ids)
+        lines += [""] + _block(meta, i, result, cluster, caseresult_ids,
+                               authors)
 
     if len(ordered) > MAX_BLOCKS:
         lines += ["", f"_{len(ordered) - MAX_BLOCKS} further cluster(s) not "
@@ -510,8 +580,11 @@ def write(run_dir: Path, *, out: Path | None = None, report_url: str = "",
     """Render and write the message. Returns the path written."""
     target = Path(out) if out else resolve_path(None, OUT_REL)
     target.parent.mkdir(parents=True, exist_ok=True)
+    # A standalone re-render has no submit to have resolved the authors, so
+    # ask for the lookup here rather than inside render().
     target.write_text(render(run_dir, report_url=report_url,
-                             link_testray=link_testray), encoding="utf-8")
+                             link_testray=link_testray,
+                             resolve_authors=True), encoding="utf-8")
     return target
 
 
