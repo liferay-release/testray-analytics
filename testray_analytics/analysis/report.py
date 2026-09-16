@@ -2165,6 +2165,43 @@ def _pre_existing_section(pre_df, meta: dict) -> str:
   </details>"""
 
 
+def _nothing_to_show(meta: dict) -> str:
+    """The empty grid, with somewhere to go when there IS an answer elsewhere.
+
+    An empty table on a build that is plainly red reads as "the tool found
+    nothing", and the reader goes and re-investigates a failure that was
+    explained days ago. When every failure was inherited, the useful thing is
+    not another verdict — it is the run that already produced one.
+
+    Derives nothing: `_repeats` is what `submit` looked up once for this run,
+    and the link is the stored earlier run. Recomputing the comparison here
+    would give the report a second opinion about when a failure started.
+    """
+    reps = (meta or {}).get("_repeats") or {}
+    if not reps:
+        return '<tr><td colspan="11">No rows.</td></tr>'
+
+    # The longest-running one: with several inherited failures, the episode
+    # that has been red longest is the one whose analysis a reader wants.
+    rep = max(reps.values(), key=lambda r: (r.occurrences, r.builds_ago))
+
+    from .recurrence import triage_url_for
+    url   = triage_url_for(meta, rep.first_build_id)
+    label = _text(rep.first_build_name) or str(rep.first_build_id)
+    where = (f'<a href="{_esc(url)}" target="_blank" rel="noopener">'
+             f'{_esc(label)}</a>') if url else _esc(label)
+
+    n = len(reps)
+    return (
+        f'<tr><td colspan="11" class="nothing-to-show">'
+        f'<strong>Nothing new in this build.</strong> '
+        f'{n} failure{"s" if n != 1 else ""} '
+        f'{"were" if n != 1 else "was"} already failing on the baseline, so '
+        f'nothing here was analysed. '
+        f'View the analysis from {where}.'
+        f'</td></tr>')
+
+
 def _is_flaky(row) -> bool:
     """Whether a row is marked flaky upstream on the Testray case."""
     v = row.get("known_flaky")
@@ -2841,7 +2878,7 @@ def render_run(run_dir, df: pd.DataFrame, meta: dict) -> Path:
         order[mode] = entries
 
     body = (_member_rows(df, meta, cluster_no, ckeys, shared)
-            if len(df) else '<tr><td colspan="11">No rows.</td></tr>')
+            if len(df) else _nothing_to_show(meta))
 
     a_url, b_url = _build_url(meta, meta.get("build_id_a")), _build_url(meta, meta.get("build_id_b"))
     a_name = _text(meta.get("build_a_name")) or _text(meta.get("build_id_a")) or "baseline"

@@ -266,3 +266,54 @@ def test_missing_optional_columns_do_not_crash(tmp_path):
 def test_long_error_is_truncated_not_dumped(tmp_path):
     html = _render([_row(1, 1, error_message="x" * 5000)], tmp_path)
     assert "[truncated]" in html
+
+
+# --- the empty grid points at the run that has the answer --------------------
+
+def test_nothing_to_show_links_the_run_that_explained_it():
+    """An empty table on a red build reads as "the tool found nothing", and
+    sends someone to re-investigate a failure explained days ago."""
+    from testray_analytics.analysis import report as R
+    from testray_analytics.analysis.recurrence import Repeat
+
+    meta = {
+        "testray_url": "https://testray.liferay.com/web/testray",
+        "_repeats": {"1": Repeat(
+            cluster_key="v3:aaaa", occurrences=2, builds_ago=1,
+            first_build_id=524997126,
+            first_build_name="[master] ci:test:stable - 19704")},
+    }
+
+    html = R._nothing_to_show(meta)
+
+    assert "Nothing new in this build" in html
+    assert "triage?buildId=524997126" in html, "must link the earlier run"
+    assert "19704" in html
+
+
+def test_nothing_to_show_falls_back_when_there_is_no_earlier_run():
+    """No repeats means genuinely nothing — do not invent a link."""
+    from testray_analytics.analysis import report as R
+
+    assert R._nothing_to_show({}) == '<tr><td colspan="11">No rows.</td></tr>'
+    assert R._nothing_to_show({"_repeats": {}}) == \
+        '<tr><td colspan="11">No rows.</td></tr>'
+
+
+def test_nothing_to_show_picks_the_longest_running_episode():
+    """With several inherited failures, the one red longest is the one whose
+    analysis a reader wants."""
+    from testray_analytics.analysis import report as R
+    from testray_analytics.analysis.recurrence import Repeat
+
+    meta = {
+        "testray_url": "https://testray.liferay.com/web/testray",
+        "_repeats": {
+            "1": Repeat(cluster_key="a", occurrences=2, builds_ago=1,
+                        first_build_id=111, first_build_name="recent"),
+            "2": Repeat(cluster_key="b", occurrences=9, builds_ago=8,
+                        first_build_id=222, first_build_name="oldest"),
+        },
+    }
+
+    assert "buildId=222" in R._nothing_to_show(meta)
