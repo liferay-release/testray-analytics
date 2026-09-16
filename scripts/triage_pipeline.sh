@@ -246,16 +246,6 @@ then
 	exit 0
 fi
 
-# A dry run first: it makes no model calls, takes seconds, and its log records
-# the batch plan and token estimate for the run that is about to happen. That is
-# the standing rule for anything that spends model usage — never fire blind.
-if ! run_step "classify_dry_run" \
-	"${PYTHON}" -m testray_analytics.analysis.classify \
-	"${BUNDLE}" --engine "${ENGINE}" --dry-run
-then
-	exit 2
-fi
-
 # Nothing classifiable means nothing to ask. Skipping is not an optimisation
 # detail: a run with zero classifiable clusters used to send its auto-only
 # sections anyway, the model correctly answered with nothing, and it cost real
@@ -277,9 +267,43 @@ if [ "${CLASSIFIABLE:-0}" -eq 0 ]
 then
 	log "! no classifiable clusters — skipping classify (nothing to ask)"
 	log "  every failure in this pair was auto-classified or excluded upstream."
-	log "  submit will still run so the report and coverage are written."
+	log "  submit still runs: the report's pre-existing section and the coverage"
+	log "  figures are the whole point of a run like this one."
+
+	# submit requires results.json to exist, so the skip path writes an empty
+	# one rather than being allowed to reach submit without it. Empty is not a
+	# provenance claim — zero verdicts cannot misattribute anything — and it
+	# keeps "the file is missing" meaning what it should: classify crashed.
+	if ! "${PYTHON}" - "${BUNDLE}" <<-'PYEOF'
+		import json, pathlib, sys
+		import yaml
+		b = pathlib.Path(sys.argv[1])
+		meta = yaml.safe_load((b / "run.yml").read_text(encoding="utf-8")) or {}
+		(b / "results.json").write_text(json.dumps({
+		    "run_id": meta.get("run_id"),
+		    "classifier": meta.get("classifier"),
+		    "results": [],
+		}, indent=2), encoding="utf-8")
+		PYEOF
+	then
+		log "! could not write an empty results.json"
+		exit 2
+	fi
+
 	SKIPPED_CLASSIFY=true
 else
+	# A dry run first: it makes no model calls, takes seconds, and its log records
+	# the batch plan and token estimate for the run that is about to happen. That
+	# is the standing rule for anything that spends model usage — never fire
+	# blind. It runs here, not before the count above: with nothing classifiable
+	# it exits 1 and used to take the whole pipeline down with it.
+	if ! run_step "classify_dry_run" \
+		"${PYTHON}" -m testray_analytics.analysis.classify \
+		"${BUNDLE}" --engine "${ENGINE}" --dry-run
+	then
+		exit 2
+	fi
+
 	if ! run_step "classify" \
 		"${PYTHON}" -m testray_analytics.analysis.classify \
 		"${BUNDLE}" --engine "${ENGINE}"

@@ -341,3 +341,87 @@ def test_a_pair_already_analysed_here_is_not_queued_again(offline):
     assert first["queued"] == 1
     assert second["queued"] == 0 and second["skipped"] == 1
     assert q.pending() == []
+
+
+# --- the row queue: TriageRun is the only memory a fresh checkout has --------
+#
+# Everything above exercises the file queue, whose done/ dir remembers a
+# finished pair. The Jenkins agent has no such memory: it checks both repos out
+# fresh on every Stable failure, so done/ and runs/ are gone before the next
+# tick. There the record lives in Testray, and these pin that path.
+
+class _RecordingQueue:
+    """Row queue stand-in. Registers anything it is given, once."""
+
+    def __init__(self):
+        self.registered = []
+
+    def register(self, job):
+        if job.name in [j.name for j in self.registered]:
+            return False
+        self.registered.append(job)
+        return True
+
+
+@pytest.fixture
+def rows(monkeypatch, offline):
+    """`offline`, but the scanner believes the TriageRun Object is deployed."""
+
+    def wire(builds, signatures, analysed=(), attributions=None):
+        offline(builds, signatures, attributions)
+        q = _RecordingQueue()
+        monkeypatch.setattr(S, "open_queue", lambda cfg, d: (q, "testray"))
+        monkeypatch.setattr(S, "analysed_pairs",
+                            lambda cfg, routine_id: set(analysed))
+        return q
+
+    return wire
+
+
+def test_a_pair_with_a_finished_triagerun_is_not_queued_again(rows):
+    """The re-pay loop: pair 522890829 -> 522894597 was classified twice in 100
+    minutes because submit deletes the request row when it finishes, so
+    register() saw a brand-new pair on the next tick. Its clusters were all
+    dropped by the write policy, so no TriageResult existed to explain them
+    either — the TriageRun row is the only thing that can say "done".
+    """
+    q = rows(
+        builds=[build(3, failed=1), build(2), build(1)],
+        signatures={3: {SIG_A: [10]}, 2: {}, 1: {}},
+        analysed=[(2, 3)],
+    )
+
+    summary = S.scan(CFG, 79529, queue_dir=None)
+
+    assert summary["queued"] == 0
+    assert summary["analysed"] == 1
+    assert q.registered == []
+
+
+def test_force_requeues_a_pair_that_already_has_a_finished_run(rows):
+    """The only way back to an analysed pair, since the row is permanent."""
+    q = rows(
+        builds=[build(3, failed=1), build(2), build(1)],
+        signatures={3: {SIG_A: [10]}, 2: {}, 1: {}},
+        analysed=[(2, 3)],
+    )
+
+    summary = S.scan(CFG, 79529, queue_dir=None, force=True)
+
+    assert summary["queued"] == 1
+    assert summary["analysed"] == 0
+    assert [j.name for j in q.registered] == ["79529-2-3"]
+
+
+def test_an_unanalysed_pair_still_queues_on_the_row_backend(rows):
+    """The skip must key on the pair, not fire for every build with a run."""
+    q = rows(
+        builds=[build(3, failed=1), build(2), build(1)],
+        signatures={3: {SIG_A: [10]}, 2: {}, 1: {}},
+        analysed=[(1, 2)],            # a different pair entirely
+    )
+
+    summary = S.scan(CFG, 79529, queue_dir=None)
+
+    assert summary["queued"] == 1
+    assert [j.name for j in q.registered] == ["79529-2-3"]

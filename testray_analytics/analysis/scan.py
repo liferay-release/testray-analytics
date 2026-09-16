@@ -204,11 +204,71 @@ def _counters_populated(builds: list[dict]) -> bool:
     return any(int(b.get("caseResultPassed") or 0) > 0 for b in builds)
 
 
+def analysed_pairs(cfg: dict, routine_id: int) -> set[tuple[int, int]]:
+    """(baseline, target) pairs this routine already has a finished run for.
+
+    This is the only memory the scanner has. The Jenkins job checks out both
+    repos fresh on every Stable failure, so the queue's `done/` markers and the
+    whole `runs/` tree are gone before the next tick — the TriageRun row in
+    Testray is the sole surviving record that a pair was ever analysed.
+
+    Without it, a pair whose clusters are all dropped by the write policy
+    (never-ran, pre-existing, flaky, auto, high-confidence FALSE_POSITIVE)
+    never gains a TriageResult. `attributions()` therefore cannot see it, every
+    scan calls its signatures NEW, and the pipeline re-prepares and RE-PAYS for
+    an identical answer on each trigger. Pair 522890829 -> 522894597 was
+    classified twice in 100 minutes that way, for one written row both times.
+
+    Keyed on the PAIR, not the target build: the baseline walk gives different
+    signatures in one build different baselines, so skipping by target alone
+    would strand every group but the first.
+
+    `triageRunStatus eq 'DONE'` filters the picklist key directly — the
+    `triageRunStatus/key` spelling is rejected, the same quirk `importStatus`
+    has in recent_done_builds. QUEUED request rows are excluded on purpose:
+    q.register() already owns "is this pending", and treating a request row as
+    an analysis would skip a pair nobody has answered yet.
+    """
+    from .testray_writer import RUN_ENDPOINT
+
+    try:
+        items = fetch_paginated(
+            RUN_ENDPOINT,
+            {"filter": (f"r_routineToTriageRuns_c_routineId eq '{routine_id}' "
+                        f"and triageRunStatus eq 'DONE'")},
+            token=_testray_oauth_token(cfg), base_url=cfg["base_url"],
+            page_size=200,
+        )
+    except Exception as e:                                       # noqa: BLE001
+        # 404 means the TriageRun Object is not deployed here; anything else is
+        # a token or a server fault. Either way the honest answer is "no runs on
+        # file". Degrading to that re-analyses — which costs money but is
+        # correct — where raising would stop the scanner dead and explain
+        # nothing about a red build.
+        print(f"  ! could not read TriageRun history "
+              f"({type(e).__name__}: {e}) — treating every pair as unanalysed",
+              file=sys.stderr)
+        return set()
+
+    pairs: set[tuple[int, int]] = set()
+    for row in items:
+        a = row.get("r_baselineBuildToTriageRuns_c_buildId")
+        b = row.get("r_buildToTriageRuns_c_buildId")
+        if a and b:
+            pairs.add((int(a), int(b)))
+    return pairs
+
+
 def scan(cfg: dict, routine_id: int, *, queue_dir: Path,
          catch_up: int = DEFAULT_CATCH_UP,
          window: int = DEFAULT_BUILD_WINDOW,
-         dry_run: bool = False) -> dict:
-    """One tick. Prints what it found; returns a summary."""
+         dry_run: bool = False, force: bool = False) -> dict:
+    """One tick. Prints what it found; returns a summary.
+
+    `force` re-queues pairs that already have a finished TriageRun. It is the
+    only way back to a pair once it has been analysed, since the row in Testray
+    is deliberately permanent — see analysed_pairs().
+    """
     tr = cfg["testray"]
     q, kind = open_queue(cfg, queue_dir)
     print(f"Testray:  {testray_target(cfg)}")
@@ -253,7 +313,22 @@ def scan(cfg: dict, routine_id: int, *, queue_dir: Path,
 
     print(f"Verdicts on file: {len(index.attributions())} distinct signature(s)")
 
-    queued = skipped = n_new = n_active = n_norange = 0
+    done_pairs: set[tuple[int, int]] = set()
+    if kind != "testray":
+        # File-queue instances keep their own memory in done/, and an instance
+        # without the TriageRun Object would 404 this lookup anyway. Note the
+        # done/ dir only survives if the checkout does — which on the Jenkins
+        # agent it does not. That is survivable only because the agent runs
+        # against prod, where the Object IS deployed and this branch is dead.
+        pass
+    elif force:
+        print("--force: pairs with a finished run will be re-queued.")
+    else:
+        done_pairs = analysed_pairs(tr, routine_id)
+        if done_pairs:
+            print(f"Runs on file:     {len(done_pairs)} pair(s) already analysed")
+
+    queued = skipped = n_new = n_active = n_norange = n_done = 0
     # Dry-run has to model the real queue's idempotency, or it reports work a
     # real run would skip: two catch-up builds carrying the same signature
     # converge on one job, and saying "2 queued" would be a lie.
@@ -294,6 +369,15 @@ def scan(cfg: dict, routine_id: int, *, queue_dir: Path,
         for (baseline, first_seen), sigs in sorted(pairs.items()):
             job = Job(routine_id=routine_id, baseline_build=baseline,
                       target_build=first_seen, signatures=sigs)
+            # Checked before the queue, not after: register() only knows about
+            # rows that are still QUEUED, and submit deletes the request row
+            # when it finishes. Without this the pair looks brand new again the
+            # moment its own analysis succeeds.
+            if (baseline, first_seen) in done_pairs:
+                n_done += 1
+                print(f"      already analysed {job.name} "
+                      f"— skipping ({len(sigs)} signature(s); --force to re-run)")
+                continue
             if dry_run:
                 if job.name in would_queue:
                     skipped += 1
@@ -312,11 +396,13 @@ def scan(cfg: dict, routine_id: int, *, queue_dir: Path,
     print(f"\nSignatures: {n_new} unexplained, {n_active} with a verdict on file")
     print(f"Jobs: {queued} queued"
           + (f", {skipped} already registered" if skipped else "")
+          + (f", {n_done} already analysed" if n_done else "")
           + (f", {n_norange} skipped for want of a baseline" if n_norange else ""))
     if dry_run:
         print("\n--dry-run: nothing was written to the queue.")
     return {"targets": len(targets), "queued": queued, "skipped": skipped,
-            "new": n_new, "active": n_active, "no_range": n_norange}
+            "new": n_new, "active": n_active, "no_range": n_norange,
+            "analysed": n_done}
 
 
 # ---------------------------------------------------------------------------
@@ -393,6 +479,11 @@ def main() -> None:
                     help="give up waiting after this long and scan anyway "
                          f"(default {DEFAULT_IMPORT_WAIT_TIMEOUT}, env "
                          f"{IMPORT_WAIT_TIMEOUT_ENV})")
+    ap.add_argument("--force", action="store_true",
+                    help="re-queue a pair even though a finished TriageRun "
+                         "exists for it. Costs a full classify: the run is "
+                         "prepared fresh, so nothing is reused. Use it after a "
+                         "prompt or rubric change, not to retry a bad tick.")
     args = ap.parse_args()
 
     cfg = load_config()
@@ -437,7 +528,7 @@ def main() -> None:
             try:
                 scan(cfg, routine_id, queue_dir=queue_dir,
                      catch_up=args.catch_up, window=args.window,
-                     dry_run=args.dry_run)
+                     dry_run=args.dry_run, force=args.force)
             except Exception as e:                               # noqa: BLE001
                 # One routine's bad tick must not take the others down, nor end
                 # a long-running scan: the usual cause is transient (a token, a
