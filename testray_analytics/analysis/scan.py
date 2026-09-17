@@ -427,6 +427,13 @@ def _post_recurrence(tr: dict, routine_id, build_id, by_id: dict) -> None:
     try:
         from . import recurrence, slack_message
 
+        # Stable only, same reason submit gates its own message: the post is
+        # for the channel watching the upstream sync. `lookup` would return
+        # nothing for another routine anyway, but saying so beats reporting
+        # "no recurring signature could be traced" as if the walk had run.
+        if int(routine_id) != recurrence.STABLE_ROUTINE_ID:
+            return
+
         repeats = recurrence.repeats_for_build(
             tr, routine_id=routine_id, build_id=build_id)
         if not repeats:

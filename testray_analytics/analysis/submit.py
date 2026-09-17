@@ -938,10 +938,10 @@ def main() -> None:
     report_path = render_run(run_dir, df, meta)
     print(f"Report:     {report_path}")
 
-    # The Slack message is written on every run, including one that concluded
-    # nothing: an unattended pipeline that posts only when it has news is
-    # indistinguishable from one that did not run. Rendered from the bundle,
-    # not from `df`, so the same file can be regenerated later with
+    # The Slack message is written on every STABLE run, including one that
+    # concluded nothing: an unattended pipeline that posts only when it has
+    # news is indistinguishable from one that did not run. Rendered from the
+    # bundle, not from `df`, so the same file can be regenerated later with
     # `testray-analysis slack <bundle>`.
     #
     # `link_testray` is passed only after a successful upsert, because the
@@ -950,6 +950,23 @@ def main() -> None:
     def write_slack(*, link_testray: bool) -> None:
         if args.no_slack:
             return
+
+        # Stable only. A red Stable build blocks the upstream sync, which is
+        # why #portal-failures watches it; a release or acceptance routine
+        # posting into the same channel is noise nobody there can act on. The
+        # gate is here rather than in the renderer so that asking for a message
+        # by hand — `testray-analysis slack <bundle>` — still works on any
+        # routine.
+        try:
+            routine = int(meta.get("routine_id") or 0)
+        except (TypeError, ValueError):
+            routine = 0
+
+        if routine != recurrence.STABLE_ROUTINE_ID:
+            print(f"Slack:      not written — routine {routine or '?'} is not "
+                  f"Stable ({recurrence.STABLE_ROUTINE_ID})")
+            return
+
         try:
             # The queue runner sets this: it drains several pairs per tick
             # through one submit each, and Jenkins posts the file once at the

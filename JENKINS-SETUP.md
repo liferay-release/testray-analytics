@@ -103,9 +103,12 @@ which is the "yes, these are deliberate" switch.
 
 A successful triage of a red build is a **job success**. With failure-only
 notification the channel would hear from this job only when the tooling itself
-broke, and never see an analysis. The message is written on every run,
-including one that concluded nothing — silence and success are
-indistinguishable otherwise.
+broke, and never see an analysis. The message is written on every **Stable**
+run, including one that concluded nothing — silence and success are
+indistinguishable otherwise. Other routines are analysed and written back to
+Testray as usual but post nothing: the channel watches Stable because a red
+Stable build blocks the upstream sync, and a release or acceptance routine
+posting there is noise nobody in it can act on.
 
 A tick that finds the previous tick still running exits **0** and logs
 `skipped: another tick still holds …`. That is deliberate — a job that notifies

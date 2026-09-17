@@ -425,3 +425,21 @@ def test_an_unanalysed_pair_still_queues_on_the_row_backend(rows):
 
     assert summary["queued"] == 1
     assert [j.name for j in q.registered] == ["79529-2-3"]
+
+
+def test_the_recurrence_message_is_stable_only(monkeypatch, tmp_path):
+    """Slack is for Stable. A release or acceptance routine is analysed and
+    written back to Testray as usual, but posts nothing to a channel that
+    watches the upstream sync and cannot act on it."""
+    from testray_analytics.analysis import scan as S
+
+    called = []
+    monkeypatch.setattr(
+        "testray_analytics.analysis.recurrence.repeats_for_build",
+        lambda *a, **k: called.append(1) or {})
+
+    S._post_recurrence({}, 590307, 1, {})          # Acceptance
+    assert called == [], "the walk must not even run for a non-Stable routine"
+
+    S._post_recurrence({}, 79529, 1, {})           # Stable
+    assert called == [1]

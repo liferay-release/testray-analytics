@@ -132,9 +132,12 @@ find out at call time.
 
 ## Symptom: Slack got nothing, but the job succeeded
 
-The message is written on **every** tick — including one that analysed nothing,
-where `scan` writes the `🔁 Still failing` block itself. So if Slack is silent,
-the posting side is the problem, not the analysis:
+The message is written on **every Stable** tick — including one that analysed
+nothing, where `scan` writes the `🔁 Still failing` block itself. A tick that
+only analysed another routine writes no message at all and logs
+`Slack: not written — routine N is not Stable`; that is expected, not a fault.
+Otherwise, if Slack is silent the posting side is the problem, not the
+analysis:
 
 1. Is the notification set to post on **every build**? If it is set to "every
    failure", it will never post — a successful triage of a red build is a job
