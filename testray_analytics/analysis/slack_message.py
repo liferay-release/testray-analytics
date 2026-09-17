@@ -496,7 +496,12 @@ def _still_failing(meta: dict, repeats: dict) -> list[str]:
         own = "" if shared else triage_url_for(meta, rep.first_build_id)
         if own:
             bullet += f" · {_link(own, 'report')}"
-        lines.append(bullet)
+        # A blank line before each entry. Slack renders these two-line entries
+        # as one grey wall without it, and the eye cannot find where one repeat
+        # ends and the next begins — which on a six-repeat build is the whole
+        # difference between a list and a paragraph. It also separates the
+        # first entry from the header block above.
+        lines += ["", bullet]
 
         # The file and the ticket from when this episode WAS analysed: enough
         # to recognise the failure and to reach the change that caused it,

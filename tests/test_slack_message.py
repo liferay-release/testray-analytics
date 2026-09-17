@@ -598,3 +598,17 @@ def test_a_singular_inherited_failure_reads_as_one(tmp_path):
     text = S.render(bundle(tmp_path, [verdict(1, "BUG")],
                            meta={"transition_counts": {"same_failure": 1}}))
     assert "1 failure inherited" in text
+
+
+def test_each_repeat_is_separated_from_the_next():
+    """Two-line entries run together into one grey wall otherwise, and on a
+    six-repeat build the reader cannot see where one ends and the next
+    begins."""
+    out = S._still_failing(META, {
+        "1": _repeat(cluster_key="v3:aaa", test_name="a/0/0"),
+        "2": _repeat(cluster_key="v3:bbb", test_name="b/0/0")})
+
+    bullets = [i for i, line in enumerate(out) if line.lstrip().startswith("•")]
+    assert len(bullets) == 2
+    for i in bullets:
+        assert out[i - 1] == "", "each entry needs a blank line before it"
