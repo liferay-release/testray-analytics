@@ -265,11 +265,49 @@ def test_a_repeat_carries_the_verdict_from_when_it_was_analysed():
     out = "\n".join(S._still_failing(META, {"1": _repeat(
         prior_verdict="POSSIBLEBUG",
         prior_culprit="modules/apps/mcp/mcp-server-rest-impl/ToolSetUtil.java",
-        prior_reason="compileJava FAILED on a module rewritten in range.")}))
+        prior_reason="compileJava FAILED on a module rewritten in range.",
+        prior_tickets=("LPD-105486",))}))
 
     assert "Likely cause" in out
     assert "ToolSetUtil.java" in out
-    assert "compileJava FAILED" in out
+    assert "LPD-105486" in out
+    assert "liferay.atlassian.net/browse/LPD-105486" in out, \
+        "a bare key in Slack is a copy-paste job"
+
+
+def test_a_repeat_does_not_quote_the_stored_reasoning():
+    """This section is an index, not a second copy of the report.
+
+    On 19793 two clusters of one compile break rendered ~300 characters of
+    near-identical prose each, pushing the build, the file and the ticket —
+    the parts a reader acts on — off the first screen.
+    """
+    out = "\n".join(S._still_failing(META, {"1": _repeat(
+        prior_verdict="BUG",
+        prior_culprit="SegmentsEntryLocalServiceTest.java",
+        prior_reason="Identical error signature to group 1 — a compile failure "
+                     "of ':apps:segments:segments-test' reported through the "
+                     "exec wrapper.")}))
+
+    assert "exec wrapper" not in out
+    assert "Identical error signature" not in out
+    # What replaces it: the run that HAS the reasoning, in one click.
+    assert "Original report:" in out
+    assert "triage?buildId=524997126" in out
+
+
+def test_repeats_from_different_builds_each_link_their_own_report():
+    """One "Original report" standing for all of them would send a reader to a
+    run that never saw the failure they clicked from."""
+    out = "\n".join(S._still_failing(META, {
+        "1": _repeat(cluster_key="v3:aaa", test_name="a/0/0",
+                     first_build_id=524997126),
+        "2": _repeat(cluster_key="v3:bbb", test_name="b/0/0",
+                     first_build_id=524000111)}))
+
+    assert "Original report:" not in out
+    assert "triage?buildId=524997126" in out
+    assert "triage?buildId=524000111" in out
 
 
 def test_a_repeat_with_no_verdict_says_so_rather_than_going_quiet():
@@ -397,10 +435,14 @@ def test_the_recurrence_message_names_the_run_that_explained_it():
         {**STABLE_META, "build_id_b": 525834113},
         {"1": _recurrence_repeat(prior_verdict="BUG",
                       prior_culprit="SegmentsEntryLocalServiceTest.java",
-                      prior_reason="the 8-arg overload was removed")})
+                      prior_reason="the 8-arg overload was removed",
+                      prior_tickets=("LPD-105486",))})
     assert "occurrence #2" in text
     assert "SegmentsEntryLocalServiceTest.java" in text
-    assert "the 8-arg overload was removed" in text
+    assert "LPD-105486" in text
+    # The reasoning lives in the linked report, not in the message.
+    assert "the 8-arg overload was removed" not in text
+    assert "Original report:" in text
     # The build that first carried it, so the reader can open that analysis.
     assert "19764" in text
 
@@ -479,3 +521,34 @@ def test_appending_under_the_ceiling_is_untouched(tmp_path):
     assert "first" in text and "second" in text
     assert S.RUN_SEPARATOR in text
     assert "more pair(s)" not in text
+
+
+# --------------------------------------------------------------------------
+# Which field the ticket on a repeat comes from
+#
+# `suspiciousCommits` is resolved from the commits that really touched the
+# culprit file, so a key found there is provably in the pair's range. The
+# prose fields can name a ticket the classifier only mentioned.
+# --------------------------------------------------------------------------
+
+def test_the_repeat_ticket_prefers_the_git_derived_field():
+    from testray_analytics.analysis.recurrence import _tickets
+
+    assert _tickets({"suspiciousCommits": "LPD-105486 (5cbd024, a040008)",
+                     "reason": "looks like LPD-999999 to me"}) \
+        == ("LPD-105486",)
+
+
+def test_the_repeat_ticket_falls_back_to_the_prose():
+    """A NEEDS_REVIEW verdict names no culprit file, so it has no commits
+    either — and those are exactly the rows somebody has to act on."""
+    from testray_analytics.analysis.recurrence import _tickets
+
+    assert _tickets({"specificChange": "either LPD-105486 or LPS-200"}) \
+        == ("LPD-105486", "LPS-200")
+
+
+def test_a_verdict_naming_no_ticket_yields_none():
+    from testray_analytics.analysis.recurrence import _tickets
+
+    assert _tickets({"reason": "a flaky timeout, no change in range"}) == ()

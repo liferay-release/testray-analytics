@@ -34,6 +34,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .error_signature import cluster_key
+from .verdicts import CANDIDATE_RE
 
 # The control repo. See the module docstring for why this is not applied to
 # every routine.
@@ -66,6 +67,9 @@ class Repeat:
     prior_verdict:    str = ""
     prior_reason:     str = ""
     prior_culprit:    str = ""
+    # Jira keys named by that verdict. Carried separately from the prose so a
+    # renderer can link the ticket without quoting the paragraph it sat in.
+    prior_tickets:    tuple = ()
 
 
 def signature_of(case_id, error) -> str:
@@ -120,6 +124,25 @@ def prior_verdicts(cfg: dict) -> dict[tuple[int, int], dict]:
             continue
         out.setdefault(key, row)
     return out
+
+
+def _tickets(row: dict, limit: int = 2) -> tuple:
+    """The Jira keys a stored verdict names, best source first.
+
+    `suspiciousCommits` is what `submit.annotate_culprit_commits` resolved from
+    the commits that actually touched the culprit file, so a ticket found there
+    is provably in the pair's range. The other two fields are model prose and
+    can name a ticket the classifier merely mentioned — a fallback, not a peer,
+    which is why the first field that yields anything wins outright.
+    """
+    out: list[str] = []
+    for field in ("suspiciousCommits", "specificChange", "reason"):
+        for key in CANDIDATE_RE.findall(str(row.get(field) or "")):
+            if key not in out:
+                out.append(key)
+        if out:
+            break
+    return tuple(out[:limit])
 
 
 def _picklist(value) -> str:
@@ -234,6 +257,7 @@ def lookup(cfg: dict, probes: dict, *, routine_id, target_build) -> dict:
                 prior_verdict=_picklist(verdict_row.get("classification")),
                 prior_reason=str(verdict_row.get("reason") or ""),
                 prior_culprit=str(verdict_row.get("culpritFile") or ""),
+                prior_tickets=_tickets(verdict_row),
             )
         except Exception:                                        # noqa: BLE001
             continue

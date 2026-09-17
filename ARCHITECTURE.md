@@ -1775,6 +1775,16 @@ failing and in which build it started. `slack_message` renders a
 `🔁 Still failing` block; `report.py` replaces its empty `No rows.` table with a
 pointer to the run that already explained it.
 
+**The block is an index, not an explanation.** It names the test, the occurrence
+count, the build the episode started in, the culprit file and the ticket — and
+links the original run's triage report once at the top (per bullet when the
+repeats started in different builds, because then no single run saw them all).
+It deliberately does *not* quote the stored `reason`: on 19793 that rendered two
+~300-character paragraphs restating the same compile break, which pushed the
+build, the file and the ticket off the first screen of a message whose whole
+point is "you already know this". The reasoning is one click away, in the report
+of the run that produced it.
+
 The prior verdict is looked up by **`(build_id, case_id)`**, split out of the
 TriageResult ERC. Deliberately *not* by `clusterKey`: the writer computes
 `cluster_key(culprit_file, test_case, error)` while the ledger computes

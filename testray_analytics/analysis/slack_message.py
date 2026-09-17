@@ -104,6 +104,20 @@ def _link(url: str, label: str) -> str:
     return f"<{u.replace('(', '%28').replace(')', '%29')}|{_text(label)}>"
 
 
+def _jira_base(meta: dict) -> str:
+    """Jira origin for ticket links.
+
+    Deliberately NOT `resolve_jira_settings`, which report.py calls: that one
+    fetches the reporter account id over the network when it is not configured,
+    and a Slack message must never be able to hang on Jira being slow. Only the
+    base URL is needed here, and run.yml already carries it whenever submit
+    resolved it.
+    """
+    jira = meta.get("jira")
+    base = _text(jira.get("base_url")) if isinstance(jira, dict) else ""
+    return (base or "https://liferay.atlassian.net").rstrip("/")
+
+
 def _short_build_name(name: str) -> str:
     """`[master] ci:test:stable - 19505 - …` -> `ci:test:stable - 19505 - …`.
 
@@ -439,37 +453,69 @@ def _still_failing(meta: dict, repeats: dict) -> list[str]:
     inherited every one of its failures. That line sent people to
     re-investigate a failure explained days earlier, which is worse than
     silence: it spends someone's morning to reach a conclusion already on file.
+
+    An INDEX, not an explanation. An earlier cut quoted the stored `reason`
+    under each bullet, and on 19793 that was two 300-character paragraphs
+    saying the same thing about the same compile break — pushing what a reader
+    acts on (which build, which file, which ticket) off the first screen of a
+    message whose entire point is "you already know this". The reasoning still
+    exists, in the report of the run that produced it, so this links that run
+    instead of re-telling it.
     """
     if not repeats:
         return []
 
+    from .recurrence import triage_url_for
+
+    shown = sorted(repeats.values(),
+                   key=lambda r: (-r.occurrences, r.test_name))[:MAX_BLOCKS]
+
     lines = ["", "🔁 *Still failing* — every failure here was inherited, "
                  "nothing new in this build."]
 
-    for rep in sorted(repeats.values(),
-                      key=lambda r: (-r.occurrences, r.test_name))[:MAX_BLOCKS]:
+    # One link at the top when every repeat started in the same build — the
+    # usual Stable shape, where one break makes every cluster in the build
+    # recur together. When they started in DIFFERENT builds there is no single
+    # "the original report", and letting the first one stand for all of them
+    # would send a reader to a run that never saw the failure they clicked
+    # from. Those carry their own link per bullet instead.
+    shared = (triage_url_for(meta, shown[0].first_build_id)
+              if len({r.first_build_id for r in shown}) == 1 else "")
+    if shared:
+        lines.append(f"*Original report:* {_link(shared, 'open in Testray')}")
+
+    base = _jira_base(meta)
+    for rep in shown:
         where = _link(_build_url(meta, rep.first_build_id),
                       _short_build_name(rep.first_build_name)
                       or str(rep.first_build_id))
         ago = _ago(rep.first_build_time)
-        lines += ["", f"• *{_trim(rep.test_name, 90)}* — occurrence "
-                      f"#{rep.occurrences}, first seen in {where}"
-                      + (f" ({ago} ago)" if ago else "")]
+        bullet = (f"  • *{_trim(rep.test_name, 90)}* — occurrence "
+                  f"#{rep.occurrences}, first seen in {where}"
+                  + (f" ({ago} ago)" if ago else ""))
+        own = "" if shared else triage_url_for(meta, rep.first_build_id)
+        if own:
+            bullet += f" · {_link(own, 'report')}"
+        lines.append(bullet)
 
-        # The verdict from when this episode WAS analysed. Naming it is the
-        # difference between "this is old" and "this is old AND here is what
-        # we already decided about it".
-        if rep.prior_reason or rep.prior_culprit:
+        # The file and the ticket from when this episode WAS analysed: enough
+        # to recognise the failure and to reach the change that caused it,
+        # which is the difference between "this is old" and "this is old AND
+        # here is what we already decided about it". The ticket is linked
+        # because a bare key in Slack is a copy-paste job.
+        if rep.prior_culprit or rep.prior_tickets:
+            bits = []
             if rep.prior_culprit:
-                lines.append(f"  *Likely cause:* `{_trim(rep.prior_culprit, 80)}`")
-            if rep.prior_reason:
-                lines.append(f"  {_trim(rep.prior_reason, 320)}")
+                bits.append(f"`{_trim(rep.prior_culprit, 80)}`")
+            bits += [_link(f"{base}/browse/{t}", t)
+                     for t in (rep.prior_tickets or ())]
+            lines.append(f"    *Likely cause:* {' '.join(bits)}")
         else:
             # Said out loud rather than left blank. A repeat with no verdict on
             # file is the write policy working as intended — the cluster was
             # flaky, auto-classified or never ran — and a reader who is not
             # told that reads the empty space as a missing answer.
-            lines.append("  _No verdict on file — the original run excluded "
+            lines.append("    _No verdict on file — the original run excluded "
                          "this cluster from triage._")
 
     return lines
@@ -495,6 +541,12 @@ def render_recurrence(meta: dict, repeats: dict) -> str:
              f"every one was analysed already."]
 
     body = _still_failing(meta, repeats)
+    # The section keeps a leading blank for `render`, where it has to separate
+    # itself from the *Analysis:* paragraph above. Here the two 🔁 lines are one
+    # statement — "nothing new, and here is what is still red" — so the gap
+    # only makes the reader look for something that is not there.
+    if body and body[0] == "":
+        body = body[1:]
     if not body:
         # Reached when the walk found no earlier appearance for anything —
         # rare, and saying so is better than posting a bare header.
