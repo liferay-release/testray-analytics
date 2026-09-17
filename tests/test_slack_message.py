@@ -66,7 +66,9 @@ def verdict(group_id, classification, confidence="high", **extra):
 def test_a_bug_raises_the_siren(tmp_path):
     text = S.render(bundle(tmp_path, [verdict(1, "BUG")]))
     assert text.startswith("🚨 ")
-    assert "*Verdict:* Bug · 🟢 confidence high" in text
+    # The verdict picks the siren and the order. It is never printed — see
+    # test_no_verdict_label_reaches_the_channel.
+    assert "Bug" not in text
 
 
 def test_nothing_actionable_does_not_raise_the_siren(tmp_path):
@@ -75,15 +77,32 @@ def test_nothing_actionable_does_not_raise_the_siren(tmp_path):
     assert text.startswith("🔍 ")
 
 
-def test_low_confidence_needs_review_reads_as_not_attributable(tmp_path):
-    """The stored verdict stays NEEDS_REVIEW; the channel must see the label
-    the report and the Testray index show."""
+def test_no_verdict_label_reaches_the_channel(tmp_path):
+    """No census, no per-block label, for any verdict.
+
+    "False Positive 1" was read in the channel as permission to stop reading,
+    so a label people glossed over decided whether the report was opened at
+    all. The verdict still orders the blocks and still picks the siren; it is
+    simply never rendered as text. It belongs where it can be weighed against
+    the evidence — the report, and Testray.
+    """
+    for classification in ("BUG", "POSSIBLE_BUG", "TEST_FIX",
+                           "FALSE_POSITIVE", "NEEDS_REVIEW"):
+        d = tmp_path / classification
+        d.mkdir()
+        text = S.render(bundle(d, [verdict(1, classification)]))
+        for banned in ("Bug", "Possible Bug", "Test Fix", "False Positive",
+                       "Needs Review", "Not Attributable", "*Verdict:*",
+                       "*Analysis:*"):
+            assert banned not in text, f"{banned!r} leaked for {classification}"
+
+
+def test_a_low_confidence_verdict_shows_no_confidence_either(tmp_path):
+    """Confidence only ever appeared inside the verdict row, and a bare 🔴
+    reads as "high-severity bug" to someone who has lost the legend."""
     text = S.render(bundle(tmp_path, [verdict(1, "NEEDS_REVIEW", "low")]))
-    assert "Not Attributable" in text
-    assert "*Analysis:* Not Attributable 1." in text
-    # Nobody attributed it, so the circle is white rather than a confidence
-    # colour — 🔴 would read as "high-severity bug".
-    assert "⚪" in text and "🔴" not in text
+    for circle in ("🟢", "🟡", "🔴", "⚪"):
+        assert circle not in text
 
 
 def test_a_candidate_that_does_not_explain_is_a_lead_not_a_cause(tmp_path):
@@ -122,10 +141,19 @@ def test_extra_clusters_are_counted_not_silently_dropped(tmp_path):
 
 
 def test_worst_verdict_is_reported_first(tmp_path):
+    """Still true with the label gone — the verdict decides what a reader sees
+    FIRST, it just no longer gets to be what they see INSTEAD. Checked through
+    the cluster each block names, since the verdict itself is not printed."""
     text = S.render(bundle(tmp_path, [verdict(1, "FALSE_POSITIVE"),
-                                      verdict(2, "BUG")]))
-    first = text.index("*Failure --- 1:*")
-    assert "Bug" in text[first:text.index("*Failure --- 2:*")]
+                                      verdict(2, "BUG")],
+                           clusters=[
+                               {"group_id": 1, "case_count": 1,
+                                "member_test_cases": "TheFalsePositive"},
+                               {"group_id": 2, "case_count": 1,
+                                "member_test_cases": "TheBug"}]))
+    block1 = text[text.index("*Failure --- 1:*"):text.index("*Failure --- 2:*")]
+    assert "TheBug" in block1
+    assert "TheFalsePositive" not in block1
 
 
 def test_a_run_with_no_verdicts_says_so(tmp_path):
@@ -366,8 +394,9 @@ def test_appending_keeps_the_earlier_pair_in_the_post(tmp_path):
 
     text = out.read_text(encoding="utf-8")
     assert text.count(S.RUN_SEPARATOR) == 1
-    assert "*Verdict:* Bug · 🟢 confidence high" in text
-    assert "False Positive" in text
+    # Both pairs are in the post; neither names its verdict.
+    assert text.count("*Failure --- 1:*") == 2
+    assert "False Positive" not in text
     # The siren belongs to the pair that earned it, so the reader still sees
     # it even though the tick ended on something unremarkable.
     assert text.startswith("🚨 ")

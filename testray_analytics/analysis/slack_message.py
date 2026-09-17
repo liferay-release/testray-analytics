@@ -13,16 +13,20 @@ the same job would cost every reader a translation:
 
     header line       what broke, with the commit range
     bullet list       compact metadata — builds, coverage, report
-    Analysis          one paragraph, the verdict rollup in prose
     Failure --- N     one block per cluster, worst verdict first
 
-Two deliberate departures from that skill:
+Three deliberate departures from that skill:
 
   * **No "Proposed Fix" paragraph.** That chain attempts a fix, runs
     `pr-check` and can open a PR, so it always has an outcome to report. This
     pipeline classifies and never edits, so the slot would be filled with
-    either silence or a fabrication. `*Analysis:*` says what was concluded
-    instead.
+    either silence or a fabrication.
+  * **No verdict, anywhere.** No census line, no per-block label. "False
+    Positive 1" was being read as permission to stop reading, so a label
+    people glossed over decided whether the report got opened at all. The
+    verdict still orders the blocks and still picks the siren; it just never
+    appears as text. It belongs where it can be weighed against the evidence
+    that produced it — the report, and Testray.
   * **One message per RUN, not per commit group.** A run's unit is the
     cluster, and a Stable pair regularly carries tens of them; posting one
     message each would bury the channel. Blocks past `MAX_BLOCKS` are dropped
@@ -48,11 +52,6 @@ from .config import resolve_path
 # the poster runs immediately after the pipeline, so history lives in the
 # report and in Testray, not in a pile of message files.
 OUT_REL = "slack/testray_analyzer_slack_message.txt"
-
-# Same circles the failure-cause chain uses, so a reader does not learn a
-# second colour scheme. White is theirs too: it means nobody attributed this.
-CONFIDENCE_EMOJI = {"high": "🟢", "medium": "🟡", "low": "🔴"}
-UNATTRIBUTED_EMOJI = "⚪"
 
 # Verdicts that mean "a person needs to look at this build". Anything else is
 # reported but does not raise the siren.
@@ -347,15 +346,10 @@ def _cause_row(meta: dict, result: dict, authors: dict | None = None) -> str:
 def _block(meta: dict, n: int, result: dict, cluster: dict,
            caseresult_ids: dict | None = None,
            authors: dict | None = None) -> list[str]:
-    """One `Failure --- N` block."""
-    verdict = _verdict_of(result)
-    confidence = _text(result.get("confidence")).lower()
+    """One `Failure --- N` block.
 
-    # White circle for anything nobody attributed, matching the skill's
-    # unattributed vocabulary; otherwise the confidence colour.
-    emoji = (UNATTRIBUTED_EMOJI if verdict in ("NEEDS_REVIEW", "NOT_ATTRIBUTABLE")
-             else CONFIDENCE_EMOJI.get(confidence, UNATTRIBUTED_EMOJI))
-
+    Carries no verdict label. See `render` for why.
+    """
     tests = [t for t in _text(cluster.get("member_test_cases")).split("|") if t]
     count = int(_text(cluster.get("case_count")) or len(tests) or 1)
     title = _trim(tests[0], 90) if tests else _trim(cluster.get("signature"), 90)
@@ -400,10 +394,6 @@ def _block(meta: dict, n: int, result: dict, cluster: dict,
             shown += f", +{len(components) - 3} more"
         lines.append(f"> *Components:* {shown}")
 
-    label = verdict.replace("_", " ").title()
-    lines.append(f"> *Verdict:* {label}"
-                 + (f" · {emoji} confidence {confidence}" if confidence
-                    else f" · {emoji} unattributed"))
     return lines
 
 
@@ -620,10 +610,6 @@ def render(run_dir: Path, *, report_url: str = "",
                        -int(_text(clusters.get(_text(r.get("group_id")), {})
                                   .get("case_count")) or 0)))
 
-    counts: dict[str, int] = {}
-    for r in results:
-        counts[_verdict_of(r)] = counts.get(_verdict_of(r), 0) + 1
-
     rollup = V.rollup([_verdict_of(r) for r in results]) if results else "PENDING"
     siren = "🚨" if rollup in ACTIONABLE else "🔍"
 
@@ -672,20 +658,26 @@ def render(run_dir: Path, *, report_url: str = "",
     lines.append(f"• *Clusters:* {len(results)} classified"
                  + (f" over {total} failure(s)" if total else ""))
 
-    # The verdict census. Stated even when it is all NEEDS_REVIEW — "the run
-    # explained nothing" is the single most useful thing a reader can learn
-    # from a glance, and it is what a missing line would hide.
-    if counts:
-        census = " · ".join(f"{v.replace('_', ' ').title()} {counts[v]}"
-                            for v in V.VERDICT_ORDER if counts.get(v))
-        lines += ["", f"*Analysis:* {census}."]
-    else:
-        # Only reached when recurrence found nothing either — a pair with no
-        # verdicts AND no history is genuinely unexplained.
-        if not repeats:
-            lines += ["", "*Analysis:* no verdicts were produced for this pair "
-                          "— every failure was auto-classified or excluded "
-                          "upstream. Needs a human."]
+    # NO verdict census, and no verdict label on the blocks below.
+    #
+    # "Test Fix 2" or "False Positive 1" is a conclusion about the RUN, and in
+    # the channel it was read as permission to stop reading: a label people
+    # glossed over decided whether they opened the report at all, which is
+    # backwards — the label is the least reliable thing in the message and the
+    # failing test and the named commit are the most. So the message carries
+    # what a reader acts on, and the verdict stays where it can be weighed
+    # against the evidence: the report, and Testray.
+    #
+    # The siren on the headline still comes from the rollup, and the blocks are
+    # still ordered worst-verdict-first. The verdict decides what a reader sees
+    # FIRST; it just does not get to be what they see INSTEAD.
+    if not results and not repeats:
+        # A pair with no verdicts AND no history is genuinely unexplained, and
+        # that is not a verdict label — it is the absence of one, which nobody
+        # can gloss over into "handled".
+        lines += ["", "*Analysis:* no verdicts were produced for this pair "
+                      "— every failure was auto-classified or excluded "
+                      "upstream. Needs a human."]
 
     lines += _still_failing(meta, repeats)
     lines += _inherited_note(meta, results, url)
