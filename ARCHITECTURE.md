@@ -1788,6 +1788,29 @@ the reason `scan` re-offers file-attributed failures.
 renderers. Two independent lookups is how a report and a message start
 disagreeing about when a failure began.
 
+**The harder case is the tick that produces no run at all.** When every red pair
+is already analysed, `scan` queues nothing, `watch` drains nothing, `submit`
+never executes — and the build gets no report *and* no message, because every
+renderer above hangs off a bundle that was never built. Stable posts to the
+channel on every failure, so that silence reads as "the analyser missed it".
+`recurrence.repeats_for_build()` is the sibling entry point for exactly this:
+probes come from the ledger's own signature index rather than from
+`diff_list.csv`, and `scan` renders `slack_message.render_recurrence()` itself.
+It fires only when nothing was queued **and** nothing was already pending — a
+pair sitting in the queue is work `watch` is about to do, and "nothing new" must
+not precede the analysis of something new. No report is written: re-analysing
+would re-pay a full classify for an identical answer, so the message links the
+run that already explained it.
+
+**The tick owns the Slack file, not any one step.** `watch` drains N pairs
+through N submits while Jenkins posts the file once, at the end, so a submit
+that overwrites loses every pair but the last — which is how a real compile
+break was buried behind an infrastructure false positive that merely finished
+later. `triage_jenkins.sh` clears the file once and exports
+`TRIAGE_SLACK_APPEND`; every writer then goes through
+`slack_message.append_to_post()`, which stops at `MAX_POST_CHARS` and carries a
+count of what it dropped rather than growing past the 40,000 Slack refuses at.
+
 ### 16.6 Naming a person
 
 The Slack message named an author the classifier chose out of the prompt's

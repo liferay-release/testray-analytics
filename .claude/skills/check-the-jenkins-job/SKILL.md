@@ -62,8 +62,11 @@ Two different causes. Tell them apart:
 - It prints `already analysed <routine>-<baseline>-<target>` → the pair has a
   finished TriageRun. This is the normal steady state on a routine whose
   failures are all known: the job runs, finds nothing new, and spends nothing.
-  It is **not** distinguishable from a healthy tick by looking at Slack, which
-  is why the run also reports `Jobs: 0 queued, N already analysed`.
+  The run reports `Jobs: 0 queued, N already analysed`, and on Stable it also
+  writes a `🔁 Still failing` message naming each recurring signature and the
+  build whose run explained it — so this state *is* readable from Slack. No
+  triage report is produced for such a build, on purpose: re-analysing would
+  re-pay a full classify for an identical answer.
 
 If the build step only calls `watch`, that is the cause: `watch` consumes work,
 it does not create it. The build step must call `scan` first. `triage_jenkins.sh`
@@ -129,8 +132,9 @@ find out at call time.
 
 ## Symptom: Slack got nothing, but the job succeeded
 
-The message is written on **every** run, including one that concluded nothing.
-So if Slack is silent, the posting side is the problem, not the analysis:
+The message is written on **every** tick — including one that analysed nothing,
+where `scan` writes the `🔁 Still failing` block itself. So if Slack is silent,
+the posting side is the problem, not the analysis:
 
 1. Is the notification set to post on **every build**? If it is set to "every
    failure", it will never post — a successful triage of a red build is a job
@@ -139,6 +143,14 @@ So if Slack is silent, the posting side is the problem, not the analysis:
    The plugin cannot read a file without that token macro.
 3. Does the file exist in the workspace after a run? The console names its path
    in step 0.
+
+**Related symptom: Slack showed one pair when the tick analysed several.** The
+file is cleared once per tick and appended to per pair, so one post covers them
+all. If only the last appears, the checkout predates that fix — every `submit`
+used to overwrite the same path while Jenkins posted it once. A post ending in
+`… and N more pair(s) analysed this tick` is not that bug: it is the
+`MAX_POST_CHARS` guard, which stops the post before Slack refuses it at 40,000
+characters.
 
 ## Symptom: every commit link points at `liferay/liferay-portal`
 

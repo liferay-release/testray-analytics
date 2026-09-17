@@ -40,7 +40,7 @@ by a hook on the Jenkins side when a Stable build fails:
 | Command | What it does |
 |---|---|
 | `preflight` | checks the credentials, the OAuth scopes and whether the Testray Objects answer |
-| `scan` | queues builds that have failures nobody has explained yet, and skips any build pair that already has a finished TriageRun |
+| `scan` | queues builds that have failures nobody has explained yet, and skips any build pair that already has a finished TriageRun. When it queues nothing because every red pair is already analysed, it writes the "Still failing" Slack message itself — no report is produced for such a build |
 | `watch` | if anything is queued, runs the pipeline below on each queued build pair. Without `--classify` it stops after `prepare`, so it spends nothing |
 
 `scripts/triage_pipeline.sh` — one build pair, start to finish. `watch` calls

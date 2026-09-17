@@ -239,7 +239,7 @@ queue:    /var/lib/triage/queue — marker files, because the TriageRun Object
 | Per-step logs | `logs/log_<timestamp>_step_<n>_<name>.txt` in the workspace |
 | Run bundles | `runs/r_<timestamp>_<baseline>_<target>/` — prompt, diff, hunks, verdicts |
 | The report | `report.html` inside the bundle |
-| Slack message | `slack/testray_analyzer_slack_message.txt`, rewritten every run |
+| Slack message | `slack/testray_analyzer_slack_message.txt`, cleared once per tick and appended to per analysed pair — one post covers the whole tick |
 | Verdicts | `TriageResult` rows in Testray, once the CX is deployed |
 
 Archiving `logs/*.txt` and `runs/**` as build artifacts is worth doing: they are
