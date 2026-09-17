@@ -2148,8 +2148,11 @@ def _pre_existing_section(pre_df, meta: dict) -> str:
             f'<td class="col-comp">{_esc(_text(r.get("component_name"))) or "—"}</td>'
             f'<td class="col-reasoning"><pre class="error">'
             f'{_esc(_truncate(_text(r.get("error_message"))))}</pre></td></tr>')
+    # The id is the Slack message's anchor: on a mixed build it links here
+    # rather than at the top of the report, because the reader who follows that
+    # line came for this table and nothing else on the page.
     return f"""
-  <details class="pre-existing">
+  <details class="pre-existing" id="pre-existing">
     <summary><strong>Pre-existing failures ({len(pre_df)})</strong>
       <span class="pre-count" id="pre-count"></span>
       <span class="hint">Already failing with the same error on the baseline —

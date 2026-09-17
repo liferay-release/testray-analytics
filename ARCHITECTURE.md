@@ -1785,6 +1785,16 @@ build, the file and the ticket off the first screen of a message whose whole
 point is "you already know this". The reasoning is one click away, in the report
 of the run that produced it.
 
+**A MIXED build gets one line, not the section.** When a build carries a new
+failure *and* inherited ones, the new failure is the news and the section would
+compete with it — but saying nothing was worse: a real message rendered 4
+verdicts beside 63 pre-existing failures and the only trace of the 63 was that
+`4 classified over 69 failure(s)` had two different numbers in it. `render` now
+appends one line naming the count and linking `#pre-existing` in the report. The
+count is read from `transition_counts` in run.yml rather than from a recurrence
+walk: the line needs a number, not a first-seen build, and a walk per classified
+run is a network call for something the bundle already carries.
+
 The prior verdict is looked up by **`(build_id, case_id)`**, split out of the
 TriageResult ERC. Deliberately *not* by `clusterKey`: the writer computes
 `cluster_key(culprit_file, test_case, error)` while the ledger computes

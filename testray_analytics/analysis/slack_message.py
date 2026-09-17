@@ -521,6 +521,43 @@ def _still_failing(meta: dict, repeats: dict) -> list[str]:
     return lines
 
 
+def _inherited_note(meta: dict, results: list, report_url: str) -> list[str]:
+    """One line for the failures this build carried in and nobody re-analysed.
+
+    `_still_failing` above only renders when a build inherited EVERY one of its
+    failures. On a MIXED build the new failure is the news and has to stay the
+    headline — but saying nothing at all is what a real Stable message did with
+    63 pre-existing failures beside 4 verdicts: the only trace was that
+    "4 classified over 69 failure(s)" had two different numbers in it, which no
+    reader decodes. That is the difference between "one thing broke" and "one
+    thing broke on top of a sync that has been blocked since Tuesday".
+
+    One line, and never a bullet list: the whole point of the section above is
+    that inherited failures must not compete with the build that introduced
+    one.
+
+    The count comes from `transition_counts`, which `prepare` already wrote
+    into run.yml. Deliberately NOT a recurrence walk — this needs a number, not
+    a first-seen build, and a walk per classified run would be a network call
+    per run for something the bundle is already carrying.
+    """
+    if not results:
+        # No verdicts means `_still_failing` rendered, and it speaks for these
+        # in full. Two sections about the same failures is worse than one.
+        return []
+    try:
+        n = int((meta.get("transition_counts") or {}).get("same_failure") or 0)
+    except (TypeError, ValueError):
+        return []
+    if n < 1:
+        return []
+
+    label = f"Pre-existing ({n})"
+    where = _link(f"{report_url}#pre-existing", label) if report_url else label
+    return ["", f"🔁 {n} failure{'s' if n != 1 else ''} inherited from earlier "
+                f"builds, not re-analysed — see {where} in the report."]
+
+
 def render_recurrence(meta: dict, repeats: dict) -> str:
     """The message for a tick that analysed nothing because nothing was new.
 
@@ -646,6 +683,7 @@ def render(run_dir: Path, *, report_url: str = "",
                           "upstream. Needs a human."]
 
     lines += _still_failing(meta, repeats)
+    lines += _inherited_note(meta, results, url)
 
     for i, result in enumerate(ordered[:MAX_BLOCKS], start=1):
         cluster = clusters.get(_text(result.get("group_id")), {})

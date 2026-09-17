@@ -552,3 +552,49 @@ def test_a_verdict_naming_no_ticket_yields_none():
     from testray_analytics.analysis.recurrence import _tickets
 
     assert _tickets({"reason": "a flaky timeout, no change in range"}) == ()
+
+
+# --------------------------------------------------------------------------
+# The MIXED build: something new, on top of failures that were already there
+#
+# `_still_failing` only renders when a build inherited every one of its
+# failures. A build with one new failure and 63 old ones took the other path
+# and said nothing at all about the 63 — the only trace was that "4 classified
+# over 69 failure(s)" carried two different numbers.
+# --------------------------------------------------------------------------
+
+def test_a_mixed_build_says_how_many_it_inherited(tmp_path):
+    text = S.render(bundle(tmp_path, [verdict(1, "BUG")],
+                           meta={"transition_counts": {"same_failure": 63,
+                                                       "new": 1}}))
+    assert "63 failures inherited" in text
+    assert "Pre-existing (63)" in text
+    # It must not become a second cluster list competing with the new failure.
+    assert text.count("inherited") == 1
+    assert "Still failing" not in text
+
+
+def test_the_inherited_line_links_the_report_section(tmp_path):
+    text = S.render(bundle(tmp_path, [verdict(1, "BUG")],
+                           meta={"transition_counts": {"same_failure": 2}}),
+                    report_url="https://example.com/report.html")
+    assert "https://example.com/report.html#pre-existing" in text
+
+
+def test_a_build_that_inherited_nothing_says_nothing(tmp_path):
+    text = S.render(bundle(tmp_path, [verdict(1, "BUG")],
+                           meta={"transition_counts": {"new": 1}}))
+    assert "inherited" not in text
+
+
+def test_the_inherited_line_stays_out_of_the_all_inherited_message():
+    """There the whole `Still failing` section already speaks for them, in
+    full. Two sections about the same failures is worse than one."""
+    assert S._inherited_note({"transition_counts": {"same_failure": 63}},
+                             [], "") == []
+
+
+def test_a_singular_inherited_failure_reads_as_one(tmp_path):
+    text = S.render(bundle(tmp_path, [verdict(1, "BUG")],
+                           meta={"transition_counts": {"same_failure": 1}}))
+    assert "1 failure inherited" in text
