@@ -215,7 +215,11 @@ def lookup(cfg: dict, probes: dict, *, routine_id, target_build) -> dict:
             # STARTED, because that is the build scan queues as the target: the
             # pair it registers is (baseline, first_seen), so the run that
             # explains an episode is always the one aimed at its first build.
-            prior = verdicts.get((first, int(case_id))) or {}
+            # NOT `prior`: that name holds the list of predecessor builds this
+            # loop walks, and rebinding it here made every probe after the
+            # first slice a dict, throw, and vanish into the except below — so
+            # the section could only ever show one repeat.
+            verdict_row = verdicts.get((first, int(case_id))) or {}
             name, when = _build_info(session, first)
 
             out[probe_id] = Repeat(
@@ -227,9 +231,9 @@ def lookup(cfg: dict, probes: dict, *, routine_id, target_build) -> dict:
                 first_build_time=when,
                 test_name=str(test_name or ""),
                 error=str(error or ""),
-                prior_verdict=_picklist(prior.get("classification")),
-                prior_reason=str(prior.get("reason") or ""),
-                prior_culprit=str(prior.get("culpritFile") or ""),
+                prior_verdict=_picklist(verdict_row.get("classification")),
+                prior_reason=str(verdict_row.get("reason") or ""),
+                prior_culprit=str(verdict_row.get("culpritFile") or ""),
             )
         except Exception:                                        # noqa: BLE001
             continue
@@ -276,6 +280,75 @@ def repeats_for_run(run_dir, meta: dict) -> dict:
                       routine_id=meta.get("routine_id"),
                       target_build=meta.get("build_id_b"))
     except Exception:                                            # noqa: BLE001
+        return {}
+
+
+def _case_name(session, case_id) -> str:
+    """Display name for a case id, or "" — one GET, failures are not fatal."""
+    try:
+        return str((session.request("GET", f"/o/c/cases/{int(case_id)}")
+                    or {}).get("name") or "")
+    except Exception:                                            # noqa: BLE001
+        return ""
+
+
+def repeats_for_build(cfg: dict, *, routine_id, build_id) -> dict:
+    """The repeats for a build NO run was produced for, keyed by case id.
+
+    The sibling of `repeats_for_run`, and the reason it exists: a tick whose
+    every red pair is already analysed queues nothing, so `watch` runs no
+    pipeline, `submit` never executes and there is no bundle to read probes
+    from. That is precisely the tick where the channel most needs a message —
+    Stable posts on every failure, and silence there reads as "the analyser
+    missed it" rather than "this is the failure you were already told about".
+
+    Probes are built from `ledger`'s OWN signature index rather than from the
+    case results directly. Two reasons, both learned the hard way:
+
+      * the ledger signs only `FAILED` rows, so probing every non-PASSED row
+        produced signatures the walk had never seen and matched nothing;
+      * one probe per SIGNATURE, not per case result, keeps the name lookups
+        to a handful on a build where 467 rows share one error.
+    """
+    try:
+        from .ledger import SignatureIndex, TestraySource
+        from .prepare import fetch_build_caseresults_api, is_aggregate_row
+        from .testray_writer import _Session
+
+        build_id = int(build_id)
+        index = SignatureIndex(TestraySource(cfg, int(routine_id)))
+        failures = index.failures(build_id)
+        if not failures.signatures:
+            return {}
+
+        df = fetch_build_caseresults_api(build_id, cfg)
+        if df is None or df.empty:
+            return {}
+        errors = {int(r["case_id"]): str(r.get("errors") or "").strip()
+                  for _, r in df.iterrows() if r.get("case_id") is not None}
+
+        session = _Session(cfg)
+        probes: dict[str, tuple[str, str, str]] = {}
+        for members in failures.signatures.values():
+            if not members:
+                continue
+            case_id = int(members[0])
+            name = _case_name(session, case_id)
+            # Testray's per-build row is not a test: it carries no error, so it
+            # would recur forever while naming nothing a reader can act on.
+            if is_aggregate_row(name):
+                continue
+            probes[str(case_id)] = (name or f"case{case_id}",
+                                    errors.get(case_id, ""), str(case_id))
+
+        if not probes:
+            return {}
+
+        return lookup(cfg, probes, routine_id=routine_id,
+                      target_build=build_id)
+    except Exception:                                            # noqa: BLE001
+        # Same contract as repeats_for_run: context is never worth failing a
+        # scan over. No repeats means no section, not no message.
         return {}
 
 

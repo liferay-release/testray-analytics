@@ -359,3 +359,73 @@ def test_appending_ignores_a_leftover_empty_file(tmp_path):
     text = out.read_text(encoding="utf-8")
     assert S.RUN_SEPARATOR not in text
     assert text.startswith("🚨 ")
+
+
+# --------------------------------------------------------------------------
+# The tick that analysed nothing
+#
+# Every pair red in the build was already analysed, so scan queues nothing,
+# watch runs no pipeline and submit never executes. Stable posts on every
+# failure, so this build still has to be answered — with the run that already
+# explained it, not with the job's bare "nothing was submitted".
+# --------------------------------------------------------------------------
+
+def _recurrence_repeat(**kw):
+    from testray_analytics.analysis.recurrence import Repeat
+    base = dict(cluster_key="v3:abc", occurrences=2, builds_ago=1,
+                first_build_id=525801997,
+                first_build_name="[master] ci:test:stable - 19764",
+                first_build_time="", test_name="modules-compile/0/1",
+                error="Compilation failed")
+    base.update(kw)
+    return Repeat(**base)
+
+
+def test_the_recurrence_message_never_raises_the_siren():
+    """Nothing here is new, so it must not compete with the build that
+    introduced the failure."""
+    text = S.render_recurrence(
+        {**STABLE_META, "build_id_b": 525834113,
+         "build_b_name": "[master] ci:test:stable - 19766"},
+        {"1": _recurrence_repeat()})
+    assert text.startswith("🔁 ")
+    assert "🚨" not in text
+
+
+def test_the_recurrence_message_names_the_run_that_explained_it():
+    text = S.render_recurrence(
+        {**STABLE_META, "build_id_b": 525834113},
+        {"1": _recurrence_repeat(prior_verdict="BUG",
+                      prior_culprit="SegmentsEntryLocalServiceTest.java",
+                      prior_reason="the 8-arg overload was removed")})
+    assert "occurrence #2" in text
+    assert "SegmentsEntryLocalServiceTest.java" in text
+    assert "the 8-arg overload was removed" in text
+    # The build that first carried it, so the reader can open that analysis.
+    assert "19764" in text
+
+
+def test_the_recurrence_message_says_so_when_nothing_traced():
+    """A header with no body reads as a message that failed to render."""
+    text = S.render_recurrence({**STABLE_META, "build_id_b": 525834113}, {})
+    assert "No recurring signature" in text
+
+
+def test_the_recurrence_message_lists_every_repeat_not_just_the_first():
+    """`lookup` used to rebind `prior` — its list of predecessor builds — to a
+    verdict dict on the first probe that emitted, so every later probe sliced a
+    dict, threw, and was swallowed by the walk's `except Exception: continue`.
+    The section could show exactly one repeat however many were recurring.
+    """
+    repeats = {
+        "1": _recurrence_repeat(cluster_key="v3:aaa",
+                                test_name="modules-compile/0/1"),
+        "2": _recurrence_repeat(cluster_key="v3:bbb",
+                                test_name="modules-compile[modules/apps/segments]"),
+    }
+    text = S.render_recurrence(
+        {**STABLE_META, "build_id_b": 525834113}, repeats)
+
+    assert "modules-compile/0/1" in text
+    assert "modules-compile[modules/apps/segments]" in text
+    assert text.count("occurrence #") == 2

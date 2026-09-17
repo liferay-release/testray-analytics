@@ -474,6 +474,37 @@ def _still_failing(meta: dict, repeats: dict) -> list[str]:
     return lines
 
 
+def render_recurrence(meta: dict, repeats: dict) -> str:
+    """The message for a tick that analysed nothing because nothing was new.
+
+    Stable posts to the channel on every failure, so a red build that produced
+    no run must still be answered. Without this the tick falls through to the
+    Jenkins job's own "nothing was submitted this run" notice, which tells a
+    reader the analyser did nothing — when in fact it recognised every failure
+    and can name the run that explained each one.
+
+    Deliberately never a siren: nothing here is new, so it must not compete
+    with the build that introduced the failure.
+    """
+    build_b = _text(meta.get("build_b_name")) or _text(meta.get("build_id_b"))
+    head = _trim(_short_build_name(build_b), 58)
+    where = _link(_build_url(meta, meta.get("build_id_b")), head) if head else ""
+
+    lines = [f"🔁 *{where or 'This build'}* — no new failures; "
+             f"every one was analysed already."]
+
+    body = _still_failing(meta, repeats)
+    if not body:
+        # Reached when the walk found no earlier appearance for anything —
+        # rare, and saying so is better than posting a bare header.
+        lines.append("")
+        lines.append("_No recurring signature could be traced to an earlier "
+                     "build._")
+        return "\n".join(lines)
+
+    return "\n".join(lines + body)
+
+
 def render(run_dir: Path, *, report_url: str = "",
            link_testray: bool = False, resolve_authors: bool = False) -> str:
     """The message body. Plain text — the poster adds nothing."""

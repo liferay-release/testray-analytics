@@ -257,6 +257,12 @@ def _start_slack_post() -> None:
     """
     from . import slack_message
 
+    # An outer caller (triage_jenkins.sh) that already set this owns the file
+    # for the whole tick: scan may have written a "nothing new" block before
+    # this drain started, and truncating here would delete it.
+    if os.environ.get("TRIAGE_SLACK_APPEND") == "1":
+        return
+
     os.environ["TRIAGE_SLACK_APPEND"] = "1"
 
     target = resolve_path(None, slack_message.OUT_REL)

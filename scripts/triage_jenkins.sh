@@ -421,6 +421,15 @@ function tick {
 		scan_args+=(--wait-for-import)
 	fi
 
+	# The TICK owns the Slack file, not any one step. scan writes a "nothing
+	# new" message when it queues nothing, and watch's submits each append
+	# theirs, so clearing it here — once, before either runs — is what lets a
+	# tick that both recognised old failures and analysed new ones report both.
+	# Without the reset the post would carry the previous tick's text too.
+	rm --force "${_PROJECT_DIR}/slack/testray_analyzer_slack_message.txt"
+
+	export TRIAGE_SLACK_APPEND=1
+
 	log "step 1: scan ${scan_args[*]}"
 
 	if ! .venv/bin/testray-analysis scan "${scan_args[@]}"

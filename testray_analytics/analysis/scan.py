@@ -29,6 +29,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import ledger as L
+from .config import resolve_path
 from .prepare import (_testray_oauth_token, fetch_one_page, fetch_paginated,
                       load_config, testray_target)
 from .queue import Job, open_queue, queue_path
@@ -400,9 +401,68 @@ def scan(cfg: dict, routine_id: int, *, queue_dir: Path,
           + (f", {n_norange} skipped for want of a baseline" if n_norange else ""))
     if dry_run:
         print("\n--dry-run: nothing was written to the queue.")
+    elif queued == 0 and skipped == 0 and n_done and targets:
+        # Red, but nothing to run: every pair is already analysed. `watch` will
+        # find an empty queue and `submit` will never execute, so nothing else
+        # in the pipeline can speak for this build. Stable posts on every
+        # failure, so answering here is the difference between "already
+        # explained, here is the run" and the job's bare "nothing submitted".
+        #
+        # `skipped` must be zero too: a pair already sitting in the queue is
+        # work `watch` is about to do, and announcing "nothing new" in front of
+        # the analysis it is running would contradict the next message.
+        _post_recurrence(tr, routine_id, targets[0], by_id)
+
     return {"targets": len(targets), "queued": queued, "skipped": skipped,
             "new": n_new, "active": n_active, "no_range": n_norange,
             "analysed": n_done}
+
+
+def _post_recurrence(tr: dict, routine_id, build_id, by_id: dict) -> None:
+    """Write the "nothing new" Slack message for a tick that queued nothing.
+
+    Never fatal: a scan that queued correctly must not be reported as failed
+    because the courtesy message could not be rendered.
+    """
+    try:
+        from . import recurrence, slack_message
+
+        repeats = recurrence.repeats_for_build(
+            tr, routine_id=routine_id, build_id=build_id)
+        if not repeats:
+            print("\nNo recurring signature could be traced — no message "
+                  "written.")
+            return
+
+        build = by_id.get(build_id) or {}
+        meta = {
+            "routine_id": routine_id,
+            "project_id": (build.get("r_projectToBuilds_c_projectId")
+                           or tr.get("project_id")),
+            "testray_url": tr.get("ui_url") or tr.get("base_url"),
+            "build_id_b": build_id,
+            "build_b_name": build.get("name") or str(build_id),
+        }
+
+        text = slack_message.render_recurrence(meta, repeats)
+        target = resolve_path(None, slack_message.OUT_REL)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        # The tick, not this step, owns the file: `watch` runs after scan and
+        # its own submits append. Appending here too keeps both in one post.
+        if os.environ.get("TRIAGE_SLACK_APPEND") == "1" and target.exists():
+            existing = target.read_text(encoding="utf-8").rstrip()
+            if existing:
+                text = (f"{existing}\n\n{slack_message.RUN_SEPARATOR}\n\n"
+                        f"{text}")
+        target.write_text(text, encoding="utf-8")
+        print(f"\nStill failing: {len(repeats)} signature(s) — "
+              f"message written to {target}")
+    except (Exception, SystemExit) as e:                          # noqa: BLE001
+        # SystemExit is listed on purpose: config loading raises it, and a
+        # courtesy message must not be able to end a scan that queued
+        # correctly.
+        print(f"\n  ! could not write the recurrence message: {e}",
+              file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
