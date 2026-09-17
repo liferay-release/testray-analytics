@@ -3179,8 +3179,15 @@ def render_commits_section(commits: list) -> list[str]:
                              + ", ".join(f"`{m}`" for m in shown)
                              + (f" _+{more} more_" if more else ""))
         for c in cs:
-            h, subj, _a, _m = parts(c)
-            lines.append(f"- `{h}` {subj}")
+            h, subj, author, _m = parts(c)
+            # The author belongs on the COMMIT, not only on the ticket heading.
+            # With it only on the heading, a ticket grouping several people
+            # left the model to guess which name went with which sha, and it
+            # took the first listed: LPD-103842's `9e012e0f6` is Lianne
+            # Louie's and was reported as Brian Chan's — in a message that
+            # goes to the team channel and @-mentions whoever it names.
+            lines.append(f"- `{h}` {subj}"
+                         + (f" — {author}" if rich and author else ""))
         lines.append("")
     lines.append("---")
     lines.append("")
