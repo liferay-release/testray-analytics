@@ -30,6 +30,7 @@ Usage:
 
 import argparse
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -950,10 +951,15 @@ def main() -> None:
         if args.no_slack:
             return
         try:
+            # The queue runner sets this: it drains several pairs per tick
+            # through one submit each, and Jenkins posts the file once at the
+            # end, so overwriting here loses every pair but the last.
+            append = os.environ.get("TRIAGE_SLACK_APPEND") == "1"
             slack_path = slack_message.write(
                 run_dir,
                 out=Path(args.slack_out) if args.slack_out else None,
-                report_url=report_url, link_testray=link_testray)
+                report_url=report_url, link_testray=link_testray,
+                append=append)
             print(f"Slack:      {slack_path}"
                   + ("" if link_testray else "  (no Testray link — "
                      "verdicts were not written there)"))

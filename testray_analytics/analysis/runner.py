@@ -49,6 +49,7 @@ build two runs — with the column free to show either.
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -56,7 +57,7 @@ import time
 import urllib.error
 from pathlib import Path
 
-from .config import cli_command
+from .config import cli_command, resolve_path
 from .prepare import load_config, testray_target
 from .queue import FileQueue, TestrayQueue, queue_path
 from .testray_writer import RUN_ENDPOINT, _Session, _run_erc_path
@@ -205,6 +206,9 @@ def _drain_files(q: FileQueue, args) -> int:
     """
     pending = q.pending()
 
+    if pending:
+        _start_slack_post()
+
     for job in pending:
         print(f"\n=== claiming {job.name} "
               f"(build {job.baseline_build} -> {job.target_build}) ===")
@@ -240,6 +244,31 @@ def _drain_files(q: FileQueue, args) -> int:
     return len(pending)
 
 
+def _start_slack_post() -> None:
+    """Begin one Slack post for this tick, and have each submit add to it.
+
+    Jenkins posts `slack/testray_analyzer_slack_message.txt` once, after the
+    whole tick, while a drain runs one submit per queued pair. With every
+    submit overwriting that path, a tick that drained two pairs posted only
+    whichever finished last — on 2026-09-16 the 19757 infra false positive
+    buried the 19764 compile break, which reached Testray and nobody's screen.
+    Truncating here (not in submit) keeps a hand-run pipeline replacing the
+    file as before; only a drain accumulates.
+    """
+    from . import slack_message
+
+    os.environ["TRIAGE_SLACK_APPEND"] = "1"
+
+    target = resolve_path(None, slack_message.OUT_REL)
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.unlink(missing_ok=True)
+    except OSError as e:
+        # Losing the reset is survivable — the post gains a stale block — so
+        # it must not take the drain down with it.
+        print(f"  ! could not reset the Slack message: {e}", file=sys.stderr)
+
+
 def _drain_rows(session: _Session, args) -> int:
     """Claim and run every QUEUED TriageRun row. Returns how many were seen."""
     try:
@@ -249,6 +278,9 @@ def _drain_rows(session: _Session, args) -> int:
         # keep waiting rather than dying and leaving the queue unattended.
         print(f"  ! poll failed: {e}", file=sys.stderr)
         return 0
+
+    if queued:
+        _start_slack_post()
 
     for run in queued:
         erc = run.get("externalReferenceCode") or ""

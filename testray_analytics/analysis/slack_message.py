@@ -575,16 +575,39 @@ def render(run_dir: Path, *, report_url: str = "",
     return "\n".join(lines) + "\n"
 
 
+# Separates one run's message from the next when a queue drain appends several
+# into the single file Jenkins posts. A tick that drained two pairs used to
+# post only the last: both submits wrote OUT_REL, so on 2026-09-16 the 19757
+# infra false positive overwrote the 19764 compile break and nobody heard
+# about the only actionable finding of the tick.
+RUN_SEPARATOR = "━" * 24
+
+
 def write(run_dir: Path, *, out: Path | None = None, report_url: str = "",
-          link_testray: bool = False) -> Path:
-    """Render and write the message. Returns the path written."""
+          link_testray: bool = False, append: bool = False) -> Path:
+    """Render and write the message. Returns the path written.
+
+    `append` belongs to the queue runner: it drains N pairs per tick through N
+    separate submits while Jenkins posts the file once, at the end. Each
+    submit therefore has to add to the post rather than replace it.
+    """
     target = Path(out) if out else resolve_path(None, OUT_REL)
     target.parent.mkdir(parents=True, exist_ok=True)
     # A standalone re-render has no submit to have resolved the authors, so
     # ask for the lookup here rather than inside render().
-    target.write_text(render(run_dir, report_url=report_url,
-                             link_testray=link_testray,
-                             resolve_authors=True), encoding="utf-8")
+    text = render(run_dir, report_url=report_url,
+                  link_testray=link_testray, resolve_authors=True)
+
+    existing = ""
+    if append and target.exists():
+        existing = target.read_text(encoding="utf-8").rstrip()
+
+    if existing:
+        target.write_text(f"{existing}\n\n{RUN_SEPARATOR}\n\n{text}",
+                          encoding="utf-8")
+    else:
+        target.write_text(text, encoding="utf-8")
+
     return target
 
 

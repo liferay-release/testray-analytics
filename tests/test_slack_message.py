@@ -290,3 +290,72 @@ def test_the_build_aggregate_row_is_never_a_repeat():
     assert S._is_aggregate_row("Top Level Build")
     assert S._is_aggregate_row("top level build")
     assert not S._is_aggregate_row("semantic-versioning/0/0")
+
+
+# --------------------------------------------------------------------------
+# One post per TICK, not per pair
+#
+# `watch` drains N queued pairs through N separate submits while Jenkins posts
+# the file once, after the whole tick. Overwriting therefore loses every pair
+# but the last: on 2026-09-16 a tick analysed 19764 (a segments compile break,
+# BUG) and then 19757 (infra, FALSE_POSITIVE), and only the false positive
+# reached the channel.
+# --------------------------------------------------------------------------
+
+def test_a_second_run_overwrites_by_default(tmp_path):
+    """A hand-run pipeline still replaces the file — one run, one message."""
+    out = tmp_path / "msg.txt"
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+
+    S.write(bundle(tmp_path / "a", [verdict(1, "BUG")]), out=out)
+    S.write(bundle(tmp_path / "b", [verdict(1, "FALSE_POSITIVE")]), out=out)
+
+    text = out.read_text(encoding="utf-8")
+    assert S.RUN_SEPARATOR not in text
+    assert text.startswith("🔍 ")
+
+
+def test_appending_keeps_the_earlier_pair_in_the_post(tmp_path):
+    """The BUG analysed first must survive the FALSE_POSITIVE analysed after."""
+    out = tmp_path / "msg.txt"
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+
+    S.write(bundle(tmp_path / "a", [verdict(1, "BUG")]), out=out, append=True)
+    S.write(bundle(tmp_path / "b", [verdict(1, "FALSE_POSITIVE")]),
+            out=out, append=True)
+
+    text = out.read_text(encoding="utf-8")
+    assert text.count(S.RUN_SEPARATOR) == 1
+    assert "*Verdict:* Bug · 🟢 confidence high" in text
+    assert "False Positive" in text
+    # The siren belongs to the pair that earned it, so the reader still sees
+    # it even though the tick ended on something unremarkable.
+    assert text.startswith("🚨 ")
+
+
+def test_appending_to_nothing_writes_a_plain_message(tmp_path):
+    """First pair of a tick: no separator, no leading blank lines."""
+    out = tmp_path / "msg.txt"
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+
+    S.write(bundle(tmp_path / "a", [verdict(1, "BUG")]), out=out, append=True)
+
+    text = out.read_text(encoding="utf-8")
+    assert S.RUN_SEPARATOR not in text
+    assert text.startswith("🚨 ")
+
+
+def test_appending_ignores_a_leftover_empty_file(tmp_path):
+    """`ensure_slack_fallback` and a reset both leave an empty file behind."""
+    out = tmp_path / "msg.txt"
+    out.write_text("   \n", encoding="utf-8")
+    (tmp_path / "a").mkdir()
+
+    S.write(bundle(tmp_path / "a", [verdict(1, "BUG")]), out=out, append=True)
+
+    text = out.read_text(encoding="utf-8")
+    assert S.RUN_SEPARATOR not in text
+    assert text.startswith("🚨 ")
