@@ -446,15 +446,14 @@ def _post_recurrence(tr: dict, routine_id, build_id, by_id: dict) -> None:
 
         text = slack_message.render_recurrence(meta, repeats)
         target = resolve_path(None, slack_message.OUT_REL)
-        target.parent.mkdir(parents=True, exist_ok=True)
         # The tick, not this step, owns the file: `watch` runs after scan and
-        # its own submits append. Appending here too keeps both in one post.
-        if os.environ.get("TRIAGE_SLACK_APPEND") == "1" and target.exists():
-            existing = target.read_text(encoding="utf-8").rstrip()
-            if existing:
-                text = (f"{existing}\n\n{slack_message.RUN_SEPARATOR}\n\n"
-                        f"{text}")
-        target.write_text(text, encoding="utf-8")
+        # its own submits append. Going through the same helper is what keeps
+        # scan and submit agreeing on when the post is full.
+        if os.environ.get("TRIAGE_SLACK_APPEND") == "1":
+            slack_message.append_to_post(target, text)
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(text, encoding="utf-8")
         print(f"\nStill failing: {len(repeats)} signature(s) — "
               f"message written to {target}")
     except (Exception, SystemExit) as e:                          # noqa: BLE001

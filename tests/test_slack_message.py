@@ -429,3 +429,53 @@ def test_the_recurrence_message_lists_every_repeat_not_just_the_first():
     assert "modules-compile/0/1" in text
     assert "modules-compile[modules/apps/segments]" in text
     assert text.count("occurrence #") == 2
+
+
+# --------------------------------------------------------------------------
+# The post has a ceiling
+#
+# Slack refuses a message over 40,000 characters outright. A tick draining a
+# backlog appends one full run message per pair (~5,600 chars measured on a
+# real Stable bundle), so around seven pairs the post would stop being sent —
+# silence, which is the one outcome worse than a long post.
+# --------------------------------------------------------------------------
+
+def test_the_post_stops_growing_before_slack_refuses_it(tmp_path):
+    out = tmp_path / "msg.txt"
+    out.write_text("x" * (S.MAX_POST_CHARS - 100), encoding="utf-8")
+
+    S.append_to_post(out, "y" * 500)
+
+    text = out.read_text(encoding="utf-8")
+    # The budget is a budget; what must never happen is nearing the 40,000
+    # Slack actually refuses at.
+    assert len(text) < 40_000
+    assert "y" * 500 not in text
+    assert "1 more pair(s)" in text
+
+
+def test_the_dropped_count_accumulates_rather_than_resetting(tmp_path):
+    """Three pairs dropped must read as 3, not as 1 three times over."""
+    out = tmp_path / "msg.txt"
+    out.write_text("x" * (S.MAX_POST_CHARS - 100), encoding="utf-8")
+
+    for _ in range(3):
+        S.append_to_post(out, "y" * 500)
+
+    text = out.read_text(encoding="utf-8")
+    assert "3 more pair(s)" in text
+    assert "1 more pair(s)" not in text
+    assert "2 more pair(s)" not in text
+    assert len(text) < 40_000
+
+
+def test_appending_under_the_ceiling_is_untouched(tmp_path):
+    out = tmp_path / "msg.txt"
+    out.write_text("first", encoding="utf-8")
+
+    S.append_to_post(out, "second")
+
+    text = out.read_text(encoding="utf-8")
+    assert "first" in text and "second" in text
+    assert S.RUN_SEPARATOR in text
+    assert "more pair(s)" not in text

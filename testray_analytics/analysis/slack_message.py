@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -614,6 +615,61 @@ def render(run_dir: Path, *, report_url: str = "",
 RUN_SEPARATOR = "━" * 24
 
 
+# Slack refuses a message over 40,000 characters outright, and a tick draining
+# a backlog appends one full run message per pair — measured at ~5,600
+# characters on a real Stable bundle, so seven pairs would silence the post
+# entirely. That is a worse failure than a long post: nothing gets said at all.
+# Stop well short and name what was dropped, the way MAX_BLOCKS already does
+# inside a single message.
+MAX_POST_CHARS = 30_000
+
+# Room for the overflow line itself, so adding it can never be what pushes the
+# post over the budget it exists to enforce.
+_OVERFLOW_RESERVE = 160
+
+_OVERFLOW_RE = re.compile(r"^_… and \d+ more pair\(s\) [^\n]*_$", re.MULTILINE)
+_OVERFLOW_COUNT_RE = re.compile(r"^_… and (\d+) more pair\(s\)", re.MULTILINE)
+
+
+def _overflow_line(n: int) -> str:
+    return (f"_… and {n} more pair(s) analysed this tick — not shown here; "
+            f"their verdicts are in Testray and on the report._")
+
+
+def _without_overflow(text: str) -> tuple[str, int]:
+    """The post with its overflow line removed, and the count it carried."""
+    m = _OVERFLOW_COUNT_RE.search(text)
+    if not m:
+        return text.rstrip(), 0
+    return _OVERFLOW_RE.sub("", text).rstrip(), int(m.group(1))
+
+
+def append_to_post(target: Path, text: str) -> None:
+    """Add one run's message to the tick's post, or record it as dropped.
+
+    Shared by `write(append=True)` and `scan`, so the two cannot disagree about
+    when the post is full.
+    """
+    target.parent.mkdir(parents=True, exist_ok=True)
+    existing = ""
+    if target.exists():
+        existing = target.read_text(encoding="utf-8").rstrip()
+
+    if not existing:
+        target.write_text(text, encoding="utf-8")
+        return
+
+    budget = MAX_POST_CHARS - _OVERFLOW_RESERVE
+    if len(existing) + len(text) + len(RUN_SEPARATOR) + 4 > budget:
+        kept, dropped = _without_overflow(existing)
+        target.write_text(f"{kept}\n\n{_overflow_line(dropped + 1)}",
+                          encoding="utf-8")
+        return
+
+    target.write_text(f"{existing}\n\n{RUN_SEPARATOR}\n\n{text}",
+                      encoding="utf-8")
+
+
 def write(run_dir: Path, *, out: Path | None = None, report_url: str = "",
           link_testray: bool = False, append: bool = False) -> Path:
     """Render and write the message. Returns the path written.
@@ -629,13 +685,8 @@ def write(run_dir: Path, *, out: Path | None = None, report_url: str = "",
     text = render(run_dir, report_url=report_url,
                   link_testray=link_testray, resolve_authors=True)
 
-    existing = ""
-    if append and target.exists():
-        existing = target.read_text(encoding="utf-8").rstrip()
-
-    if existing:
-        target.write_text(f"{existing}\n\n{RUN_SEPARATOR}\n\n{text}",
-                          encoding="utf-8")
+    if append:
+        append_to_post(target, text)
     else:
         target.write_text(text, encoding="utf-8")
 
