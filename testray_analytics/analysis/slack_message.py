@@ -550,7 +550,7 @@ def _inherited_note(meta: dict, results: list, report_url: str) -> list[str]:
     label = f"Pre-existing ({n})"
     where = _link(f"{report_url}#pre-existing", label) if report_url else label
     return ["", f"🔁 {n} failure{'s' if n != 1 else ''} inherited from earlier "
-                f"builds, not re-analysed — see {where} in the report."]
+                f"builds, not re-analyzed — see {where} in the report."]
 
 
 def render_recurrence(meta: dict, repeats: dict) -> str:
@@ -570,7 +570,7 @@ def render_recurrence(meta: dict, repeats: dict) -> str:
     where = _link(_build_url(meta, meta.get("build_id_b")), head) if head else ""
 
     lines = [f"🔁 *{where or 'This build'}* — no new failures; "
-             f"every one was analysed already."]
+             f"each one was analyzed already."]
 
     body = _still_failing(meta, repeats)
     # The section keeps a leading blank for `render`, where it has to separate
@@ -719,7 +719,7 @@ _OVERFLOW_COUNT_RE = re.compile(r"^_… and (\d+) more pair\(s\)", re.MULTILINE)
 
 
 def _overflow_line(n: int) -> str:
-    return (f"_… and {n} more pair(s) analysed this tick — not shown here; "
+    return (f"_… and {n} more pair(s) analyzed this tick — not shown here; "
             f"their verdicts are in Testray and on the report._")
 
 
