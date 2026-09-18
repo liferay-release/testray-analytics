@@ -72,40 +72,57 @@ If the build step only calls `watch`, that is the cause: `watch` consumes work,
 it does not create it. The build step must call `scan` first. `triage_jenkins.sh`
 does both.
 
-- It prints `Routine …: build … is PENDING/INPROGRESS — waiting …` or
-  `newest build on file is …, already DONE — watching for a newer build to
-  appear …`, then `still waiting: newest is … (…) after …s` a few times, then
+- It prints `Routine …: build … is PENDING/INPROGRESS — waiting …`, then
+  `still waiting: newest is … (…) after …s` a few times, then
   `gave up after 3600s` → this is the build that fired the hook, and Testray
-  had not finished importing it (or had not even created its row yet — see
-  below) before the wait timeout. Not a bug: `--wait-for-import` (a flag on
-  `triage_jenkins.sh` itself, which the failure-triggered build step should
-  pass — see JENKINS-SETUP.md) polls for exactly this, and a give-up just
-  means the build waits for the next Stable failure's `--catch-up`, same as
-  before that flag existed. If this repeats every run, Testray's import lag
-  is longer than `TRIAGE_IMPORT_WAIT_TIMEOUT` (default 3600s = 1 hour) —
-  raise it in the job's environment rather than treating it as broken.
+  had not finished importing it before the wait timeout. Not a bug:
+  `--wait-for-import` (a flag on `triage_jenkins.sh` itself, which the
+  failure-triggered build step should pass — see JENKINS-SETUP.md) polls for
+  exactly this, and a give-up just means the build waits for the next Stable
+  failure's `--catch-up`, same as before that flag existed. If this repeats
+  every run, Testray's import lag is longer than `TRIAGE_IMPORT_WAIT_TIMEOUT`
+  (default 3600s = 1 hour) — raise it in the job's environment rather than
+  treating it as broken.
+- It prints `newest build on file is …, already DONE — watching up to 600s
+  for a newer build …`, then `still no newer build after …s`, then
+  **either** `no newer build appeared within 600s — proceeding with …,
+  already DONE` (normal — see below) **or** `new build … appeared after …s`
+  followed by the same PENDING/waiting messages as the first bullet, now for
+  that new build. Both are the settle window (`TRIAGE_IMPORT_SETTLE_WINDOW`,
+  default 600s = 10 min) doing its job, telling apart "nothing new is
+  coming" from "the real build hasn't shown up yet".
 - If the console shows none of these lines at all, check whether the build
   step is actually passing `--wait-for-import` to `triage_jenkins.sh` — it is
   off by default (step 0's `wait_for_import: false/true` says which), on
   purpose, so a manual `--no-classify`/`--check` run does not sit through the
   wait for a build that was never coming.
-- The "already DONE — watching for a newer build" message on its own, every
-  single run, is normal and expected — it is not evidence of a stuck build.
-  The hook fires the instant Stable fails, which is routinely *before*
-  Testray has even created the Build row for it (measured live 2026-09-15: a
-  ~4-minute gap between the hook firing and the row existing at all). Until
-  that row appears, the newest build Testray can report IS the previous one,
-  already DONE — `await_import()` deliberately does not treat that as "ready"
-  by itself; it waits for a build with a *different* id to show up DONE.
-- It prints `Routine …: waiting for the build testing <sha> …` instead of the
-  two messages above → `PORTAL_GIT_COMMIT` (LPD-105603) got through, and
-  `scan` is waiting on that exact build by `gitHash`, not guessing from
-  "newest". No baseline confusion is possible here — it either finds that
-  build and it's DONE, or it doesn't exist yet, or it's still importing.
-  If you expected this path but see the baseline messages instead, check
-  whether `PORTAL_GIT_COMMIT` reached the environment at all — an empty or
-  malformed value falls back to the heuristic silently, with a line on
-  stderr (`--trigger-git-commit … does not look like a git SHA`) naming why.
+- The "already DONE — watching up to 600s" message, and it resolving with
+  "proceeding with …, already DONE" every single run, is normal and
+  expected — it is not evidence of a stuck build. Two different situations
+  produce it, and there is no way to tell them apart from one read: the hook
+  fires the instant Stable fails, which is routinely *before* Testray has
+  even created the Build row for it (measured live 2026-09-15: a ~4-minute
+  gap between the hook firing and the row existing at all) — in which case a
+  newer build shows up within the settle window; or the tick itself started
+  late (measured live 2026-09-17: Jenkins had queued it behind a prior run,
+  since `Concurrent builds` is disabled) and the build the hook fired for
+  had *already* finished importing by the time this tick got to look — in
+  which case nothing newer ever shows up, and the settle window is what
+  stops that from being mistaken for the first case and waited out for a
+  full hour.
+- It prints `Routine …: waiting for the build testing <sha> …` instead of any
+  of the above → `PORTAL_GIT_COMMIT` (LPD-105603) got through, and `scan` is
+  waiting on that exact build by `gitHash`, not guessing from "newest". No
+  baseline, no settle window — it either finds that build and it's DONE, or
+  it doesn't exist yet, or it's still importing. If you expected this path
+  but see the baseline/settle messages instead, check whether
+  `PORTAL_GIT_COMMIT` reached the environment at all — an empty or malformed
+  value falls back to the heuristic silently, with a line on stderr
+  (`--trigger-git-commit … does not look like a git SHA`) naming why.
+- To run any of this by hand without waiting at all — to prove the wiring
+  against a build that is already imported, say — prefix the exact same
+  command with `TRIAGE_IMPORT_WAIT_TIMEOUT=0`. It works for both paths: one
+  check, then proceed immediately, whether or not the build is ready.
 
 ## Symptom: `! poll failed: HTTP Error 404: Not Found`
 

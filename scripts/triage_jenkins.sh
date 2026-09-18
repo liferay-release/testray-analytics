@@ -396,6 +396,13 @@ function print_help {
 	  TRIAGE_IMPORT_WAIT_TIMEOUT   seconds to wait before giving up on that
 	                        build for this tick (default 3600 = 1 hour — measured
 	                        import lag on a real trigger has been ~24 minutes)
+	  TRIAGE_IMPORT_SETTLE_WINDOW  heuristic fallback only (no PORTAL_GIT_COMMIT):
+	                        seconds to watch for a newer build before accepting
+	                        an already-DONE one as the answer (default 600 =
+	                        10 min). Without this, a tick that starts late
+	                        finds the build it was triggered for already done
+	                        and sits out the full wait timeout for a build id
+	                        that will never appear.
 	  PORTAL_GIT_COMMIT     the commit Stable was testing when the hook fired
 	                        (LPD-105603, set by the Jenkins trigger itself).
 	                        When present, scan --wait-for-import waits for

@@ -709,10 +709,37 @@ original 900, to 1800, to 2400, to 3600 (1 hour) — the measured 24-minute lag
 left too little margin under any of the earlier defaults, and 1 hour was
 chosen deliberately over just matching the measurement.
 
-**`--trigger-git-commit` replaces the guess with a fact, when it can.**
-LPD-105603. The baseline comparison above is a heuristic because the hook
-never said which build it was for — `await_import()` had to infer "is this
-newest thing the one I'm waiting for?" from timing alone. The Stable job's
+**An already-DONE baseline is genuinely ambiguous, and needed a second,
+shorter budget of its own.** Found live 2026-09-17: `Concurrent builds` is
+disabled on the Jenkins job, so a tick can be *queued* behind a prior run
+before it ever starts. By the time that queued tick finally ran, the build
+the hook had fired for had already finished importing — it was sitting there
+as the newest build, DONE, from the very first `newest_build()` call. Nothing
+newer was ever coming (the next Stable build was hours away), but "baseline
+already DONE" reads identically whether the real build hasn't appeared yet
+(09-15) or has already finished before this tick even got to look (09-17) —
+and the fix for the first bug made the second one sit out the entire one-hour
+timeout on every occurrence, waiting for a build id that would never exist.
+
+The two cases only diverge over time: if the real build's row does not exist
+yet, a newer id shows up within the ~4-minute lag measured on 09-15; if it
+does not, the DONE build already on file always was the answer. So an
+already-DONE baseline now gets `DEFAULT_IMPORT_SETTLE_WINDOW` (600s = 10 min,
+`TRIAGE_IMPORT_SETTLE_WINDOW`) to watch for a different id before accepting
+the one on file — comfortably past the measured lag without reintroducing a
+near-instant return for the case that motivated removing one in the first
+place. A build found during the settle window switches this into the ordinary
+"wait for it to finish" path, under the full `DEFAULT_IMPORT_WAIT_TIMEOUT`
+budget, same as a baseline that was never DONE to begin with. `settle_window`
+is capped at `timeout` (`min(settle_window, timeout)`) so a manual, no-wait
+run (`TRIAGE_IMPORT_WAIT_TIMEOUT=0`) is not defeated by the settle phase
+sleeping through its own separate, uncapped default.
+
+**`--trigger-git-commit` replaces the guess with a fact, when it can — and
+makes the settle window above unnecessary when it works.** LPD-105603. Both
+of the above are heuristics because the hook never said which build it was
+for — `await_import()` had to infer "is this newest thing the one I'm
+waiting for?" from timing alone, no matter how carefully. The Stable job's
 own trigger (`trigger-release-master-job` in `liferay-jenkins-ee`) now passes
 `PORTAL_GIT_COMMIT` — the exact commit it was testing — as a build parameter,
 which `triage_jenkins.sh` forwards as `PORTAL_GIT_COMMIT` and `scan` reads as

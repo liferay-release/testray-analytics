@@ -72,6 +72,18 @@ giving up and scanning anyway. A give-up is not a failure: the build then
 waits for the next Stable
 failure's `--catch-up`, same as before this flag existed.
 
+**An already-DONE baseline is its own, second race.** Measured live
+2026-09-17: the Jenkins job was queued behind a prior run (`Concurrent
+builds` disabled), so by the time this tick actually started, the build the
+hook fired for had already finished importing — sitting there as the newest
+build, DONE, from the very first read. Nothing newer was ever coming, but
+that reads identically to the 09-15 case above, and the tick sat out the
+*entire* one-hour timeout waiting for a build id that would never appear.
+`TRIAGE_IMPORT_SETTLE_WINDOW` (default 600s = 10 min) is the shorter budget
+that tells the two apart: it watches for a different id for up to that long
+before accepting the DONE build on file as the answer, instead of committing
+to the full hour every time.
+
 **`PORTAL_GIT_COMMIT` — when it's there, there is no guessing at all.**
 LPD-105603. The Stable job's own trigger now passes the commit it was
 testing as a build parameter, which arrives here as the env var

@@ -46,6 +46,7 @@ SCAN_INTERVAL_ENV = "TRIAGE_SCAN_INTERVAL"
 # await_import() (below) somewhere to wait before scan() ever runs.
 IMPORT_POLL_INTERVAL_ENV = "TRIAGE_IMPORT_POLL_INTERVAL"
 IMPORT_WAIT_TIMEOUT_ENV = "TRIAGE_IMPORT_WAIT_TIMEOUT"
+IMPORT_SETTLE_WINDOW_ENV = "TRIAGE_IMPORT_SETTLE_WINDOW"
 DEFAULT_IMPORT_POLL_INTERVAL = 60
 # Measured live 2026-09-15 on a real trigger: hook fired at 13:40, Testray did
 # not even create the Build row until 13:43:59, and did not finish importing
@@ -54,6 +55,20 @@ DEFAULT_IMPORT_POLL_INTERVAL = 60
 # above the measured 24 minutes without blocking the Jenkins job
 # indefinitely on a Testray outage.
 DEFAULT_IMPORT_WAIT_TIMEOUT = 3600
+# Only used by await_import() (the heuristic fallback for when LPD-105603's
+# PORTAL_GIT_COMMIT did not arrive) — await_import_for_commit() never needs
+# this, since it is never ambiguous about which build it wants. How long to
+# watch for a NEWER build before accepting an already-DONE one as the
+# answer: found live 2026-09-17, Jenkins had queued that tick behind a prior
+# run, so by the time it started, the build the hook fired for had ALREADY
+# finished importing — sitting there as the newest build, DONE, from the
+# very first read. Nothing newer was ever coming, but the baseline logic
+# alone cannot tell that apart from "the row just hasn't appeared yet" (the
+# 2026-09-15 case) and sat out the FULL hour waiting for a build id that
+# would never exist. This window has to clear the ~4-minute row-creation lag
+# measured on 09-15 comfortably, without reintroducing a near-instant return
+# for the case that motivated having a baseline at all.
+DEFAULT_IMPORT_SETTLE_WINDOW = 600
 
 # How many recent builds to consider as baseline candidates. Comfortably past
 # the measured worst case (20 builds back) without pulling whole history.
@@ -125,23 +140,36 @@ def newest_build(tr: dict, routine_id: int) -> dict | None:
 
 def await_import(tr: dict, routine_id: int, *,
                  poll_interval: int = DEFAULT_IMPORT_POLL_INTERVAL,
-                 timeout: int = DEFAULT_IMPORT_WAIT_TIMEOUT) -> None:
-    """Block until a build newer than the one on file when this started is
-    `importStatus` DONE, or give up after `timeout` seconds.
+                 timeout: int = DEFAULT_IMPORT_WAIT_TIMEOUT,
+                 settle_window: int = DEFAULT_IMPORT_SETTLE_WINDOW) -> None:
+    """Block until the build the hook fired for is `importStatus` DONE, or
+    give up. The heuristic fallback for when LPD-105603's `PORTAL_GIT_COMMIT`
+    did not arrive — await_import_for_commit() is the deterministic version
+    and does not need any of this.
 
-    The build the hook fired for often does not exist as a Build row AT ALL
-    yet — observed live 2026-09-15: the Jenkins job fired the hook at 13:40,
-    Testray did not create the row until 13:43:59, and did not finish
-    importing it until ~14:04. Queried at 13:40, newest_build() returns the
-    PREVIOUS build, which is long since DONE. An earlier version of this
-    function read that as "nothing to wait for" and returned immediately —
-    exactly backwards, since that IS the case with the most waiting left to
-    do. So the id seen on the FIRST call is recorded as a baseline and never
-    updated; "ready" requires either that same build finishing (the ordinary
-    PENDING/INPROGRESS-when-we-arrived case) or a build with a different id
-    showing up DONE (the row-not-created-yet case) — never "whatever is
-    newest right now happens to say DONE", which is true before AND after the
-    row nobody has seen yet appears.
+    Two different unknowns, two different budgets:
+
+    1. **The row does not exist yet.** Observed live 2026-09-15: the hook
+       fired at 13:40, Testray did not create the Build row until 13:43:59.
+       Queried at 13:40, newest_build() returns the PREVIOUS build, long
+       since DONE — indistinguishable, from one read, from "nothing new is
+       coming". Resolved by watching for up to `settle_window` seconds for a
+       DIFFERENT id to appear; that lag was ~4 minutes, so a short window
+       covers it without cost to the common case.
+    2. **The row exists and is still importing** (either it already did when
+       this was first called, or it is the new one `settle_window` found).
+       That takes longer — measured ~20 minutes once the row existed — so
+       this waits up to the full `timeout`.
+
+    Treating both with the single `timeout` budget was itself a bug, found
+    live 2026-09-17: Jenkins had queued that tick behind a prior run
+    (concurrent builds disabled), so by the time it actually started, the
+    build the hook had fired for was already DONE — on file as the newest
+    build from the very first read. Nothing newer was ever coming (the next
+    Stable build was hours away), but the old logic could not tell that
+    apart from case 1 above and sat waiting the full hour for a build id
+    that would never appear. `settle_window` is what makes "nothing newer
+    shows up" a fast, bounded conclusion instead of a full-timeout one.
 
     Never raises and never signals failure either way: giving up just leaves
     scan() unable to see the build this tick, exactly as if this function did
@@ -149,25 +177,65 @@ def await_import(tr: dict, routine_id: int, *,
     error here — a build that never finishes importing is a Testray problem,
     not a reason to fail an otherwise-healthy triage run.
     """
+    # The "unsure yet" phase must never outlast the overall budget: a caller
+    # setting timeout=0 for a manual, no-wait run (TRIAGE_IMPORT_WAIT_TIMEOUT=0)
+    # would otherwise still sleep through up to settle_window seconds when the
+    # baseline happens to be DONE — settle_window is a sub-phase of timeout,
+    # not a second, independent budget.
+    settle_window = min(settle_window, timeout)
+
     baseline = newest_build(tr, routine_id)
     if baseline is None:
         print(f"Routine {routine_id}: no builds yet — nothing to wait for.")
         return
 
-    baseline_id = baseline["id"]
-    baseline_status = _import_status(baseline)
-    name = baseline.get("name") or baseline_id
+    ref_id = baseline["id"]
+    ref_status = _import_status(baseline)
+    name = baseline.get("name") or ref_id
 
-    if baseline_status == "DONE":
-        print(f"Routine {routine_id}: newest build on file is {baseline_id} "
-              f"({name}), already DONE — watching for a newer build to "
-              f"appear and finish importing, checking every {poll_interval}s "
-              f"(up to {timeout}s)", flush=True)
-    else:
-        print(f"Routine {routine_id}: build {baseline_id} ({name}) is "
-              f"{baseline_status or 'unknown'} — waiting for it, or a newer "
+    if ref_status != "DONE":
+        print(f"Routine {routine_id}: build {ref_id} ({name}) is "
+              f"{ref_status or 'unknown'} — waiting for it, or a newer "
               f"build, to finish importing, checking every {poll_interval}s "
               f"(up to {timeout}s)", flush=True)
+    else:
+        # Ambiguous: this DONE build might be the answer already (the tick
+        # started late — see 2026-09-17 above) or the real one might not
+        # exist yet (see 2026-09-15 above). settle_window is what tells them
+        # apart, cheaply, before committing to the long wait.
+        print(f"Routine {routine_id}: newest build on file is {ref_id} "
+              f"({name}), already DONE — watching up to {settle_window}s for "
+              f"a newer build to appear; proceeding with this one if none "
+              f"does", flush=True)
+
+        settled = 0
+        found_newer = False
+        while settled < settle_window:
+            time.sleep(poll_interval)
+            settled += poll_interval
+            current = newest_build(tr, routine_id)
+            if current is not None and current["id"] != ref_id:
+                ref_id = current["id"]
+                ref_status = _import_status(current)
+                name = current.get("name") or ref_id
+                print(f"  new build {ref_id} appeared after {settled}s "
+                      f"({ref_status or 'unknown'})", flush=True)
+                found_newer = True
+                break
+            print(f"  still no newer build after {settled}s (on file: "
+                  f"{ref_id}, DONE)", flush=True)
+
+        if not found_newer:
+            print(f"  no newer build appeared within {settle_window}s — "
+                  f"proceeding with {ref_id}, already DONE", flush=True)
+            return
+
+        if ref_status == "DONE":
+            print(f"  new build {ref_id} was already imported", flush=True)
+            return
+
+        print(f"  waiting for build {ref_id} to finish importing, checking "
+              f"every {poll_interval}s (up to {timeout}s)", flush=True)
 
     waited = 0
     while waited < timeout:
@@ -175,14 +243,17 @@ def await_import(tr: dict, routine_id: int, *,
         waited += poll_interval
         current = newest_build(tr, routine_id)
         status = _import_status(current) if current else None
-        is_new = current is not None and current["id"] != baseline_id
-        if status == "DONE" and (is_new or baseline_status != "DONE"):
-            which = f"new build {current['id']}" if is_new else \
-                    f"build {current['id']}"
-            print(f"  {which} imported after {waited}s", flush=True)
+        cur_id = current["id"] if current else ref_id
+        if cur_id != ref_id:
+            # Rare: yet another, even newer build appeared while this one
+            # was still importing (two Stable failures close together).
+            ref_id = cur_id
+            print(f"  even newer build {ref_id} appeared after {waited}s "
+                  f"({status or 'unknown'})", flush=True)
+        if status == "DONE":
+            print(f"  build {ref_id} imported after {waited}s", flush=True)
             return
-        cur_id = current["id"] if current else baseline_id
-        print(f"  still waiting: newest is {cur_id} ({status or 'unknown'}) "
+        print(f"  still waiting: newest is {ref_id} ({status or 'unknown'}) "
               f"after {waited}s", flush=True)
 
     print(f"  gave up after {timeout}s — scan will not see a new build this "
@@ -621,6 +692,14 @@ def main() -> None:
                     help="give up waiting after this long and scan anyway "
                          f"(default {DEFAULT_IMPORT_WAIT_TIMEOUT}, env "
                          f"{IMPORT_WAIT_TIMEOUT_ENV})")
+    ap.add_argument("--import-settle-window", type=int, default=None,
+                    metavar="SECONDS",
+                    help="heuristic fallback only (no --trigger-git-commit): "
+                         "when the newest build on file is already DONE, how "
+                         "long to watch for a newer one before accepting it "
+                         "as the answer instead of sitting out the full wait "
+                         f"timeout (default {DEFAULT_IMPORT_SETTLE_WINDOW}, "
+                         f"env {IMPORT_SETTLE_WINDOW_ENV})")
     ap.add_argument("--trigger-git-commit", default=None, metavar="SHA",
                     help="the exact commit Stable was testing when the hook "
                          "fired (env TRIAGE_TRIGGER_GIT_COMMIT, set from "
@@ -654,6 +733,9 @@ def main() -> None:
     import_wait_timeout = (args.import_wait_timeout
                            or int(os.environ.get(IMPORT_WAIT_TIMEOUT_ENV,
                                                   DEFAULT_IMPORT_WAIT_TIMEOUT)))
+    import_settle_window = (args.import_settle_window
+                            or int(os.environ.get(IMPORT_SETTLE_WINDOW_ENV,
+                                                   DEFAULT_IMPORT_SETTLE_WINDOW)))
 
     trigger_git_commit = (args.trigger_git_commit
                           or os.environ.get("TRIAGE_TRIGGER_GIT_COMMIT"))
@@ -678,7 +760,8 @@ def main() -> None:
                     else:
                         await_import(cfg["testray"], routine_id,
                                      poll_interval=import_poll_interval,
-                                     timeout=import_wait_timeout)
+                                     timeout=import_wait_timeout,
+                                     settle_window=import_settle_window)
                 except Exception as e:                           # noqa: BLE001
                     # A broken wait must degrade to "did not wait", not to
                     # "did not scan" — this routine's own try/except below is

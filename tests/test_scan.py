@@ -221,19 +221,25 @@ def test_newest_build_returns_none_when_routine_has_no_builds(monkeypatch):
     assert S.newest_build(CFG["testray"], 79529) is None
 
 
-def test_await_import_waits_out_the_timeout_when_no_new_build_ever_appears(monkeypatch):
-    """The newest build being DONE on the very first check is NOT, by itself,
-    a reason to return immediately: it is also exactly what the trigger race
-    looks like before the build it fired for even exists as a row (observed
-    live 2026-09-15 — the hook fired minutes before Testray created the row).
-    With nothing ever showing up newer than the baseline, this can only give
-    up after the full timeout — same as the PENDING-forever case."""
+def test_await_import_proceeds_after_settle_window_when_nothing_newer_appears(monkeypatch):
+    """The bug found live 2026-09-17: Jenkins had queued that tick behind a
+    prior run (concurrent builds disabled), so by the time it actually
+    started, the build the hook fired for had ALREADY finished importing —
+    on file as the newest build, DONE, from the very first read. Nothing
+    newer was ever coming (the next Stable build was hours away), but the
+    original version could not tell that apart from the 2026-09-15 race (row
+    not created yet) and sat out the FULL timeout waiting for a build id that
+    would never appear. It must instead give up on waiting after the much
+    shorter settle_window and proceed with the DONE build already on file —
+    note timeout here is deliberately huge to prove settle_window, not
+    timeout, is what bounds this path."""
     monkeypatch.setattr(S, "newest_build",
                         lambda tr, rid: _build_row(9, "DONE"))
     sleeps = []
     monkeypatch.setattr(S.time, "sleep", lambda s: sleeps.append(s))
 
-    S.await_import(CFG["testray"], 79529, poll_interval=10, timeout=20)
+    S.await_import(CFG["testray"], 79529, poll_interval=10, timeout=3600,
+                   settle_window=20)
 
     assert sleeps == [10, 10]
 
@@ -273,6 +279,24 @@ def test_await_import_detects_a_new_build_after_baseline_was_already_done(monkey
     assert sleeps == [10, 10, 10]
 
 
+def test_await_import_returns_as_soon_as_a_settle_window_new_build_is_done(monkeypatch):
+    """A new build appearing during the settle window already DONE (not
+    PENDING) must not fall through into the full wait loop — it is the
+    answer, immediately."""
+    rows = iter([
+        _build_row(9, "DONE"),    # baseline: the old build
+        _build_row(10, "DONE"),  # a new id shows up, already finished
+    ])
+    monkeypatch.setattr(S, "newest_build", lambda tr, rid: next(rows))
+    sleeps = []
+    monkeypatch.setattr(S.time, "sleep", lambda s: sleeps.append(s))
+
+    S.await_import(CFG["testray"], 79529, poll_interval=10, timeout=900,
+                   settle_window=600)
+
+    assert sleeps == [10]
+
+
 def test_await_import_gives_up_after_timeout_without_raising(monkeypatch):
     """A build that never finishes importing must not fail the tick — it just
     leaves scan() unable to see it, same as before this existed."""
@@ -292,6 +316,19 @@ def test_await_import_with_no_builds_does_not_poll(monkeypatch):
                         lambda *_: pytest.fail("nothing to wait for"))
 
     S.await_import(CFG["testray"], 79529)
+
+
+def test_await_import_timeout_zero_skips_the_settle_window_too(monkeypatch):
+    """TRIAGE_IMPORT_WAIT_TIMEOUT=0 is the manual "don't wait" override — it
+    must not be defeated by settle_window defaulting to 600s on its own when
+    the baseline happens to be DONE. settle_window is a sub-phase of timeout,
+    not a second independent budget."""
+    monkeypatch.setattr(S, "newest_build",
+                        lambda tr, rid: _build_row(9, "DONE"))
+    monkeypatch.setattr(S.time, "sleep",
+                        lambda *_: pytest.fail("timeout=0 must not sleep"))
+
+    S.await_import(CFG["testray"], 79529, timeout=0)
 
 
 COMMIT = "351635bc2d7e9120a7448fa35b8cb276e8b302df"
