@@ -72,6 +72,18 @@ giving up and scanning anyway. A give-up is not a failure: the build then
 waits for the next Stable
 failure's `--catch-up`, same as before this flag existed.
 
+**`PORTAL_GIT_COMMIT` — when it's there, there is no guessing at all.**
+LPD-105603. The Stable job's own trigger now passes the commit it was
+testing as a build parameter, which arrives here as the env var
+`PORTAL_GIT_COMMIT`. `triage_jenkins.sh` forwards it to `scan` as
+`--trigger-git-commit`, which asks Testray directly for the build whose
+`gitHash` matches — found and DONE, or not created yet, never "is this the
+right one?". This is strictly better than the baseline heuristic above when
+it is available, and the script falls back to that heuristic cleanly when
+`PORTAL_GIT_COMMIT` is unset or does not look like a real 40-character SHA
+(an unresolved Ant property leaks through as a literal string, not as
+empty — this is guarded against, not trusted blindly).
+
 ---
 
 ## Jenkins configuration

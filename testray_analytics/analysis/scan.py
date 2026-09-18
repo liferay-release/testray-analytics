@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -185,6 +186,81 @@ def await_import(tr: dict, routine_id: int, *,
               f"after {waited}s", flush=True)
 
     print(f"  gave up after {timeout}s — scan will not see a new build this "
+          f"tick; the next Stable failure's --catch-up will pick it up",
+          flush=True)
+
+
+_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+def _looks_like_commit(value: str | None) -> bool:
+    """A real git SHA, not an unresolved Ant property leaking through.
+
+    LPD-105603 passes `PORTAL_GIT_COMMIT` through the Jenkins trigger as a
+    literal `${env.PORTAL_GIT_COMMIT}` substitution; Ant does not blank out
+    an unset property the way a shell would — it leaves the token itself in
+    the string. A malformed value here must fall back to the heuristic in
+    await_import(), not get handed to a Testray filter as someone's SHA.
+    """
+    return bool(_COMMIT_RE.match(value or ""))
+
+
+def find_build_by_commit(tr: dict, routine_id: int,
+                         git_commit: str) -> dict | None:
+    """The build for this routine whose gitHash matches exactly, or None if
+    it has not been created yet.
+
+    Unlike newest_build(), this needs no baseline and no settle window: the
+    caller already knows exactly which commit it is waiting for (the one
+    Stable was testing when the hook fired), so "found and DONE" or "not
+    found yet" is the whole answer — never "is this the right build?".
+    """
+    items = fetch_one_page(
+        "/o/c/builds",
+        {"filter": (f"r_routineToBuilds_c_routineId eq '{routine_id}' and "
+                    f"gitHash eq '{git_commit}'"),
+         "pageSize": 1},
+        token=_testray_oauth_token(tr), base_url=tr["base_url"],
+    )
+    return items[0] if items else None
+
+
+def await_import_for_commit(tr: dict, routine_id: int, git_commit: str, *,
+                            poll_interval: int = DEFAULT_IMPORT_POLL_INTERVAL,
+                            timeout: int = DEFAULT_IMPORT_WAIT_TIMEOUT) -> None:
+    """Block until the build for `git_commit` is `importStatus` DONE, or
+    give up after `timeout` seconds.
+
+    The deterministic counterpart to await_import(): LPD-105603 has the
+    Jenkins hook pass the exact commit Stable was testing, so there is
+    nothing to infer here — a build either exists and is DONE, or it does
+    not exist yet, or it exists and is still importing. No baseline, no
+    settle window, because there is no "is this the right build" question
+    left to answer.
+
+    Same backstop as await_import(): never raises, and a give-up just
+    leaves scan() unable to see the build this tick — the next Stable
+    failure's --catch-up picks it up.
+    """
+    print(f"Routine {routine_id}: waiting for the build testing {git_commit}, "
+          f"checking every {poll_interval}s (up to {timeout}s)", flush=True)
+
+    waited = 0
+    while True:
+        build = find_build_by_commit(tr, routine_id, git_commit)
+        status = _import_status(build) if build else None
+        if status == "DONE":
+            print(f"  build {build['id']} imported after {waited}s",
+                  flush=True)
+            return
+        if waited >= timeout:
+            break
+        print(f"  still {'PENDING/INPROGRESS' if build else 'not created yet'} "
+              f"after {waited}s", flush=True)
+        time.sleep(poll_interval)
+        waited += poll_interval
+
+    print(f"  gave up after {timeout}s — scan will not see this build this "
           f"tick; the next Stable failure's --catch-up will pick it up",
           flush=True)
 
@@ -545,6 +621,14 @@ def main() -> None:
                     help="give up waiting after this long and scan anyway "
                          f"(default {DEFAULT_IMPORT_WAIT_TIMEOUT}, env "
                          f"{IMPORT_WAIT_TIMEOUT_ENV})")
+    ap.add_argument("--trigger-git-commit", default=None, metavar="SHA",
+                    help="the exact commit Stable was testing when the hook "
+                         "fired (env TRIAGE_TRIGGER_GIT_COMMIT, set from "
+                         "PORTAL_GIT_COMMIT — see LPD-105603). When given, "
+                         "--wait-for-import waits for THIS build specifically "
+                         "instead of guessing from whatever is newest. A "
+                         "missing or malformed value falls back to the "
+                         "heuristic silently.")
     ap.add_argument("--force", action="store_true",
                     help="re-queue a pair even though a finished TriageRun "
                          "exists for it. Costs a full classify: the run is "
@@ -571,6 +655,14 @@ def main() -> None:
                            or int(os.environ.get(IMPORT_WAIT_TIMEOUT_ENV,
                                                   DEFAULT_IMPORT_WAIT_TIMEOUT)))
 
+    trigger_git_commit = (args.trigger_git_commit
+                          or os.environ.get("TRIAGE_TRIGGER_GIT_COMMIT"))
+    if trigger_git_commit and not _looks_like_commit(trigger_git_commit):
+        print(f"! --trigger-git-commit {trigger_git_commit!r} does not look "
+              f"like a git SHA — ignoring it and falling back to the "
+              f"heuristic wait", file=sys.stderr)
+        trigger_git_commit = None
+
     while True:
         if interval:
             print(f"\n=== {datetime.now(timezone.utc):%Y-%m-%d %H:%M:%S} UTC ===")
@@ -578,9 +670,15 @@ def main() -> None:
         for routine_id in routines:
             if wait_for_import:
                 try:
-                    await_import(cfg["testray"], routine_id,
-                                 poll_interval=import_poll_interval,
-                                 timeout=import_wait_timeout)
+                    if trigger_git_commit:
+                        await_import_for_commit(cfg["testray"], routine_id,
+                                                trigger_git_commit,
+                                                poll_interval=import_poll_interval,
+                                                timeout=import_wait_timeout)
+                    else:
+                        await_import(cfg["testray"], routine_id,
+                                     poll_interval=import_poll_interval,
+                                     timeout=import_wait_timeout)
                 except Exception as e:                           # noqa: BLE001
                     # A broken wait must degrade to "did not wait", not to
                     # "did not scan" — this routine's own try/except below is

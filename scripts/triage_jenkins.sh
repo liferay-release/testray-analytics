@@ -396,6 +396,12 @@ function print_help {
 	  TRIAGE_IMPORT_WAIT_TIMEOUT   seconds to wait before giving up on that
 	                        build for this tick (default 3600 = 1 hour — measured
 	                        import lag on a real trigger has been ~24 minutes)
+	  PORTAL_GIT_COMMIT     the commit Stable was testing when the hook fired
+	                        (LPD-105603, set by the Jenkins trigger itself).
+	                        When present, scan --wait-for-import waits for
+	                        THIS exact build instead of guessing from
+	                        whatever is newest. Optional: unset falls back
+	                        to the guess.
 	END
 }
 
@@ -419,6 +425,16 @@ function tick {
 	if [ "${_WAIT_FOR_IMPORT}" == "true" ]
 	then
 		scan_args+=(--wait-for-import)
+
+		# LPD-105603: the Stable job's own trigger now passes the commit it
+		# was testing (PORTAL_GIT_COMMIT), which lets scan wait for that EXACT
+		# build instead of guessing from whatever is newest. Passed only when
+		# non-empty: an unset PORTAL_GIT_COMMIT must fall back to the
+		# heuristic, not hand scan a blank filter value.
+		if [ -n "${PORTAL_GIT_COMMIT:-}" ]
+		then
+			scan_args+=(--trigger-git-commit "${PORTAL_GIT_COMMIT}")
+		fi
 	fi
 
 	# The TICK owns the Slack file, not any one step. scan writes a "nothing

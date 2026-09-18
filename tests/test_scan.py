@@ -294,6 +294,78 @@ def test_await_import_with_no_builds_does_not_poll(monkeypatch):
     S.await_import(CFG["testray"], 79529)
 
 
+COMMIT = "351635bc2d7e9120a7448fa35b8cb276e8b302df"
+
+
+def test_looks_like_commit():
+    assert S._looks_like_commit(COMMIT)
+    assert not S._looks_like_commit("")
+    assert not S._looks_like_commit(None)
+    assert not S._looks_like_commit("${env.PORTAL_GIT_COMMIT}")  # Ant, unresolved
+    assert not S._looks_like_commit("351635b")                   # short SHA
+
+
+def test_find_build_by_commit_returns_none_when_not_created_yet(monkeypatch):
+    monkeypatch.setattr(S, "_testray_oauth_token", lambda tr: "token")
+    monkeypatch.setattr(S, "fetch_one_page",
+                        lambda endpoint, params, token, base_url: [])
+
+    assert S.find_build_by_commit(CFG["testray"], 79529, COMMIT) is None
+
+
+def test_find_build_by_commit_returns_the_match(monkeypatch):
+    monkeypatch.setattr(S, "_testray_oauth_token", lambda tr: "token")
+    monkeypatch.setattr(S, "fetch_one_page",
+                        lambda endpoint, params, token, base_url:
+                            [_build_row(9, "DONE")])
+
+    result = S.find_build_by_commit(CFG["testray"], 79529, COMMIT)
+
+    assert result["id"] == 9
+
+
+def test_await_import_for_commit_returns_immediately_when_already_done(monkeypatch):
+    """No baseline, no settle window — the caller already knows exactly which
+    build it wants, so "found and DONE" is the whole answer."""
+    monkeypatch.setattr(S, "find_build_by_commit",
+                        lambda tr, rid, commit: _build_row(9, "DONE"))
+    monkeypatch.setattr(S.time, "sleep",
+                        lambda *_: pytest.fail("must not sleep when DONE"))
+
+    S.await_import_for_commit(CFG["testray"], 79529, COMMIT)
+
+
+def test_await_import_for_commit_waits_for_the_row_to_be_created(monkeypatch):
+    """The 2026-09-15 race, but with no ambiguity to resolve: the build for
+    this exact commit does not exist yet (None), then appears PENDING, then
+    finishes. Every step is about this one commit, never "is this the right
+    build"."""
+    rows = iter([None, None, _build_row(9, "PENDING"), _build_row(9, "DONE")])
+    monkeypatch.setattr(S, "find_build_by_commit",
+                        lambda tr, rid, commit: next(rows))
+    sleeps = []
+    monkeypatch.setattr(S.time, "sleep", lambda s: sleeps.append(s))
+
+    S.await_import_for_commit(CFG["testray"], 79529, COMMIT, poll_interval=10,
+                              timeout=900)
+
+    assert sleeps == [10, 10, 10]
+
+
+def test_await_import_for_commit_gives_up_after_timeout_without_raising(monkeypatch):
+    """A commit whose build never appears (or never finishes) must not fail
+    the tick — --catch-up on the next Stable failure is the backstop, same
+    as the heuristic path."""
+    monkeypatch.setattr(S, "find_build_by_commit", lambda tr, rid, commit: None)
+    sleeps = []
+    monkeypatch.setattr(S.time, "sleep", lambda s: sleeps.append(s))
+
+    S.await_import_for_commit(CFG["testray"], 79529, COMMIT, poll_interval=10,
+                              timeout=20)
+
+    assert sleeps == [10, 10]
+
+
 def test_wait_for_import_failure_does_not_block_the_real_scan(offline, monkeypatch, capsys):
     """A bug in await_import must degrade to "did not wait", never to "did
     not scan" — the two are wired through separate try/excepts in main()."""

@@ -97,6 +97,15 @@ does both.
   that row appears, the newest build Testray can report IS the previous one,
   already DONE — `await_import()` deliberately does not treat that as "ready"
   by itself; it waits for a build with a *different* id to show up DONE.
+- It prints `Routine …: waiting for the build testing <sha> …` instead of the
+  two messages above → `PORTAL_GIT_COMMIT` (LPD-105603) got through, and
+  `scan` is waiting on that exact build by `gitHash`, not guessing from
+  "newest". No baseline confusion is possible here — it either finds that
+  build and it's DONE, or it doesn't exist yet, or it's still importing.
+  If you expected this path but see the baseline messages instead, check
+  whether `PORTAL_GIT_COMMIT` reached the environment at all — an empty or
+  malformed value falls back to the heuristic silently, with a line on
+  stderr (`--trigger-git-commit … does not look like a git SHA`) naming why.
 
 ## Symptom: `! poll failed: HTTP Error 404: Not Found`
 

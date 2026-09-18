@@ -709,6 +709,31 @@ original 900, to 1800, to 2400, to 3600 (1 hour) — the measured 24-minute lag
 left too little margin under any of the earlier defaults, and 1 hour was
 chosen deliberately over just matching the measurement.
 
+**`--trigger-git-commit` replaces the guess with a fact, when it can.**
+LPD-105603. The baseline comparison above is a heuristic because the hook
+never said which build it was for — `await_import()` had to infer "is this
+newest thing the one I'm waiting for?" from timing alone. The Stable job's
+own trigger (`trigger-release-master-job` in `liferay-jenkins-ee`) now passes
+`PORTAL_GIT_COMMIT` — the exact commit it was testing — as a build parameter,
+which `triage_jenkins.sh` forwards as `PORTAL_GIT_COMMIT` and `scan` reads as
+`--trigger-git-commit` (env `TRIAGE_TRIGGER_GIT_COMMIT`).
+
+With a commit in hand, `find_build_by_commit()` asks Testray directly —
+`gitHash eq '<commit>'`, scoped to the routine — and `await_import_for_commit()`
+waits on that answer alone: found and DONE, or not yet, never "is this the
+right build?". No baseline, no settle window, because there is no ambiguity
+left to resolve. Confirmed live 2026-09-17 against a real Stable build
+(commit `351635bc2d7e9120a7448fa35b8cb276e8b302df`, build `526135739`):
+`find_build_by_commit` returned the exact row, `DONE`.
+
+`_looks_like_commit()` guards the one way this can go wrong without the
+Jenkins side misbehaving: Ant does not blank out an unresolved property the
+way a shell would — `${env.PORTAL_GIT_COMMIT}` left unresolved would arrive
+here as that literal string, not as empty. A value that is not exactly 40
+hex characters is treated as absent and falls back to `await_import()`'s
+heuristic, silently — a malformed commit must never reach a Testray filter
+as though it were real.
+
 ### Two queues, one drainer
 
 The TriageRun Object exists only where the analytics client extension is
