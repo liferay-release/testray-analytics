@@ -159,8 +159,8 @@ function main {
 
 	if [[ "$(hostname)" =~ ^release-slave-[1-4]$ ]]
 	then
-		export TESTRAY_CLIENT_ID=$("${_PROJECT_DIR}/scripts/get-credential.sh" "Testray OAuth - Liferay Release User" "username")
-		export TESTRAY_CLIENT_SECRET=$("${_PROJECT_DIR}/scripts/get-credential.sh" "Testray OAuth - Liferay Release User" "password")
+		export TESTRAY_CLIENT_ID=$("${_PROJECT_DIR}/scripts/get_credential.sh" "Testray OAuth - Liferay Release User" "username")
+		export TESTRAY_CLIENT_SECRET=$("${_PROJECT_DIR}/scripts/get_credential.sh" "Testray OAuth - Liferay Release User" "password")
 
 		if [ -z "${TESTRAY_CLIENT_ID}" ] || [ -z "${TESTRAY_CLIENT_SECRET}" ]
 		then
@@ -187,7 +187,7 @@ function main {
 	then
 		if [[ "$(hostname)" =~ ^release-slave-[1-4]$ ]]
 		then
-			export ANTHROPIC_API_KEY=$("${_PROJECT_DIR}/scripts/get-credential.sh" "Release Team Claude API Token" "credential")
+			export ANTHROPIC_API_KEY=$("${_PROJECT_DIR}/scripts/get_credential.sh" "Release Team Claude API Token" "credential")
 
 			if [ -z "${ANTHROPIC_API_KEY}" ]
 			then
