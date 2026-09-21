@@ -643,6 +643,40 @@ def _inherited_note(meta: dict, results: list, report_url: str) -> list[str]:
                 f"builds, not re-analyzed — see {where} in the report."]
 
 
+def render_blocked(meta: dict, stuck: list) -> str:
+    """The message for pairs a dead TriageRun row has parked.
+
+    A siren, unlike `render_recurrence`: this IS new, in the sense that
+    matters — the failure has never been explained and, left alone, never will
+    be. The row has to be cleared by hand or re-queued with `--force`, so the
+    message names the pair rather than only the build, because the pair is what
+    the fix takes as an argument.
+    """
+    build_b = _text(meta.get("build_b_name")) or _text(meta.get("build_id_b"))
+    head = _trim(_short_build_name(build_b), 58)
+    where = _link(_build_url(meta, meta.get("build_id_b")), head) if head else ""
+
+    n = len(stuck)
+    lines = [f"🚨 *{where or 'This routine'}* — {n} build pair"
+             f"{'s' if n != 1 else ''} could not be analyzed and nothing will "
+             f"retry {'them' if n != 1 else 'it'}."]
+
+    for job, status in stuck[:MAX_BLOCKS]:
+        name = _text(getattr(job, "name", "")) or "unknown pair"
+        sigs = list(getattr(job, "signatures", None) or [])
+        lines.append(f"> `{name}` — TriageRun is *{status}*"
+                     + (f", {len(sigs)} unexplained signature(s)" if sigs else ""))
+    if n > MAX_BLOCKS:
+        lines.append(f"> _… and {n - MAX_BLOCKS} more._")
+
+    # No instruction for HOW to clear it. The command belongs in the job log
+    # and the runbook, not in a channel where the people reading are being told
+    # a build is unexplained — and a re-queue costs a full classify, which is
+    # not a thing to invite by copy-paste.
+    lines += ["", "*Human review required.*"]
+    return "\n".join(lines)
+
+
 def render_recurrence(meta: dict, repeats: dict) -> str:
     """The message for a tick that analysed nothing because nothing was new.
 

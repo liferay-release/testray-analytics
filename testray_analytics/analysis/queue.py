@@ -36,6 +36,22 @@ from pathlib import Path
 
 from .config import resolve_path
 
+# Statuses a blocking row can carry that mean "the drainer is going to get to
+# this". Anything else — FAILED above all — means nobody will, and a scan that
+# treats the two the same reports a dead pair as work in progress. That is not
+# hypothetical: pair 79529-527680167-527702480 failed in `prepare` on
+# 2026-09-21, kept its FAILED row, and every tick after it said "already
+# queued" while `watch` (which claims QUEUED only) said "Nothing queued".
+# Neither would ever touch it again, and two red Stable builds sat unanalysed
+# and unannounced behind it.
+LIVE_STATUSES = frozenset({"QUEUED", "RUNNING"})
+
+# ...and DONE, which needs no action for the opposite reason: it is the answer.
+# On an instance with no verdict store the file queue's `done` directory is the
+# ONLY memory that a pair was analysed, so counting it as a dead row would
+# re-report every finished pair as needing a human.
+SETTLED_STATUSES = LIVE_STATUSES | {"DONE"}
+
 QUEUE_ENV          = "TRIAGE_QUEUE"
 DEFAULT_QUEUE_PATH = "state/queue"
 
@@ -142,6 +158,32 @@ class FileQueue:
             raise
         return True
 
+    def blocking_status(self, job: Job) -> str:
+        """Why `register` would refuse this job, or "" if it would not.
+
+        This backend cannot deadlock the way the Testray one can: `release`
+        deletes the marker, so a failed job leaves nothing behind and the pair
+        is eligible on the next tick. The method exists so the scanner can ask
+        both backends the same question.
+        """
+        if (self.dir / f"{job.name}.json").exists():
+            return "QUEUED"
+        if (self.done_dir / f"{job.name}.json").exists():
+            return "DONE"
+        return ""
+
+    def requeue(self, job: Job) -> bool:
+        """Make a settled job eligible again. True when something changed.
+
+        Only reachable for a DONE job here: this backend drops a failed job's
+        marker outright, so it has no dead state to recover from.
+        """
+        done = self.done_dir / f"{job.name}.json"
+        if not done.exists():
+            return False
+        done.unlink()
+        return self.register(job)
+
     def pending(self) -> list[Job]:
         """Queued jobs, oldest first — a backlog drains in the order it arrived."""
         if not self.dir.exists():
@@ -238,6 +280,24 @@ class TestrayQueue:
         except Exception:                                        # noqa: BLE001
             return False
 
+    def blocking_status(self, job: Job) -> str:
+        """The status of the row that would make `register` refuse, or "".
+
+        Read separately rather than returned from `register` so the bool
+        contract the file queue and its tests share stays intact. It costs one
+        GET, and only for a pair that was actually refused.
+        """
+        from .testray_writer import _run_erc_path
+        import urllib.error
+        try:
+            body = self.session.request("GET", _run_erc_path(job.name)) or {}
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                return ""
+            raise
+        status = (body.get("triageRunStatus") or {})
+        return str(status.get("key") or "").strip().upper() or "UNKNOWN"
+
     def register(self, job: Job) -> bool:
         """Upsert a QUEUED row. Returns False when one is already pending.
 
@@ -258,6 +318,26 @@ class TestrayQueue:
             "triageRunStatus": {"key": "QUEUED"},
             "r_baselineBuildToTriageRuns_c_buildId": job.baseline_build,
             "r_buildToTriageRuns_c_buildId": job.target_build,
+        })
+        return True
+
+    def requeue(self, job: Job) -> bool:
+        """Put an existing row back to QUEUED so the drainer claims it again.
+
+        The only way out of a dead row. `register` refuses whenever a row
+        exists — deliberately, since re-queueing a RUNNING pair would reset a
+        live job's status under the drainer — and `watch` claims QUEUED only,
+        so a FAILED row is a state nothing in the pipeline can leave. It has to
+        be an explicit act, which is why this is `--force` and not a retry.
+
+        `errorMessage` is cleared with it: leaving the last failure's text on a
+        row that is about to run again makes the diamond's tooltip describe a
+        run that is no longer happening.
+        """
+        from .testray_writer import _run_erc_path
+        self.session.request("PATCH", _run_erc_path(job.name), {
+            "triageRunStatus": {"key": "QUEUED"},
+            "errorMessage": "",
         })
         return True
 

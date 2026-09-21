@@ -762,3 +762,36 @@ def test_a_bundle_with_no_aggregate_key_is_unaffected(tmp_path):
     text = S.render(bundle(tmp_path, []))
     assert "Top Level Build failed" not in text
     assert "auto-classified or excluded upstream" in text
+
+
+# --- A pair nothing will retry ----------------------------------------------
+
+class _Job:
+    def __init__(self, name, signatures=()):
+        self.name, self.signatures = name, list(signatures)
+
+
+def test_a_blocked_pair_is_announced_as_a_siren(tmp_path):
+    """Unlike the recurrence message, this one competes for attention on
+    purpose: the failure has never been explained and, left alone, never
+    will be."""
+    text = S.render_blocked(
+        {**STABLE_META, "build_id_b": 222},
+        [(_Job("79529-527680167-527702480", ["v3:ca61ca98281c6797"]), "FAILED")])
+    assert text.startswith("🚨 ")
+    assert "79529-527680167-527702480" in text, "the pair is what the fix takes"
+    assert "*FAILED*" in text
+    assert "*Human review required.*" in text
+
+
+def test_a_blocked_message_does_not_claim_nothing_is_wrong(tmp_path):
+    """The line it replaces — "no new failures; each one was analyzed already"
+    — is the exact opposite of true for a parked pair."""
+    text = S.render_blocked(STABLE_META, [(_Job("79529-1-2"), "FAILED")])
+    assert "analyzed already" not in text
+
+
+def test_many_blocked_pairs_are_capped(tmp_path):
+    stuck = [(_Job(f"79529-{i}-{i + 1}"), "FAILED") for i in range(9)]
+    text = S.render_blocked(STABLE_META, stuck)
+    assert "… and 3 more." in text

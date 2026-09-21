@@ -126,3 +126,54 @@ def test_done_records_do_not_look_like_pending_work(tmp_path):
 
     assert [j.target_build for j in q.pending()] == [3]
     assert len(q) == 1
+
+
+# --- The deadlock: a dead row nothing will retry -----------------------------
+
+def test_a_marker_queue_reports_why_it_refused(tmp_path):
+    """The file backend cannot deadlock — release() deletes the marker — but it
+    answers the same question, so the scanner can ask both the same way."""
+    q = FileQueue(tmp_path)
+    job = Job(79529, 1, 2, [SIG_A])
+    assert q.blocking_status(job) == ""
+    q.register(job)
+    assert q.blocking_status(job) == "QUEUED"
+    q.release(job)
+    assert q.blocking_status(job) == "", "a released job must be eligible again"
+    q.register(job)
+    q.complete(job)
+    assert q.blocking_status(job) == "DONE"
+
+
+def test_failed_is_not_a_live_status():
+    """The whole bug in one assertion. `scan` refuses to re-queue a pair that
+    has a row and `watch` claims QUEUED only, so a FAILED row parks the pair
+    forever — on 2026-09-21 it parked two red Stable builds. Anything outside
+    this set has to be reported, not counted as work in progress."""
+    from testray_analytics.analysis.queue import (LIVE_STATUSES,
+                                                   SETTLED_STATUSES)
+    assert "QUEUED" in LIVE_STATUSES and "RUNNING" in LIVE_STATUSES
+    assert "FAILED" not in SETTLED_STATUSES
+    # DONE needs no action for the opposite reason — it is the answer, and on
+    # an instance with no verdict store it is the only record that there was
+    # one.
+    assert "DONE" in SETTLED_STATUSES and "DONE" not in LIVE_STATUSES
+
+
+def test_force_can_recover_a_settled_job(tmp_path):
+    """`--force` has to reach past `register`, which refuses on ANY existing
+    record. Without that, the BLOCKED message tells a reader to run a command
+    that does nothing and the pair stays parked."""
+    q = FileQueue(tmp_path)
+    job = Job(79529, 1, 2, [SIG_A])
+    q.register(job)
+    q.complete(job)
+    assert q.register(job) is False, "register alone must still refuse"
+    assert q.requeue(job) is True
+    assert q.blocking_status(job) == "QUEUED"
+    assert [j.name for j in q.pending()] == [job.name]
+
+
+def test_requeue_is_a_no_op_for_a_job_the_queue_never_settled(tmp_path):
+    q = FileQueue(tmp_path)
+    assert q.requeue(Job(79529, 1, 2, [SIG_A])) is False

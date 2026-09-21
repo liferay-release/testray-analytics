@@ -339,7 +339,13 @@ function main {
 		# Notifier's ${FILE,path=...} template (notifySuccess) needs something
 		# to read even though nothing was analysed this time.
 		log "note: no Slack message was written — submit did not run"
-		ensure_slack_fallback "ℹ️ Triage tick completed — nothing was submitted this run (no new work queued)."
+		# Deliberately does not say WHY. It used to add "(no new work
+		# queued)", which was a guess this step cannot make: on 2026-09-21 it
+		# said exactly that for a tick whose only red pair was parked behind a
+		# FAILED TriageRun row. scan and submit know the reason and write their
+		# own message when there is one; this is only the fallback that keeps
+		# the Slack Notifier's ${FILE,path=...} template from reading nothing.
+		ensure_slack_fallback "ℹ️ Triage tick completed — nothing was submitted this run."
 	fi
 
 	log "done"

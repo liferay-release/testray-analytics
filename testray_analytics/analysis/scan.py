@@ -33,7 +33,7 @@ from . import ledger as L
 from .config import resolve_path
 from .prepare import (_testray_oauth_token, fetch_one_page, fetch_paginated,
                       load_config, testray_target)
-from .queue import Job, open_queue, queue_path
+from .queue import SETTLED_STATUSES, Job, open_queue, queue_path
 
 # Cadence lives in the environment, like the job-runner's crontab expression.
 SCAN_INTERVAL_ENV = "TRIAGE_SCAN_INTERVAL"
@@ -413,7 +413,8 @@ def scan(cfg: dict, routine_id: int, *, queue_dir: Path,
          dry_run: bool = False, force: bool = False) -> dict:
     """One tick. Prints what it found; returns a summary.
 
-    `force` re-queues pairs that already have a finished TriageRun. It is the
+    `force` re-queues pairs that already have a TriageRun — finished OR dead.
+    A dead one is the case that cannot be recovered any other way. It is the
     only way back to a pair once it has been analysed, since the row in Testray
     is deliberately permanent — see analysed_pairs().
     """
@@ -477,6 +478,9 @@ def scan(cfg: dict, routine_id: int, *, queue_dir: Path,
             print(f"Runs on file:     {len(done_pairs)} pair(s) already analysed")
 
     queued = skipped = n_new = n_active = n_norange = n_done = 0
+    # (job, status) for pairs a dead row is blocking. Not a counter: the
+    # Slack note has to name them.
+    stuck: list = []
     # Dry-run has to model the real queue's idempotency, or it reports work a
     # real run would skip: two catch-up builds carrying the same signature
     # converge on one job, and saying "2 queued" would be a lie.
@@ -538,16 +542,49 @@ def scan(cfg: dict, routine_id: int, *, queue_dir: Path,
                 queued += 1
                 print(f"      queued {job.name}  ({len(sigs)} signature(s))")
             else:
-                skipped += 1
-                print(f"      already queued {job.name}")
+                # WHY it was refused decides whether this build has been
+                # answered. A QUEUED or RUNNING row is work `watch` is about to
+                # do; anything else is a pair nothing will ever pick up, and
+                # reporting the two the same way is what let a FAILED row
+                # silently park two red builds (see queue.SETTLED_STATUSES).
+                status = ""
+                try:
+                    status = q.blocking_status(job)
+                except Exception as e:                            # noqa: BLE001
+                    # A lookup that fails must not fail the scan: the job was
+                    # still refused, which is all the caller needs to proceed.
+                    print(f"      ! could not read the blocking row for "
+                          f"{job.name}: {e}", file=sys.stderr)
+                if status and status not in SETTLED_STATUSES and force:
+                    # The only way out of a dead row, and the reason --force
+                    # has to reach past `register`: register refuses on ANY
+                    # row, so without this the instruction the BLOCKED message
+                    # gives a reader does nothing and the pair stays parked.
+                    q.requeue(job)
+                    queued += 1
+                    print(f"      --force: re-queued {job.name} from {status} "
+                          f"({len(sigs)} signature(s))")
+                elif status and status not in SETTLED_STATUSES:
+                    stuck.append((job, status))
+                    print(f"      BLOCKED {job.name} — its TriageRun is "
+                          f"{status}; nothing retries it "
+                          f"({len(sigs)} signature(s); --force to re-queue)")
+                else:
+                    skipped += 1
+                    print(f"      already queued {job.name}")
 
     print(f"\nSignatures: {n_new} unexplained, {n_active} with a verdict on file")
     print(f"Jobs: {queued} queued"
           + (f", {skipped} already registered" if skipped else "")
+          + (f", {len(stuck)} BLOCKED by a dead row" if stuck else "")
           + (f", {n_done} already analysed" if n_done else "")
           + (f", {n_norange} skipped for want of a baseline" if n_norange else ""))
     if dry_run:
         print("\n--dry-run: nothing was written to the queue.")
+    elif stuck:
+        # Said instead of the recurrence message, not beside it: "no new
+        # failures, each one was analyzed already" is the opposite of true here.
+        _post_stuck(tr, routine_id, targets[0] if targets else None, by_id, stuck)
     elif queued == 0 and skipped == 0 and n_done and targets:
         # Red, but nothing to run: every pair is already analysed. `watch` will
         # find an empty queue and `submit` will never execute, so nothing else
@@ -563,6 +600,44 @@ def scan(cfg: dict, routine_id: int, *, queue_dir: Path,
     return {"targets": len(targets), "queued": queued, "skipped": skipped,
             "new": n_new, "active": n_active, "no_range": n_norange,
             "analysed": n_done}
+
+
+def _post_stuck(tr: dict, routine_id, build_id, by_id: dict, stuck: list) -> None:
+    """Announce pairs that no longer have anything willing to run them.
+
+    A dead TriageRun row is invisible from both ends: `scan` will not re-queue
+    a pair that has a row, and `watch` claims QUEUED rows only, so a FAILED one
+    parks the pair forever. Nothing downstream runs, which means nothing
+    downstream can report it either — the tick falls through to the Jenkins
+    job's "nothing was submitted this run" notice and reads as a quiet day.
+
+    Never fatal, for the same reason `_post_recurrence` is not: the scan's own
+    job was done correctly and must not be reported as failed because a
+    courtesy message could not be rendered.
+    """
+    try:
+        from . import slack_message
+
+        build = by_id.get(build_id) or {}
+        meta = {
+            "routine_id": routine_id,
+            "project_id": (build.get("r_projectToBuilds_c_projectId")
+                           or tr.get("project_id")),
+            "testray_url": tr.get("ui_url") or tr.get("base_url"),
+            "build_id_b": build_id,
+            "build_b_name": build.get("name") or str(build_id or ""),
+        }
+        text = slack_message.render_blocked(meta, stuck)
+        target = resolve_path(None, slack_message.OUT_REL)
+        if os.environ.get("TRIAGE_SLACK_APPEND") == "1":
+            slack_message.append_to_post(target, text)
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(text, encoding="utf-8")
+        print(f"\nBLOCKED: {len(stuck)} pair(s) — message written to {target}")
+    except (Exception, SystemExit) as e:                          # noqa: BLE001
+        print(f"\n! could not write the blocked-pair message: {e}",
+              file=sys.stderr)
 
 
 def _post_recurrence(tr: dict, routine_id, build_id, by_id: dict) -> None:
