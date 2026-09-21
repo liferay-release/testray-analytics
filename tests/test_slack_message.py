@@ -189,6 +189,76 @@ def test_reasoning_is_labelled_like_the_report_column(tmp_path):
     assert "> *Reasoning:* because" in text
 
 
+REASONING = ("The build-services check fails because the service-builder "
+             "verify step produces an uncommitted diff. Auto SF re-sorted the "
+             "Java terms in BlogsEntryServiceHttp.java, so the regenerated "
+             "file differs from the committed one.")
+
+
+def test_reasoning_is_cut_to_one_sentence_with_a_link_to_the_rest(tmp_path):
+    """The channel gets the conclusion; the report keeps the argument.
+
+    A reasoning paragraph in Slack was read as the answer, because none of the
+    evidence that makes it checkable — the diff, the error text — is beside it
+    there. One sentence and a link is the same information with the weight put
+    back where it can be judged.
+    """
+    d = bundle(tmp_path, [verdict(1, "BUG", reason=REASONING)])
+    text = S.render(d, report_url="https://x/report")
+
+    assert ("> *Reasoning:* The build-services check fails because the "
+            "service-builder verify step produces an uncommitted diff. "
+            "<https://x/report|Read more…>") in text
+    assert "Auto SF re-sorted" not in text
+
+
+def test_the_read_more_link_prefers_the_testray_triage_view(tmp_path):
+    """Same order as the two report rows in the header: Testray is where the
+    team already works and where the verdicts live."""
+    d = bundle(tmp_path, [verdict(1, "BUG", reason=REASONING)])
+    text = S.render(d, report_url="https://x/report", link_testray=True)
+    assert ("<https://testray.liferay.com/web/testray/triage?buildId=222"
+            "|Read more…>") in text
+    assert "|Read more…>" in text and "https://x/report|Read more…" not in text
+
+
+def test_a_one_sentence_reasoning_gets_no_read_more(tmp_path):
+    """A link that adds nothing teaches the channel not to follow links."""
+    d = bundle(tmp_path, [verdict(1, "BUG", reason="The module was renamed.")])
+    text = S.render(d, report_url="https://x/report")
+    assert "> *Reasoning:* The module was renamed." in text
+    assert "Read more" not in text
+
+
+def test_reasoning_survives_in_full_when_there_is_nowhere_to_link(tmp_path):
+    """No analytics CX and no published report. Cutting the paragraph here
+    would delete it, not relocate it."""
+    text = S.render(bundle(tmp_path, [verdict(1, "BUG", reason=REASONING)]))
+    assert "Read more" not in text
+    assert "Auto SF re-sorted" in text
+
+
+def test_a_dotted_identifier_is_not_a_sentence_boundary(tmp_path):
+    """`BlogsEntryServiceHttp.java` and `com.liferay.portal.kernel` used to end
+    the first sentence, which put the whole finding behind the link."""
+    reason = ("com.liferay.portal.kernel.NoSuchLayoutException is thrown by "
+              "LayoutLocalServiceImpl.java at line 412. The commit in range "
+              "removed the fallback.")
+    d = bundle(tmp_path, [verdict(1, "BUG", reason=reason)])
+    text = S.render(d, report_url="https://x/report")
+    assert "LayoutLocalServiceImpl.java at line 412." in text
+    assert "removed the fallback" not in text
+
+
+def test_an_abbreviation_does_not_end_the_sentence(tmp_path):
+    reason = ("The listener runs without the flag, e.g. When setUp calls it "
+              "directly, and _validate then throws. A later commit hid it.")
+    d = bundle(tmp_path, [verdict(1, "BUG", reason=reason)])
+    text = S.render(d, report_url="https://x/report")
+    assert "_validate then throws." in text
+    assert "A later commit hid it" not in text
+
+
 def test_the_testray_link_is_opt_in(tmp_path):
     """The triage view reads TriageResult rows. Linking it before the upsert
     lands — or on an instance with no analytics CX — sends the channel to an

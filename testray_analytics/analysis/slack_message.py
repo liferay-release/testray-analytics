@@ -61,8 +61,10 @@ ACTIONABLE = {"BUG", "POSSIBLE_BUG", "TEST_FIX"}
 # report is the right surface.
 MAX_BLOCKS = 6
 
-# Trim length for the reasoning paragraph. Slack soft-wraps long lines into
-# unreadable walls, and the reasoning is already on the report in full.
+# Backstop for the reasoning row. The row is normally one sentence plus a
+# `Read more…` link, so this only bites on reasoning with no sentence boundary
+# in it at all — a pasted stack trace, which is exactly the case that used to
+# fill the channel with a wall.
 #
 # There is deliberately no cap on a candidate's `why`. It used to be cut at 200
 # characters, which reliably severed the sentence naming the mechanism — the
@@ -80,6 +82,39 @@ def _flat(text: str) -> str:
     """Collapse whitespace without shortening. Slack renders a newline inside a
     `>` quote as an unquoted line, so the text still has to be one line."""
     return " ".join(_text(text).split())
+
+
+# A sentence boundary: `.`, `?` or `!`, then whitespace, then something that
+# starts a new sentence. Requiring the whitespace AND the capital is what keeps
+# `BlogsEntryServiceHttp.java diff` and `com.liferay.portal.kernel` in one
+# piece — a dotted identifier has no space after the dot, and a file extension
+# is lowercase. Splitting naively on "." cut the reasoning at the first class
+# name it mentioned, which is nearly always inside sentence one.
+_SENTENCE_END_RE = re.compile(r"""(?<=[.!?])\s+(?=["'(\[]?[A-Z0-9])""")
+
+# These end in a period without ending a sentence. Without the guard, a
+# reasoning that opens "The check fails, e.g. When the flag is off…" renders a
+# four-word first sentence and hides the rest behind the link.
+_ABBREVIATIONS = frozenset(("e.g.", "i.e.", "cf.", "vs.", "etc.", "resp.",
+                            "approx.", "no.", "fig.", "ver.", "al."))
+
+
+def _first_sentence(text: str) -> tuple[str, bool]:
+    """The first sentence, and whether anything followed it.
+
+    The caller needs the second half of that pair: a `Read more…` link on a
+    reasoning that was already complete sends a reader to the report to find
+    nothing new, which teaches them the link is not worth following.
+    """
+    s = _flat(text)
+    for m in _SENTENCE_END_RE.finditer(s):
+        head = s[:m.start()]
+        last = head.rsplit(" ", 1)[-1].casefold()
+        # An abbreviation, or an initial like `J.` — neither ends a sentence.
+        if last in _ABBREVIATIONS or len(last.rstrip(".")) <= 1:
+            continue
+        return head, True
+    return s, False
 
 
 def _trim(text: str, cap: int) -> str:
@@ -345,7 +380,7 @@ def _cause_row(meta: dict, result: dict, authors: dict | None = None) -> str:
 
 def _block(meta: dict, n: int, result: dict, cluster: dict,
            caseresult_ids: dict | None = None,
-           authors: dict | None = None) -> list[str]:
+           authors: dict | None = None, read_more_url: str = "") -> list[str]:
     """One `Failure --- N` block.
 
     Carries no verdict label. See `render` for why.
@@ -374,7 +409,22 @@ def _block(meta: dict, n: int, result: dict, cluster: dict,
     if cause:
         lines.append(cause)
 
-    reason = _trim(result.get("reason"), _REASON_MAX)
+    # One sentence, then the link. The reasoning is a paragraph written for
+    # the report, where it sits beside the diff and the error text that make it
+    # checkable; in the channel it arrived as a wall that stated a conclusion
+    # with none of that beside it, so it was read as the answer instead of as
+    # the claim it is. The opening sentence says WHAT the model concluded,
+    # which is the part a reader can act on, and the link is where the rest of
+    # it can be weighed.
+    first, more = _first_sentence(result.get("reason"))
+    if more and read_more_url:
+        reason = (f"{_trim(first, _REASON_MAX)} "
+                  f"{_link(read_more_url, 'Read more…')}")
+    else:
+        # Nowhere to send them, so the text has to carry itself — hiding the
+        # rest behind a `Read more…` that goes nowhere loses it outright. This
+        # is the instance with no analytics CX and no published report.
+        reason = _trim(result.get("reason"), _REASON_MAX)
     if reason:
         lines.append(f"> *Reasoning:* {reason}")
 
@@ -645,14 +695,19 @@ def render(run_dir: Path, *, report_url: str = "",
     # published one is the standalone HTML, which is what exists on an
     # instance whose Objects are not deployed. Both sit above the cluster count
     # so the two "where do I read this" rows stay together under the build.
-    if link_testray:
-        tr = triage_url(meta)
-        if tr:
-            lines.append(f"• *Triage Report:* {_link(tr, 'open in Testray')}")
+    tr = triage_url(meta) if link_testray else ""
+    if tr:
+        lines.append(f"• *Triage Report:* {_link(tr, 'open in Testray')}")
 
     url = _text(report_url) or _text(meta.get("report_url"))
     if url:
         lines.append(f"• *Full Report:* {_link(url, 'report')}")
+
+    # Where `Read more…` on a block's reasoning points. Testray first, for the
+    # same reason the two rows above are in this order: it is where the team
+    # already works and where the verdicts now live. Empty when neither surface
+    # exists, and the blocks then print the reasoning in full.
+    read_more = tr or url
 
     total = _text(meta.get("total_failures"))
     lines.append(f"• *Clusters:* {len(results)} classified"
@@ -685,7 +740,7 @@ def render(run_dir: Path, *, report_url: str = "",
     for i, result in enumerate(ordered[:MAX_BLOCKS], start=1):
         cluster = clusters.get(_text(result.get("group_id")), {})
         lines += [""] + _block(meta, i, result, cluster, caseresult_ids,
-                               authors)
+                               authors, read_more)
 
     if len(ordered) > MAX_BLOCKS:
         lines += ["", f"_{len(ordered) - MAX_BLOCKS} further cluster(s) not "
