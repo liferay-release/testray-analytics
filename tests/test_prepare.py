@@ -99,3 +99,34 @@ def test_plain_commit_tuples_still_render_without_an_author():
     commit_lines = [l for l in lines if l.startswith("- `")]
 
     assert commit_lines == ["- `abc1234` LPD-1 Do a thing"]
+
+
+# --- The empty frame: the aggregate row was the only failure ----------------
+
+def test_enrich_survives_a_frame_emptied_by_dropping_the_aggregate_row():
+    """Build 19999 (2026-09-21) crashed the whole tick here.
+
+    `.map()` on an EMPTY Series keeps the string dtype rather than returning
+    bool, so the masks in enrich_and_pre_classify were combined with `&` as
+    StringArrays: `TypeError: unsupported operand type(s) for &`. Warnings are
+    errors in this test because the local pandas only warns and the Jenkins
+    agent's raises — that version gap is why it shipped.
+    """
+    import warnings
+    import pandas as pd
+    from testray_analytics.analysis import prepare
+
+    cols = ["testray_case_id", "test_case", "component_name", "team_name",
+            "status_a", "status_b", "transition", "known_flaky",
+            "linked_issues", "error_message", "baseline_error_message"]
+    one = pd.DataFrame({c: pd.Series(["x"], dtype="string") for c in cols})
+    one.loc[0, "test_case"] = "Top Level Build"
+    one.loc[0, "transition"] = prepare.TRANSITION_NEW
+
+    kept, dropped = prepare.drop_aggregate_rows(one)
+    assert len(kept) == 0 and dropped == {prepare.TRANSITION_NEW: 1}
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        out = prepare.enrich_and_pre_classify(kept)
+    assert len(out) == 0

@@ -963,7 +963,7 @@ def drop_aggregate_rows(df) -> tuple:
     """
     if "test_case" not in df.columns or df.empty:
         return df, {}
-    mask = df["test_case"].map(is_aggregate_row)
+    mask = _mask(df["test_case"], is_aggregate_row)
     n = int(mask.sum())
     if not n:
         return df, {}
@@ -1826,6 +1826,23 @@ def run_extract_hunks(diff_path: Path, fragments_path: Path, out_path: Path) -> 
 # Step 5: component/team enrichment (optional) + pre-classification
 # ---------------------------------------------------------------------------
 
+def _mask(series, fn) -> "pd.Series":
+    """`series.map(fn)` as a real boolean mask.
+
+    `.map()` on an EMPTY Series keeps the ORIGINAL dtype — `string`, not
+    `bool` — because there are no results to infer one from. The masks here
+    are then combined with `&`, `|` and `~`, and on pandas 4 that is a
+    `TypeError: unsupported operand type(s) for &: 'StringArray' and
+    'StringArray'` instead of an empty mask.
+
+    It took down a real Stable tick (build 19999, 2026-09-21): the only new
+    failure was the aggregate `Top Level Build` row, `drop_aggregate_rows`
+    removed it as it is meant to, and everything after ran on an empty frame.
+    The job still reported SUCCESS, so nobody saw it for a day.
+    """
+    return series.map(fn).astype(bool)
+
+
 def _explainable(df: pd.DataFrame) -> "pd.Series":
     """Rows the classifier can actually say something about.
 
@@ -1843,9 +1860,9 @@ def _explainable(df: pd.DataFrame) -> "pd.Series":
     the rules that used to withhold them — BATCH_FAILURE on a shard name,
     NO_BASELINE on a new test — now only apply when one of those is missing.
     """
-    failing = df["status_b"].map(lambda v: str(v).strip().upper() == "FAILED") \
-        if "status_b" in df.columns else pd.Series(True, index=df.index)
-    return failing & df["error_message"].map(lambda e: not _is_blank(e))
+    failing = _mask(df["status_b"], lambda v: str(v).strip().upper() == "FAILED") \
+        if "status_b" in df.columns else pd.Series(True, index=df.index, dtype=bool)
+    return failing & _mask(df["error_message"], lambda e: not _is_blank(e))
 
 
 def enrich_and_pre_classify(df: pd.DataFrame) -> pd.DataFrame:
@@ -1862,7 +1879,7 @@ def enrich_and_pre_classify(df: pd.DataFrame) -> pd.DataFrame:
     # first and filled from Testray only where the map returned nothing, which
     # silently replaced real Testray teams with mapped ones.
     mapped = df["component_name"].apply(prompt_helpers.team_for_component)
-    keep = ~df["team_name"].map(_is_blank)
+    keep = ~_mask(df["team_name"], _is_blank)
     df["team_name"] = df["team_name"].astype(object).where(keep, mapped)
 
     df["pre_classification"] = df["error_message"].apply(
@@ -1882,14 +1899,16 @@ def enrich_and_pre_classify(df: pd.DataFrame) -> pd.DataFrame:
     excluded = [str(c).strip().lower()
                 for c in (cfg.get("excluded_components")
                           or DEFAULT_EXCLUDED_COMPONENTS)]
-    is_batch = pd.Series(False, index=df.index)
+    is_batch = pd.Series(False, index=df.index, dtype=bool)
     if "test_case" in df.columns:
-        is_batch |= df["test_case"].map(
+        is_batch |= _mask(
+            df["test_case"],
             lambda n: (not _is_blank(n))
             and bool(_BATCH_SHARD_RE.match(str(n).strip()))
         )
     if excluded and "component_name" in df.columns:
-        is_batch |= df["component_name"].map(
+        is_batch |= _mask(
+            df["component_name"],
             lambda c: (not _is_blank(c)) and str(c).strip().lower() in excluded
         )
     # Only where no more specific pattern already fired — an error-text match
@@ -2128,6 +2147,7 @@ def write_run_yml(run_dir: Path, *, run_id: str,
                   git_remote: str | None = None,
                   repo_slug: str | None = None,
                   transition_counts: dict | None = None,
+                  aggregate_dropped: dict | None = None,
                   baseline_rows: int | None = None,
                   target_rows: int | None = None,
                   status_matrix: dict | None = None,
@@ -2165,6 +2185,15 @@ def write_run_yml(run_dir: Path, *, run_id: str,
         "baseline_rows":       baseline_rows,
         "target_rows":         target_rows,
         "transition_counts":   dict(transition_counts or {}) or None,
+        # `{transition: count}` for the `Top Level Build` rows removed from
+        # the triage set. Recorded because REMOVING it is what makes a
+        # build-break look like a clean build: Stable halts on first
+        # failure, so the build-level row is FAILED and every test is
+        # UNTESTED, and once it is dropped there is nothing left to
+        # classify. Without this the Slack message says "every failure was
+        # auto-classified or excluded upstream" — true of the mechanism,
+        # wrong about the build.
+        "aggregate_dropped":   dict(aggregate_dropped or {}) or None,
         "status_matrix":       dict(status_matrix or {}) or None,
         # The anti-join the status_matrix cannot show: cases one build ran
         # and the other did not. Read by the report's Compared pill.
@@ -3797,6 +3826,7 @@ def _finalize_bundle(
     project_id: int | None = None,
     testray_url: str | None = None,
     transition_counts: dict | None = None,
+    aggregate_dropped: dict | None = None,
     baseline_rows: int | None = None,
     target_rows: int | None = None,
     status_matrix: dict | None = None,
@@ -3896,8 +3926,8 @@ def _finalize_bundle(
     # PRE_EXISTING fill can reach it (that fill is .isna()-gated on purpose,
     # so the more specific pattern wins), and keying on the tag let exactly
     # those rows leak back into the grouping and change the prompt.
-    is_report_only = df["transition"] == TRANSITION_SAME_FAILURE
-    is_flaky       = df["known_flaky"].fillna(False)
+    is_report_only = (df["transition"] == TRANSITION_SAME_FAILURE).astype(bool)
+    is_flaky       = df["known_flaky"].fillna(False).astype(bool)
 
     # The buckets below describe the CLASSIFY population, so report-only rows
     # are taken out of all of them first and counted on their own. Folding them
@@ -3905,8 +3935,8 @@ def _finalize_bundle(
     # excluded" for a run where only one flaky row was ever a candidate.
     df_pre_ex   = df[is_report_only].copy()
     df_cand     = df[~is_report_only]
-    df_flaky    = df_cand[df_cand["known_flaky"].fillna(False)].copy()
-    df_nonflaky = df_cand[~df_cand["known_flaky"].fillna(False)].copy()
+    df_flaky    = df_cand[df_cand["known_flaky"].fillna(False).astype(bool)].copy()
+    df_nonflaky = df_cand[~df_cand["known_flaky"].fillna(False).astype(bool)].copy()
     df_auto     = df_nonflaky[df_nonflaky["pre_classification"].notna()].copy()
     df_to_cls   = df_nonflaky[df_nonflaky["pre_classification"].isna()].copy()
     print(f"   {len(df)} unique cases: "
@@ -4027,6 +4057,7 @@ def _finalize_bundle(
         git_remote=git_remote,
         repo_slug=repo_slug,
         transition_counts=transition_counts,
+        aggregate_dropped=aggregate_dropped,
         baseline_rows=baseline_rows,
         target_rows=target_rows,
         status_matrix=status_matrix,
@@ -4187,6 +4218,7 @@ def prepare(baseline: SideSpec, target: SideSpec, classifier: str,
         project_id=project_id,
         testray_url=testray_ui_url(cfg["testray"]),
         transition_counts=dict(transitions),
+        aggregate_dropped=dict(dropped_aggregate),
         baseline_rows=len(baseline_df),
         target_rows=len(target_df),
         status_matrix=status_matrix,

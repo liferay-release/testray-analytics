@@ -711,3 +711,54 @@ def test_each_repeat_is_separated_from_the_next():
     assert len(bullets) == 2
     for i in bullets:
         assert out[i - 1] == "", "each entry needs a blank line before it"
+
+
+# --- The build break: Top Level Build failed and no test did ---------------
+#
+# Stable halts on first failure, so a broken build leaves Testray's own
+# build-level row FAILED and every test UNTESTED. prepare drops that row
+# (it is not a test), which leaves nothing to classify — and a run that
+# says nothing is indistinguishable from a healthy one. It runs unattended.
+
+
+def test_a_build_break_says_so_and_asks_for_a_human(tmp_path):
+    d = bundle(tmp_path, [], meta={"aggregate_dropped": {"new": 1}})
+    text = S.render(d)
+    assert "Nothing was submitted this run — but Top Level Build failed." in text
+    assert "*Human review required*" in text
+    # and NOT the generic line, which is true of the mechanism and wrong
+    # about the build.
+    assert "auto-classified or excluded upstream" not in text
+
+
+def test_a_build_break_raises_the_siren(tmp_path):
+    """No verdicts means the rollup is PENDING, which would otherwise pick the
+    magnifying glass — the quiet icon, on the one outcome nobody finds any
+    other way."""
+    d = bundle(tmp_path, [], meta={"aggregate_dropped": {"new": 1}})
+    assert S.render(d).startswith("🚨 ")
+
+
+def test_an_already_broken_build_does_not_re_raise_it(tmp_path):
+    """A same_failure aggregate row means the build was already broken.
+    _still_failing and _inherited_note cover that; warning again on every tick
+    of an already-red routine is how a channel learns to skip the warning."""
+    d = bundle(tmp_path, [], meta={"aggregate_dropped": {"same_failure": 1}})
+    text = S.render(d)
+    assert "Top Level Build failed" not in text
+    assert "auto-classified or excluded upstream" in text
+
+
+def test_a_run_with_verdicts_is_never_a_build_break(tmp_path):
+    """The note replaces the no-verdicts line. A pair that classified
+    something has news of its own and must not be buried under a warning."""
+    d = bundle(tmp_path, [verdict(1, "BUG")],
+               meta={"aggregate_dropped": {"new": 1}})
+    assert "Top Level Build failed" not in S.render(d)
+
+
+def test_a_bundle_with_no_aggregate_key_is_unaffected(tmp_path):
+    """Every run.yml written before this field existed."""
+    text = S.render(bundle(tmp_path, []))
+    assert "Top Level Build failed" not in text
+    assert "auto-classified or excluded upstream" in text

@@ -566,6 +566,46 @@ def _still_failing(meta: dict, repeats: dict) -> list[str]:
     return lines
 
 
+def _build_break_note(meta: dict) -> list[str]:
+    """The catch for a build that broke without any test failing.
+
+    Stable halts on first failure, so a build break leaves Testray's own
+    `Top Level Build` row FAILED and every test UNTESTED. That row is not a
+    test — it carries no error text and no code to attribute — so
+    `prepare.drop_aggregate_rows` removes it, and with it gone the pipeline
+    correctly finds nothing to classify and writes no verdicts.
+
+    Which is how build 19999 (2026-09-21) produced a green Jenkins job and a
+    Slack line reading "nothing was submitted this run (no new work queued)"
+    for a build that was red. The cause was real and findable — a bnd baseline
+    `VERSION INCREASE REQUIRED` — just not anywhere this pipeline can currently
+    read.
+
+    So the run says so itself rather than going quiet. It runs unattended;
+    nobody is watching the console to notice the silence.
+
+    Only for an aggregate row that failed IN THIS BUILD. A `same_failure` one
+    means the build was already broken, which `_still_failing` and
+    `_inherited_note` already say — crying wolf on every tick of an
+    already-red routine is how a channel learns to skip the warning.
+    """
+    dropped = meta.get("aggregate_dropped") or {}
+    if not isinstance(dropped, dict):
+        return []
+    fresh = sum(int(n or 0) for tr, n in dropped.items()
+                if str(tr).strip() != "same_failure")
+    if fresh < 1:
+        return []
+
+    return ["", "⚠️ *Nothing was submitted this run — but Top Level Build "
+                "failed.*",
+            "No test failure was recorded: Testray's build-level row is the "
+            "only failure, so there was nothing to classify and no verdict "
+            "was written.",
+            "*Human review required* — the cause is in the Jenkins console "
+            "linked above, not in Testray."]
+
+
 def _inherited_note(meta: dict, results: list, report_url: str) -> list[str]:
     """One line for the failures this build carried in and nobody re-analysed.
 
@@ -660,8 +700,14 @@ def render(run_dir: Path, *, report_url: str = "",
                        -int(_text(clusters.get(_text(r.get("group_id")), {})
                                   .get("case_count")) or 0)))
 
+    # Computed here because the siren depends on it: a build break produces no
+    # verdicts, so the rollup is PENDING and the headline would carry the
+    # magnifying glass — the quiet icon, on the one outcome nobody is going to
+    # find any other way.
+    build_break = _build_break_note(meta) if not results else []
+
     rollup = V.rollup([_verdict_of(r) for r in results]) if results else "PENDING"
-    siren = "🚨" if rollup in ACTIONABLE else "🔍"
+    siren = "🚨" if rollup in ACTIONABLE or build_break else "🔍"
 
     # The build name IS the link, and carries no `routine N build` preamble:
     # the routine is implied by the channel the message lands in, and the two
@@ -726,7 +772,12 @@ def render(run_dir: Path, *, report_url: str = "",
     # The siren on the headline still comes from the rollup, and the blocks are
     # still ordered worst-verdict-first. The verdict decides what a reader sees
     # FIRST; it just does not get to be what they see INSTEAD.
-    if not results and not repeats:
+    # Used instead of the generic "no verdicts" line, not beside it: for a
+    # build break, "every failure was auto-classified or excluded upstream" is
+    # a true statement about the mechanism and a wrong one about the build.
+    if build_break:
+        lines += build_break
+    elif not results and not repeats:
         # A pair with no verdicts AND no history is genuinely unexplained, and
         # that is not a verdict label — it is the absence of one, which nobody
         # can gloss over into "handled".
