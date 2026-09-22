@@ -1897,6 +1897,41 @@ def run_extract_hunks(diff_path: Path, fragments_path: Path, out_path: Path) -> 
     )
 
 
+def write_hunks(diff_path: Path, fragments: set[str], fragments_path: Path,
+                hunks_path: Path) -> str | None:
+    """Filter the diff down to the failing tests, falling back to the whole
+    diff when that filtering leaves nothing. Returns a warning to print, or
+    None when the filter worked.
+
+    Two ways to end up with no diff evidence, and only the first was handled:
+    no fragments to match with, and fragments that match no file. The second
+    looked like success — the step printed "3 fragments → hunks.txt" over a
+    zero-byte file — and it is the NORMAL outcome on a Poshi routine, whose
+    fragments are test class names (`DatabasePartitioning.java`) that appear
+    nowhere in a product diff. With the candidate-diff section also empty on
+    such a routine, the classifier saw no diff text at all and attributed a
+    db-partition failure to an unrelated commit on the word "audit" in its
+    subject line.
+
+    The full diff is a pool, not a payload: `parse_diff_blocks` selects
+    per-file blocks out of it per cluster, so the 2.8 MB fallback that Stable
+    has always taken renders a 529 KB prompt, not a 2.8 MB one.
+    """
+    if not fragments:
+        # Neither side carries case_name (e.g. api x api): no tokens to narrow
+        # the diff with in the first place.
+        hunks_path.write_bytes(diff_path.read_bytes())
+        return ("no test_case fragments (both sides lack case_name). "
+                "Copying full diff → hunks.txt unfiltered.")
+
+    run_extract_hunks(diff_path, fragments_path, hunks_path)
+    if hunks_path.stat().st_size:
+        return None
+    hunks_path.write_bytes(diff_path.read_bytes())
+    return (f"{len(fragments)} fragment(s) matched no file in the diff. "
+            f"Copying full diff → hunks.txt unfiltered.")
+
+
 # ---------------------------------------------------------------------------
 # Step 5: component/team enrichment (optional) + pre-classification
 # ---------------------------------------------------------------------------
@@ -3961,16 +3996,11 @@ def _finalize_bundle(
     fragments_path = run_dir / "test_fragments.txt"
     fragments_path.write_text("\n".join(sorted(fragments)), encoding="utf-8")
     hunks_path = run_dir / "hunks.txt"
-    if fragments:
-        run_extract_hunks(diff_path, fragments_path, hunks_path)
-        print(f"   {len(fragments)} fragments → {_disp(hunks_path)}")
+    warning = write_hunks(diff_path, fragments, fragments_path, hunks_path)
+    if warning:
+        print(f"   WARNING: {warning}", file=sys.stderr)
     else:
-        # Happens when neither side carries case_name (e.g. api × api): no
-        # tokens to narrow the diff. Fall back to the full diff; classify
-        # by reading hunks.txt directly.
-        hunks_path.write_bytes(diff_path.read_bytes())
-        print(f"   WARNING: no test_case fragments (both sides lack case_name). "
-              f"Copying full diff → hunks.txt unfiltered.", file=sys.stderr)
+        print(f"   {len(fragments)} fragments → {_disp(hunks_path)}")
 
     print(f"→ Step 5/6 enrich + pre-classify …")
     df = enrich_and_pre_classify(df)
