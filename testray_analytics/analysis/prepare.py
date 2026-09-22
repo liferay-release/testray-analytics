@@ -1069,7 +1069,22 @@ def fetch_caseresults(spec: SideSpec, cfg: dict) -> pd.DataFrame:
 
 def _aggregate_baseline(df: pd.DataFrame, key_cols: list[str]) -> pd.DataFrame:
     """Per key, status='PASSED' if any retry passed; else worst status wins.
-    Matches test_diff.sql semantics — any passing run counts as passing in A."""
+    Matches test_diff.sql semantics — any passing run counts as passing in A.
+
+    The passing row wins, but the non-passing rows it hides are not thrown
+    away: the worst of them rides along as `baseline_masked_status` /
+    `baseline_masked_errors`. `_aggregate_target` keeps the WORST row instead,
+    so on a routine that runs each case on several axes the two rules read the
+    same build in opposite directions — a case failing on one axis of three is
+    PASSED in A and FAILED in B, i.e. a brand-new regression, on every run
+    forever. ci:test:db-partition reported the LPD-92622 audit failure as new
+    for fifteen consecutive days that way, and ci:test:upgrade (3.0 rows per
+    case) had it on half its `new` rows. `compute_test_diff` re-reads such a
+    pair against the row that was actually masked.
+
+    Nothing is attached where a case has one row per build, so a routine whose
+    rows/case is 1.00 — Stable, CMS, headless — is untouched by this.
+    """
     if df.empty:
         return df
     df = df.copy()
@@ -1079,6 +1094,27 @@ def _aggregate_baseline(df: pd.DataFrame, key_cols: list[str]) -> pd.DataFrame:
     out = df.drop_duplicates(subset=key_cols, keep="first") \
             .drop(columns=["_is_pass", "_rank"]) \
             .reset_index(drop=True)
+
+    if "errors" not in df.columns:
+        return out
+
+    # Worst non-passing row per key, in the same rank order as above.
+    masked = df[df["_is_pass"] == 0].drop_duplicates(
+        subset=key_cols, keep="first")
+    if masked.empty:
+        return out
+
+    out = out.merge(
+        masked[key_cols + ["status", "errors"]].rename(
+            columns={"status": "baseline_masked_status",
+                     "errors": "baseline_masked_errors"}),
+        on=key_cols, how="left")
+
+    # Only a PASSED winner actually hid anything. Where the non-passing row won
+    # it IS the baseline row, and classify_transition already reads it.
+    kept_failing = out["status"] != "PASSED"
+    out.loc[kept_failing,
+            ["baseline_masked_status", "baseline_masked_errors"]] = None
     return out
 
 
@@ -1399,7 +1435,8 @@ def attach_history(df: pd.DataFrame, history: dict[int, list[dict]], *,
 
 def compute_test_diff(baseline: pd.DataFrame, target: pd.DataFrame,
                       *, matrix_out: dict | None = None,
-                      coverage_out: dict | None = None):
+                      coverage_out: dict | None = None,
+                      masked_out: dict | None = None):
     """Inner-join baseline and target and keep the §12 triage candidates —
     new failures *and changed* ones, not only PASSED→FAILED.
 
@@ -1471,6 +1508,44 @@ def compute_test_diff(baseline: pd.DataFrame, target: pd.DataFrame,
         for sa, sb, ea, eb in zip(merged["status_a"], merged["status_b"],
                                   merged["errors_a"], merged["errors_b"])
     ]
+
+    # A `new` row is not necessarily new. `_aggregate_baseline` resolves
+    # any-axis-passed to PASSED while `_aggregate_target` takes the worst row,
+    # so a case failing on one axis of three reads PASSED→FAILED every run —
+    # the same two db-partition tests were reported as a fresh regression on
+    # fifteen consecutive builds while failing identically on every one of
+    # them. Where the baseline hid a non-passing row, re-read the pair against
+    # THAT row through the same §12 matrix: a matching signature lands on
+    # same_failure, a different one on changed, exactly as a visible FAILED
+    # baseline would. Deliberately not a prevalence test —
+    # `baseline_signature_count` is build-wide, so on a 1300-case Stable build
+    # it would demote a genuinely new failure that merely shares a signature
+    # with an unrelated chronic one. This is per case, and a routine with one
+    # row per case can never reach it.
+    #
+    # The masked row REPLACES the baseline side rather than only relabelling
+    # the transition: `status_a` and `errors_a` are what the env-churn check
+    # below, the status matrix, the report's baseline-error column and the CSV
+    # all read. Leaving them as PASSED/"" reproduced the original defect in
+    # miniature — a `changed` row whose printed baseline error was blank, and a
+    # status_matrix saying PASSED against a transition saying the baseline had
+    # failed. One row, one story.
+    n_unmasked = 0
+    if "baseline_masked_status" in merged.columns:
+        for idx in merged.index[merged["transition"] == TRANSITION_NEW]:
+            masked_status = _status_text(merged.at[idx, "baseline_masked_status"])
+            if not masked_status:
+                continue
+            merged.at[idx, "status_a"] = masked_status
+            merged.at[idx, "errors_a"] = merged.at[idx, "baseline_masked_errors"]
+            merged.at[idx, "transition"] = classify_transition(
+                masked_status, merged.at[idx, "status_b"],
+                merged.at[idx, "errors_a"], merged.at[idx, "errors_b"])
+            n_unmasked += 1
+    if masked_out is not None:
+        masked_out.clear()
+        masked_out["rows"] = n_unmasked
+
     # Env churn is not a changed failure. Two runs can fail on the same
     # infrastructure problem with textually different messages — a different
     # container id, a different missing dependency — and the signature
@@ -4106,9 +4181,11 @@ def prepare(baseline: SideSpec, target: SideSpec, classifier: str,
 
     status_matrix: dict = {}
     coverage: dict = {}
+    masked: dict = {}
     df, transitions = compute_test_diff(baseline_df, target_df,
                                         matrix_out=status_matrix,
-                                        coverage_out=coverage)
+                                        coverage_out=coverage,
+                                        masked_out=masked)
     if df.empty:
         raise SystemExit(
             "test_diff returned 0 triage rows. Transitions seen: "
@@ -4118,6 +4195,13 @@ def prepare(baseline: SideSpec, target: SideSpec, classifier: str,
     print(f"   {len(df)} triage rows — " +
           ", ".join(f"{n} {name}" for name, n in sorted(transitions.items(),
                                                         key=lambda kv: -kv[1])))
+    # Silence here means the routine runs one row per case and the any-passed
+    # rule never fired. A number means that many failures would have been
+    # classified — and billed — as regressions of this range while the baseline
+    # was failing the same way on another axis.
+    if masked.get("rows"):
+        print(f"   {masked['rows']} row(s) re-read against a baseline failure "
+              f"the any-axis-passed rule had hidden — not new in this range")
 
     # The join keeps every case the target ran, so the transition total IS how many
     # cases were comparable. When that is a small share of the target build the
