@@ -827,13 +827,18 @@ def test_many_blocked_pairs_are_capped(tmp_path):
 # here and scan calls it.
 
 
-def test_the_rollup_only_message_leads_with_duration():
+def test_the_rollup_only_message_counts_every_build_in_the_state():
+    """Three builds in this state is "and the same on 2 earlier builds", not
+    "for 2 builds" — the first cut undercounted by one, and claimed a span
+    scan never established: it examines builds that HAVE failures, which need
+    not be consecutive."""
     text = S.render_rollup_only(
         {**STABLE_META, "build_id_b": 222},
-        builds_ago=6, first_build_id=191,
-        first_build_name="[master] ci:test:stable - 19999")
-    assert "Top Level Build has been the only failure for 6 builds" in text
-    assert "ci:test:stable - 19999" in text
+        earlier=2, first_build_id=191,
+        first_build_name="[master] ci:test:stable - 20002")
+    assert "the same on 2 earlier builds, back to" in text
+    assert "for 2 builds" not in text
+    assert "ci:test:stable - 20002" in text
     assert "No failing test reached Testray for this build" in text
     # A standing condition, not an alarm. Repeating a siren every tick is how
     # a channel learns to skip it.
@@ -847,11 +852,11 @@ def test_the_first_build_says_it_plainly_without_inventing_a_duration():
     assert "has been the only failure for" not in text
 
 
-def test_one_build_is_singular():
+def test_one_earlier_build_is_singular():
     text = S.render_rollup_only({**STABLE_META, "build_id_b": 222},
-                                builds_ago=1, first_build_id=191,
+                                earlier=1, first_build_id=191,
                                 first_build_name="b")
-    assert "for 1 build," in text
+    assert "the same on 1 earlier build, back to" in text
 
 
 def test_a_fresh_rollup_in_a_bundle_still_gets_the_warning(tmp_path):

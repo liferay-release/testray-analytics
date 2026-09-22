@@ -657,7 +657,7 @@ def _post_rollup_only(tr: dict, routine_id, builds: list, by_id: dict,
         }
         text = slack_message.render_rollup_only(
             meta,
-            builds_ago=len(run) - 1,
+            earlier=len(run) - 1,
             first_build_id=first if len(run) > 1 else None,
             first_build_name=(by_id.get(first) or {}).get("name", ""))
         out = resolve_path(None, slack_message.OUT_REL)

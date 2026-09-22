@@ -647,7 +647,7 @@ def _inherited_note(meta: dict, results: list, report_url: str) -> list[str]:
                 f"builds, not re-analyzed — see {where} in the report."]
 
 
-def render_rollup_only(meta: dict, builds_ago: int = 0,
+def render_rollup_only(meta: dict, earlier: int = 0,
                        first_build_id=None, first_build_name: str = "") -> str:
     """The message for a build whose only failure is Testray's roll-up.
 
@@ -672,13 +672,18 @@ def render_rollup_only(meta: dict, builds_ago: int = 0,
     head = _trim(_short_build_name(build_b), 58)
     where = _link(_build_url(meta, meta.get("build_id_b")), head) if head else ""
 
-    if builds_ago and first_build_id:
-        plural = "build" if builds_ago == 1 else "builds"
+    # `earlier` counts the OTHER builds seen in this state, so the run is
+    # `earlier + 1`. Said as "and the same on N earlier builds" rather than
+    # "for N builds since X": scan examines builds that HAVE failures, which
+    # need not be consecutive, so a span would be claiming contiguity it never
+    # established. The first cut said "for 2 builds" about three of them.
+    if earlier and first_build_id:
+        plural = "build" if earlier == 1 else "builds"
         since = _link(_build_url(meta, first_build_id),
                       _short_build_name(first_build_name) or str(first_build_id))
-        head_line = (f"🔁 *{where or 'This build'}* — Top Level Build has been "
-                     f"the only failure for {builds_ago} {plural}, since "
-                     f"{since}.")
+        head_line = (f"🔁 *{where or 'This build'}* — Top Level Build is the "
+                     f"only failure recorded, and the same on {earlier} "
+                     f"earlier {plural}, back to {since}.")
     else:
         head_line = (f"🔁 *{where or 'This build'}* — Top Level Build is the "
                      f"only failure recorded.")
