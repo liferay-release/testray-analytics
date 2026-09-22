@@ -441,7 +441,7 @@ def assemble_dataframe(diff_list: pd.DataFrame, results: list[dict]) -> pd.DataF
         })
 
     df = pd.concat([df.reset_index(drop=True),
-                    df.apply(_row, axis=1).reset_index(drop=True)], axis=1)
+                    _verdicts_frame(df, _row).reset_index(drop=True)], axis=1)
     df["tokens_in"]  = 0
     df["tokens_out"] = 0
     df["api_error"]  = None
@@ -536,7 +536,7 @@ def assemble_dataframe_subtask(
         })
 
     df = pd.concat([df.reset_index(drop=True),
-                    df.apply(_row, axis=1).reset_index(drop=True)], axis=1)
+                    _verdicts_frame(df, _row).reset_index(drop=True)], axis=1)
 
     # Subtask_id: prefer the value from the verdict (which is the Testray
     # subtask the classifier saw), falling back to the diff_list value
@@ -555,7 +555,7 @@ def assemble_dataframe_subtask(
                 return None
         return None
 
-    df["subtask_id"]   = df.apply(_resolve_subtask, axis=1)
+    df["subtask_id"]   = _row_series(df, _resolve_subtask)
     df["tokens_in"]    = 0
     df["tokens_out"]   = 0
     df["api_error"]    = None
@@ -566,6 +566,43 @@ def assemble_dataframe_subtask(
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
+# The columns both `_row` closures add to the diff_list frame.
+_VERDICT_COLS = ("classification", "confidence", "culprit_file",
+                 "specific_change", "reason", "candidates", "match_strategy")
+
+
+def _verdicts_frame(df: "pd.DataFrame", row_fn) -> "pd.DataFrame":
+    """`df.apply(row_fn, axis=1)` as a frame of `_VERDICT_COLS`.
+
+    On an EMPTY frame `apply` never sees a real row. It PROBES `row_fn` once to
+    learn the result shape, and when the probe raises — which both `_row`
+    closures do, since they index columns the probe row does not carry —
+    pandas falls back to returning a frame shaped like the INPUT. Concatenating
+    that duplicates every diff_list column, and the `df[col] = df.apply(...)`
+    below then receives a DataFrame where it expects a Series:
+    `ValueError: Columns must be same length as key`.
+
+    A pair with nothing to submit is not an error — it is the clean-build path,
+    where the report's pre-existing section and the coverage figures are the
+    whole point of the run. On 2026-09-21 it killed submit for pair
+    527271658 -> 527557324 after prepare had already done all the work.
+    """
+    if df.empty:
+        return pd.DataFrame({c: pd.Series(dtype="object") for c in _VERDICT_COLS})
+    return df.apply(row_fn, axis=1)
+
+
+def _row_series(df: "pd.DataFrame", fn) -> "pd.Series":
+    """`df.apply(fn, axis=1)` that is still a Series when df is empty.
+
+    Same probe behaviour as `_verdicts_frame`; here the caller assigns the
+    result to a single column, so a frame is what actually raises.
+    """
+    if df.empty:
+        return pd.Series(dtype="object", index=df.index)
+    return df.apply(fn, axis=1)
+
 
 def annotate_culprit_commits(df: pd.DataFrame, full_cfg: dict,
                              meta: dict) -> pd.DataFrame:
