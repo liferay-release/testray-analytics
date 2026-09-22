@@ -14,6 +14,7 @@ server. The cases that matter are the ones a naive implementation gets wrong:
 
 import pytest
 
+from testray_analytics.analysis import ledger as L
 from testray_analytics.analysis.ledger import (
     Attribution, BuildFailures, STATE_ACTIVE, STATE_NEW, STATE_REGRESSED,
     SignatureIndex,
@@ -213,3 +214,83 @@ def test_no_baseline_when_the_test_is_brand_new():
     })
     st = SignatureIndex(src).classify_build(2, [1])[0]
     assert st.baseline_build is None, "a brand-new failing test has no baseline"
+
+
+# --- The aggregate row is not a signature ----------------------------------
+#
+# `prepare` drops Testray's per-build "Top Level Build" row because it is not
+# a test. The ledger kept it, so every failing build carried a signature no
+# analysis could ever explain: prepare produced no cluster for it, the pair
+# still went DONE, and scan reported it unexplained on every later tick.
+# Stable build 19999 is the live case — case 42588, signature v3:a1b9ae71…
+
+
+def _rest_source(monkeypatch, rows, cases):
+    """A TestraySource wired to canned REST responses."""
+    from testray_analytics.analysis import prepare as P
+    monkeypatch.setattr(P, "fetch_paginated",
+                        lambda *a, **k: rows, raising=True)
+    asked = []
+
+    def _one_page(endpoint, params, token, base_url):
+        asked.append(params.get("filter", ""))
+        return cases
+
+    monkeypatch.setattr(P, "fetch_one_page", _one_page, raising=True)
+    src = L.TestraySource({"base_url": "http://x"}, routine_id=79529)
+    monkeypatch.setattr(src, "_token", lambda: "t", raising=False)
+    return src, asked
+
+
+def _cr(case_id, status, errors=""):
+    return {"r_caseToCaseResult_c_caseId": case_id,
+            "dueStatus": {"key": status}, "errors": errors}
+
+
+def test_the_aggregate_row_does_not_become_a_signature(monkeypatch):
+    src, _ = _rest_source(
+        monkeypatch,
+        rows=[_cr(42588, "FAILED", ""),
+              _cr(17642251, "FAILED", "VERSION INCREASE REQUIRED")],
+        cases=[{"id": 42588, "name": "Top Level Build"},
+               {"id": 17642251, "name": "semantic-versioning/0/0"}])
+    out = src.build_failures(527702480)
+    assert len(out.signatures) == 1, "the aggregate row is not a failure"
+    assert [c for v in out.signatures.values() for c in v] == [17642251]
+
+
+def test_only_failing_cases_are_looked_up(monkeypatch):
+    """The walk visits many builds; resolving every case's name would cost a
+    request per build for nothing. Passing cases are never asked about."""
+    src, asked = _rest_source(
+        monkeypatch,
+        rows=[_cr(1, "PASSED"), _cr(2, "PASSED"), _cr(42588, "FAILED")],
+        cases=[{"id": 42588, "name": "Top Level Build"}])
+    src.build_failures(1)
+    assert len(asked) == 1
+    assert "42588" in asked[0]
+    assert "id eq '1'" not in asked[0] and "id eq '2'" not in asked[0]
+
+
+def test_a_name_lookup_failure_leaves_the_scan_running(monkeypatch):
+    """Degrading to the old behaviour beats failing the tick."""
+    from testray_analytics.analysis import prepare as P
+    monkeypatch.setattr(P, "fetch_paginated",
+                        lambda *a, **k: [_cr(42588, "FAILED")], raising=True)
+
+    def _boom(*a, **k):
+        raise RuntimeError("503")
+
+    monkeypatch.setattr(P, "fetch_one_page", _boom, raising=True)
+    src = L.TestraySource({"base_url": "http://x"}, routine_id=79529)
+    monkeypatch.setattr(src, "_token", lambda: "t", raising=False)
+    assert len(src.build_failures(1).signatures) == 1
+
+
+def test_the_name_is_resolved_once_across_builds(monkeypatch):
+    src, asked = _rest_source(
+        monkeypatch, rows=[_cr(42588, "FAILED")],
+        cases=[{"id": 42588, "name": "Top Level Build"}])
+    src.build_failures(1)
+    src.build_failures(2)
+    assert len(asked) == 1, "the second build reuses the cached name"

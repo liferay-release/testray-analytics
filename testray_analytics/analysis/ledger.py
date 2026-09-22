@@ -40,6 +40,8 @@ The three decisions this implements:
 
 from __future__ import annotations
 
+import sys
+
 from dataclasses import dataclass, field
 
 from .error_signature import cluster_key
@@ -245,10 +247,50 @@ class TestraySource:
     def __init__(self, cfg: dict, routine_id: int):
         self.cfg = cfg
         self.routine_id = routine_id
+        # case id -> name, for the aggregate-row test. Per instance, so it
+        # cannot be a module-level constant.
+        self._case_name_cache: dict[int, str] = {}
 
     def _token(self):
         from .prepare import _testray_oauth_token
         return _testray_oauth_token(self.cfg)
+
+    def _aggregate_case_ids(self, case_ids: set[int]) -> set[int]:
+        """Which of `case_ids` are Testray's per-build aggregate row.
+
+        `prepare` drops that row because it is not a test; the ledger used to
+        keep it, so every failing build carried an extra signature that no
+        analysis could ever explain — `prepare` produced no cluster for it, the
+        pair still went DONE, and `scan` then reported it unexplained forever
+        (Stable build 19999, signature v3:a1b9ae713072d018 = case 42588).
+
+        Resolved by NAME, like `prepare.is_aggregate_row`, because the id is
+        assigned per instance. Only failing ids are looked up — a handful per
+        build — and the answer is cached for the run. `/o/c/cases` has no `in`
+        operator, so ids go up in `or`-chains kept under the URI limit.
+        """
+        from .prepare import fetch_one_page, is_aggregate_row
+        unknown = sorted(case_ids - self._case_name_cache.keys())
+        for i in range(0, len(unknown), 100):
+            chunk = unknown[i:i + 100]
+            flt = " or ".join(f"id eq '{c}'" for c in chunk)
+            try:
+                rows = fetch_one_page("/o/c/cases",
+                                      {"filter": flt, "pageSize": str(len(chunk) + 5),
+                                       "fields": "id,name"},
+                                      self._token(), self.cfg["base_url"])
+            except Exception as e:                                # noqa: BLE001
+                # A name lookup that fails must not fail the scan: without it
+                # the aggregate is merely counted again, which is the old
+                # behaviour, not a new failure.
+                print(f"   ! could not resolve case names: {e}", file=sys.stderr)
+                rows = []
+            for r in rows:
+                self._case_name_cache[int(r["id"])] = r.get("name") or ""
+            for c in chunk:
+                self._case_name_cache.setdefault(c, "")
+        return {c for c in case_ids
+                if is_aggregate_row(self._case_name_cache.get(c, ""))}
 
     def build_failures(self, build_id: int) -> BuildFailures:
         from .prepare import fetch_paginated
@@ -259,6 +301,10 @@ class TestraySource:
             token=self._token(), base_url=self.cfg["base_url"],
             progress_label=f"caseresults build {build_id}",
         )
+        failed_ids = {int(it["r_caseToCaseResult_c_caseId"]) for it in items
+                      if it.get("r_caseToCaseResult_c_caseId") is not None
+                      and _status(it) == "FAILED"}
+        aggregate = self._aggregate_case_ids(failed_ids) if failed_ids else set()
         sigs: dict[str, list[int]] = {}
         not_run: set[int] = set()
         for it in items:
@@ -269,7 +315,7 @@ class TestraySource:
             st = _status(it)
             if st in NOT_RUN_STATUSES:
                 not_run.add(cid)
-            elif st == "FAILED":
+            elif st == "FAILED" and cid not in aggregate:
                 sig = cluster_key(None, f"case{cid}", it.get("errors") or "")
                 sigs.setdefault(sig, []).append(cid)
         present = {int(it["r_caseToCaseResult_c_caseId"]) for it in items
