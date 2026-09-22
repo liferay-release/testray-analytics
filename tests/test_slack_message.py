@@ -713,12 +713,15 @@ def test_each_repeat_is_separated_from_the_next():
         assert out[i - 1] == "", "each entry needs a blank line before it"
 
 
-# --- The build break: Top Level Build failed and no test did ---------------
+# --- Only the roll-up failed: the real failures never reached Testray -------
 #
-# Stable halts on first failure, so a broken build leaves Testray's own
-# build-level row FAILED and every test UNTESTED. prepare drops that row
-# (it is not a test), which leaves nothing to classify — and a run that
-# says nothing is indistinguishable from a healthy one. It runs unattended.
+# `Top Level Build` is FAILED whenever anything under it failed. prepare drops
+# it (it is not a test), which leaves nothing to classify — and a run that says
+# nothing is indistinguishable from a healthy one. It runs unattended.
+#
+# Verified on build 20005: Testray held only the roll-up while the build's
+# jenkins-report listed two axes at FAILURE with three failed specs. So the
+# message must send a reader after the MISSING ROWS, not after a broken build.
 
 
 def test_a_build_break_says_so_and_asks_for_a_human(tmp_path):
@@ -726,6 +729,10 @@ def test_a_build_break_says_so_and_asks_for_a_human(tmp_path):
     text = S.render(d)
     assert "Nothing was submitted this run — but Top Level Build failed." in text
     assert "*Human review required*" in text
+    # It must point at the missing rows, not at a broken build: an earlier
+    # wording said "this is what a broken build looks like" and sent readers
+    # hunting for the wrong thing.
+    assert "never made it into Testray" in text
     # and NOT the generic line, which is true of the mechanism and wrong
     # about the build.
     assert "auto-classified or excluded upstream" not in text
@@ -739,14 +746,29 @@ def test_a_build_break_raises_the_siren(tmp_path):
     assert S.render(d).startswith("🚨 ")
 
 
-def test_an_already_broken_build_does_not_re_raise_it(tmp_path):
-    """A same_failure aggregate row means the build was already broken.
-    _still_failing and _inherited_note cover that; warning again on every tick
-    of an already-red routine is how a channel learns to skip the warning."""
+def test_an_already_broken_build_does_not_re_raise_it(tmp_path, monkeypatch):
+    """A same_failure aggregate row means the build was already broken, so it
+    gets the 🔁 duration line, never the ⚠️ warning again."""
+    from testray_analytics.analysis import recurrence
+    monkeypatch.setattr(recurrence, "repeats_for_build", lambda *a, **k: {})
+    monkeypatch.setattr("testray_analytics.analysis.prepare.load_config",
+                        lambda *a, **k: {"testray": {}})
     d = bundle(tmp_path, [], meta={"aggregate_dropped": {"same_failure": 1}})
     text = S.render(d)
     assert "Top Level Build failed" not in text
+    # Walk found nothing, so it falls back rather than inventing a duration.
     assert "auto-classified or excluded upstream" in text
+
+
+def test_a_lookup_that_cannot_reach_testray_does_not_kill_the_message(tmp_path,
+                                                                      monkeypatch):
+    """`load_config` raises SystemExit, not Exception. An `except Exception`
+    here let it escape and took the whole Slack message down with it."""
+    def boom(*a, **k):
+        raise SystemExit("OAuth2 token request failed")
+    monkeypatch.setattr("testray_analytics.analysis.prepare.load_config", boom)
+    d = bundle(tmp_path, [], meta={"aggregate_dropped": {"same_failure": 1}})
+    assert "auto-classified or excluded upstream" in S.render(d)
 
 
 def test_a_run_with_verdicts_is_never_a_build_break(tmp_path):
@@ -795,3 +817,47 @@ def test_many_blocked_pairs_are_capped(tmp_path):
     stuck = [(_Job(f"79529-{i}-{i + 1}"), "FAILED") for i in range(9)]
     text = S.render_blocked(STABLE_META, stuck)
     assert "… and 3 more." in text
+
+
+# --- Only the roll-up failed: scan speaks, because nothing else can --------
+#
+# Since the ledger stopped signing the aggregate row, such a build produces no
+# signature: nothing queues, no pipeline runs, no bundle exists and submit
+# never executes. `scan` is the last place that sees it, so the renderer lives
+# here and scan calls it.
+
+
+def test_the_rollup_only_message_leads_with_duration():
+    text = S.render_rollup_only(
+        {**STABLE_META, "build_id_b": 222},
+        builds_ago=6, first_build_id=191,
+        first_build_name="[master] ci:test:stable - 19999")
+    assert "Top Level Build has been the only failure for 6 builds" in text
+    assert "ci:test:stable - 19999" in text
+    assert "No failing test reached Testray for this build" in text
+    # A standing condition, not an alarm. Repeating a siren every tick is how
+    # a channel learns to skip it.
+    assert text.startswith("🔁 ")
+    assert "🚨" not in text
+
+
+def test_the_first_build_says_it_plainly_without_inventing_a_duration():
+    text = S.render_rollup_only({**STABLE_META, "build_id_b": 222})
+    assert "is the only failure recorded" in text
+    assert "has been the only failure for" not in text
+
+
+def test_one_build_is_singular():
+    text = S.render_rollup_only({**STABLE_META, "build_id_b": 222},
+                                builds_ago=1, first_build_id=191,
+                                first_build_name="b")
+    assert "for 1 build," in text
+
+
+def test_a_fresh_rollup_in_a_bundle_still_gets_the_warning(tmp_path):
+    """The bundle path still exists for the narrower case: a pair queued for
+    OTHER signatures that all end up auto-classified or excluded, leaving no
+    verdicts with the roll-up dropped."""
+    text = S.render(bundle(tmp_path, [], meta={"aggregate_dropped": {"new": 1}}))
+    assert "⚠️" in text
+    assert "never made it into Testray" in text

@@ -76,6 +76,18 @@ class BuildFailures:
     signatures: dict[str, list[int]] = field(default_factory=dict)
     not_run:    set[int]             = field(default_factory=set)
     present:    set[int]             = field(default_factory=set)
+    # The FAILED case ids dropped for being Testray's per-build aggregate row.
+    # Recorded rather than forgotten: dropping it from `signatures` is right —
+    # nothing can ever explain it — but a build where it is the ONLY failure is
+    # not a clean build, it is one whose test rows never reached Testray. With
+    # the signature gone that build queues nothing, runs no pipeline and
+    # produces no message, so this is the only surviving evidence it was red.
+    aggregate:  set[int]             = field(default_factory=set)
+
+    @property
+    def aggregate_only(self) -> bool:
+        """Nothing failed here except Testray's own build-level row."""
+        return bool(self.aggregate) and not self.signatures
 
     def ran(self, case_ids) -> bool:
         """True when at least one of `case_ids` produced a verdict here.
@@ -321,7 +333,8 @@ class TestraySource:
         present = {int(it["r_caseToCaseResult_c_caseId"]) for it in items
                    if it.get("r_caseToCaseResult_c_caseId") is not None}
         return BuildFailures(build_id=build_id, signatures=sigs,
-                             not_run=not_run, present=present)
+                             not_run=not_run, present=present,
+                             aggregate=aggregate)
 
     # Class-level, so a long-running scan warns once rather than every tick.
     _warned_no_store = False

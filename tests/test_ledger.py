@@ -294,3 +294,24 @@ def test_the_name_is_resolved_once_across_builds(monkeypatch):
     src.build_failures(1)
     src.build_failures(2)
     assert len(asked) == 1, "the second build reuses the cached name"
+
+
+# --- The aggregate row is dropped, but not forgotten ------------------------
+
+def test_build_failures_records_the_aggregate_it_dropped():
+    """Dropping it from `signatures` is right — nothing can ever explain it.
+    But a build where it is the ONLY failure is not clean: its test rows never
+    reached Testray, and with the signature gone this is the only surviving
+    evidence the build was red."""
+    from testray_analytics.analysis.ledger import BuildFailures
+
+    rollup_only = BuildFailures(build_id=1, aggregate={42588})
+    assert rollup_only.aggregate_only is True
+
+    with_real_failures = BuildFailures(build_id=1, aggregate={42588},
+                                       signatures={"v3:abc": [9]})
+    assert with_real_failures.aggregate_only is False, \
+        "a real failure beside the roll-up is the roll-up doing its job"
+
+    clean = BuildFailures(build_id=1)
+    assert clean.aggregate_only is False, "green is not the same as roll-up-only"

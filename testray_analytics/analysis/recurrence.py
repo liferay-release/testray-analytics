@@ -360,6 +360,9 @@ def repeats_for_build(cfg: dict, *, routine_id, build_id) -> dict:
             name = _case_name(session, case_id)
             # Testray's per-build row is not a test: it carries no error, so it
             # would recur forever while naming nothing a reader can act on.
+            # Belt and braces now — `ledger.TestraySource` drops it before a
+            # signature is ever made — and kept because this reads names and
+            # that one reads ids.
             if is_aggregate_row(name):
                 continue
             probes[str(case_id)] = (name or f"case{case_id}",

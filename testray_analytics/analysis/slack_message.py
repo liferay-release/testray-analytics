@@ -566,26 +566,30 @@ def _still_failing(meta: dict, repeats: dict) -> list[str]:
     return lines
 
 
-def _build_break_note(meta: dict) -> list[str]:
-    """The catch for a build that broke without any test failing.
+def _missing_failures_note(meta: dict) -> list[str]:
+    """The catch for a build whose only failure is Testray's own roll-up.
 
-    Stable halts on first failure, so a build break leaves Testray's own
-    `Top Level Build` row FAILED and every test UNTESTED. That row is not a
-    test — it carries no error text and no code to attribute — so
-    `prepare.drop_aggregate_rows` removes it, and with it gone the pipeline
-    correctly finds nothing to classify and writes no verdicts.
+    `Top Level Build` is FAILED whenever anything under it failed. It is not a
+    test — no error text, no code to attribute — so
+    `prepare.drop_aggregate_rows` removes it, and the pipeline then correctly
+    finds nothing to classify and writes no verdicts.
 
-    Which is how build 19999 (2026-09-21) produced a green Jenkins job and a
-    Slack line reading "nothing was submitted this run (no new work queued)"
-    for a build that was red. The cause was real and findable — a bnd baseline
-    `VERSION INCREASE REQUIRED` — just not anywhere this pipeline can currently
-    read.
+    **What that state actually means is that failures are MISSING, not that
+    none happened.** Verified on build 20005 (2026-09-21): Testray held only
+    the roll-up, while the build's own `jenkins-report.html.gz` listed two
+    axes at FAILURE — `playwright-js-tomcat101-postgresql163/0/3` and `/2/2` —
+    carrying three failed Playwright specs between them. The results existed in
+    Jenkins and never reached Testray. An earlier version of this message said
+    "no test failure was recorded… this is what a broken build looks like",
+    which sent a reader looking for a broken build instead of for the missing
+    rows.
 
-    So the run says so itself rather than going quiet. It runs unattended;
-    nobody is watching the console to notice the silence.
+    So the message names the gap and points at the one artifact that can close
+    it. Fetching that artifact needs a GCS grant this pipeline does not have;
+    a human following the link has the SSO it lacks.
 
     Only for an aggregate row that failed IN THIS BUILD. A `same_failure` one
-    means the build was already broken, which `_still_failing` and
+    means the build was already red, which `_still_failing` and
     `_inherited_note` already say — crying wolf on every tick of an
     already-red routine is how a channel learns to skip the warning.
     """
@@ -599,11 +603,11 @@ def _build_break_note(meta: dict) -> list[str]:
 
     return ["", "⚠️ *Nothing was submitted this run — but Top Level Build "
                 "failed.*",
-            "No test failure was recorded: Testray's build-level row is the "
-            "only failure, so there was nothing to classify and no verdict "
-            "was written.",
-            "*Human review required* — the cause is in the Jenkins console "
-            "linked above, not in Testray."]
+            "Testray holds no failing test for this build, only its "
+            "build-level row. That normally means the real failures never "
+            "made it into Testray — the axis results are in Jenkins.",
+            "*Human review required* — open the Jenkins report linked above "
+            "and check which axes are at FAILURE."]
 
 
 def _inherited_note(meta: dict, results: list, report_url: str) -> list[str]:
@@ -641,6 +645,49 @@ def _inherited_note(meta: dict, results: list, report_url: str) -> list[str]:
     where = _link(f"{report_url}#pre-existing", label) if report_url else label
     return ["", f"🔁 {n} failure{'s' if n != 1 else ''} inherited from earlier "
                 f"builds, not re-analyzed — see {where} in the report."]
+
+
+def render_rollup_only(meta: dict, builds_ago: int = 0,
+                       first_build_id=None, first_build_name: str = "") -> str:
+    """The message for a build whose only failure is Testray's roll-up.
+
+    Lives here and is called by `scan`, not by `render`, because after the
+    ledger stopped signing the aggregate row such a build produces no signature
+    at all: nothing is queued, no pipeline runs, no bundle exists and `submit`
+    never executes. `scan` is the last place that still sees it.
+
+    Dropping the signature was right — nothing could ever explain it, and it
+    was re-offered on every tick forever. But a build with only the roll-up
+    failing is not clean: its test rows never reached Testray. Verified on
+    build 20005 (2026-09-21), where Testray held the roll-up alone while the
+    build's own jenkins-report listed two axes at FAILURE carrying three failed
+    Playwright specs.
+
+    No siren. On the first build this is news; by the fifth it is a standing
+    condition, and the only thing that changes is how long it has gone on — so
+    that is what it leads with. An alarm repeated every tick is one a channel
+    learns to skip.
+    """
+    build_b = _text(meta.get("build_b_name")) or _text(meta.get("build_id_b"))
+    head = _trim(_short_build_name(build_b), 58)
+    where = _link(_build_url(meta, meta.get("build_id_b")), head) if head else ""
+
+    if builds_ago and first_build_id:
+        plural = "build" if builds_ago == 1 else "builds"
+        since = _link(_build_url(meta, first_build_id),
+                      _short_build_name(first_build_name) or str(first_build_id))
+        head_line = (f"🔁 *{where or 'This build'}* — Top Level Build has been "
+                     f"the only failure for {builds_ago} {plural}, since "
+                     f"{since}.")
+    else:
+        head_line = (f"🔁 *{where or 'This build'}* — Top Level Build is the "
+                     f"only failure recorded.")
+
+    return "\n".join([
+        head_line,
+        "No failing test reached Testray for this build, so there is nothing "
+        "to analyze and no run was made. The axis results are in Jenkins.",
+    ])
 
 
 def render_blocked(meta: dict, stuck: list) -> str:
@@ -738,10 +785,10 @@ def render(run_dir: Path, *, report_url: str = "",
     # verdicts, so the rollup is PENDING and the headline would carry the
     # magnifying glass — the quiet icon, on the one outcome nobody is going to
     # find any other way.
-    build_break = _build_break_note(meta) if not results else []
+    missing = _missing_failures_note(meta) if not results else []
 
     rollup = V.rollup([_verdict_of(r) for r in results]) if results else "PENDING"
-    siren = "🚨" if rollup in ACTIONABLE or build_break else "🔍"
+    siren = "🚨" if rollup in ACTIONABLE or missing else "🔍"
 
     # The build name IS the link, and carries no `routine N build` preamble:
     # the routine is implied by the channel the message lands in, and the two
@@ -806,11 +853,12 @@ def render(run_dir: Path, *, report_url: str = "",
     # The siren on the headline still comes from the rollup, and the blocks are
     # still ordered worst-verdict-first. The verdict decides what a reader sees
     # FIRST; it just does not get to be what they see INSTEAD.
-    # Used instead of the generic "no verdicts" line, not beside it: for a
-    # build break, "every failure was auto-classified or excluded upstream" is
-    # a true statement about the mechanism and a wrong one about the build.
-    if build_break:
-        lines += build_break
+    # Used instead of the generic "no verdicts" line, not beside it: when the
+    # rows are missing, "every failure was auto-classified or excluded
+    # upstream" is a true statement about the mechanism and a wrong one about
+    # the build.
+    if missing:
+        lines += missing
     elif not results and not repeats:
         # A pair with no verdicts AND no history is genuinely unexplained, and
         # that is not a verdict label — it is the absence of one, which nobody

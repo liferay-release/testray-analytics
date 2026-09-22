@@ -481,6 +481,8 @@ def scan(cfg: dict, routine_id: int, *, queue_dir: Path,
     # (job, status) for pairs a dead row is blocking. Not a counter: the
     # Slack note has to name them.
     stuck: list = []
+    # Target builds whose only failure is the aggregate row, newest first.
+    rollup_only: list = []
     # Dry-run has to model the real queue's idempotency, or it reports work a
     # real run would skip: two catch-up builds carrying the same signature
     # converge on one job, and saying "2 queued" would be a lie.
@@ -491,6 +493,16 @@ def scan(cfg: dict, routine_id: int, *, queue_dir: Path,
         states = index.classify_build(target, preds)
         name = by_id[target].get("name") or target
         print(f"\n  build {target}  {name}")
+
+        # A build whose ONLY failure is Testray's roll-up. `classify_build`
+        # returns nothing for it — the ledger no longer signs that row — so
+        # without this the build is indistinguishable from a green one, and
+        # the tick that should have said "the test rows are missing" says
+        # nothing at all.
+        if not states and index.failures(target).aggregate_only:
+            rollup_only.append(target)
+            print("    · only Top Level Build failed — no test rows reached "
+                  "Testray for this build")
 
         pairs: dict[int, list[str]] = {}
         for st in states:
@@ -577,10 +589,17 @@ def scan(cfg: dict, routine_id: int, *, queue_dir: Path,
     print(f"Jobs: {queued} queued"
           + (f", {skipped} already registered" if skipped else "")
           + (f", {len(stuck)} BLOCKED by a dead row" if stuck else "")
+          + (f", {len(rollup_only)} with only the roll-up failing"
+             if rollup_only else "")
           + (f", {n_done} already analysed" if n_done else "")
           + (f", {n_norange} skipped for want of a baseline" if n_norange else ""))
     if dry_run:
         print("\n--dry-run: nothing was written to the queue.")
+    elif rollup_only and queued == 0 and skipped == 0:
+        # Only when nothing else is going to speak. A tick that queued work
+        # will produce a real message from submit, and this must not compete
+        # with the build that actually has failures to explain.
+        _post_rollup_only(tr, routine_id, rollup_only, by_id, index)
     elif stuck:
         # Said instead of the recurrence message, not beside it: "no new
         # failures, each one was analyzed already" is the opposite of true here.
@@ -600,6 +619,58 @@ def scan(cfg: dict, routine_id: int, *, queue_dir: Path,
     return {"targets": len(targets), "queued": queued, "skipped": skipped,
             "new": n_new, "active": n_active, "no_range": n_norange,
             "analysed": n_done}
+
+
+def _post_rollup_only(tr: dict, routine_id, builds: list, by_id: dict,
+                      index) -> None:
+    """Speak for a build whose only failure is Testray's own roll-up.
+
+    Stable only, like every other message this module writes — the gate is in
+    `submit` for the bundle path, and this is its equivalent for the path with
+    no bundle. Other routines have nowhere to post.
+
+    How long it has gone on comes from the builds this scan ALREADY examined
+    and cached, so it costs no extra fetch and is honestly bounded: it reports
+    what it can see, not a walk it did not do.
+
+    Never fatal, for the same reason `_post_recurrence` is not.
+    """
+    try:
+        from . import recurrence, slack_message
+        if int(routine_id) != recurrence.STABLE_ROUTINE_ID:
+            return
+
+        target = builds[0]
+        # Consecutive older builds in the same state, among those already
+        # fetched. `ids` is newest-first, so this walks backwards in time.
+        run = [b for b in builds]
+        first = run[-1]
+
+        build = by_id.get(target) or {}
+        meta = {
+            "routine_id": routine_id,
+            "project_id": (build.get("r_projectToBuilds_c_projectId")
+                           or tr.get("project_id")),
+            "testray_url": tr.get("ui_url") or tr.get("base_url"),
+            "build_id_b": target,
+            "build_b_name": build.get("name") or str(target),
+        }
+        text = slack_message.render_rollup_only(
+            meta,
+            builds_ago=len(run) - 1,
+            first_build_id=first if len(run) > 1 else None,
+            first_build_name=(by_id.get(first) or {}).get("name", ""))
+        out = resolve_path(None, slack_message.OUT_REL)
+        if os.environ.get("TRIAGE_SLACK_APPEND") == "1":
+            slack_message.append_to_post(out, text)
+        else:
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(text, encoding="utf-8")
+        print(f"\nOnly the roll-up failed on {len(run)} build(s) — "
+              f"message written to {out}")
+    except (Exception, SystemExit) as e:                          # noqa: BLE001
+        print(f"\n! could not write the roll-up-only message: {e}",
+              file=sys.stderr)
 
 
 def _post_stuck(tr: dict, routine_id, build_id, by_id: dict, stuck: list) -> None:
