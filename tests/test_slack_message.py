@@ -827,16 +827,17 @@ def test_many_blocked_pairs_are_capped(tmp_path):
 # here and scan calls it.
 
 
-def test_the_rollup_only_message_counts_every_build_in_the_state():
-    """Three builds in this state is "and the same on 2 earlier builds", not
-    "for 2 builds" — the first cut undercounted by one, and claimed a span
-    scan never established: it examines builds that HAVE failures, which need
+def test_the_rollup_only_message_names_where_it_goes_back_to_without_a_count():
+    """No number: scan sees only --catch-up builds, so a count capped at
+    catch_up - 1 and said "2 earlier builds" on every tick of a longer run.
+    Nor "for 2 builds" — scan examines builds that HAVE failures, which need
     not be consecutive."""
     text = S.render_rollup_only(
         {**STABLE_META, "build_id_b": 222},
         earlier=2, first_build_id=191,
         first_build_name="[master] ci:test:stable - 20002")
-    assert "the same on 2 earlier builds, back to" in text
+    assert "and the same on earlier builds, back to" in text
+    assert "2 earlier" not in text
     assert "for 2 builds" not in text
     assert "ci:test:stable - 20002" in text
     assert "No failing test reached Testray for this build" in text
@@ -852,11 +853,19 @@ def test_the_first_build_says_it_plainly_without_inventing_a_duration():
     assert "has been the only failure for" not in text
 
 
-def test_one_earlier_build_is_singular():
+def test_one_earlier_build_reads_the_same_as_many():
     text = S.render_rollup_only({**STABLE_META, "build_id_b": 222},
                                 earlier=1, first_build_id=191,
                                 first_build_name="b")
-    assert "the same on 1 earlier build, back to" in text
+    assert "and the same on earlier builds, back to" in text
+    assert "1 earlier" not in text
+
+
+def test_a_walk_that_stopped_short_does_not_claim_the_start():
+    text = S.render_rollup_only({**STABLE_META, "build_id_b": 222},
+                                earlier=20, first_build_id=191,
+                                first_build_name="b", at_least=True)
+    assert "back to at least" in text
 
 
 def test_a_fresh_rollup_in_a_bundle_still_gets_the_warning(tmp_path):

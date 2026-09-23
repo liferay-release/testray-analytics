@@ -552,3 +552,67 @@ def test_the_recurrence_message_is_stable_only(monkeypatch, tmp_path):
 
     S._post_recurrence({}, 79529, 1, {})           # Stable
     assert called == [1]
+
+
+# --- Where a roll-up-only run began ----------------------------------------
+#
+# Ticks #49 and #50 (2026-09-22) reported one streak as starting at 20005 and
+# then at 20011, because the walk stopped at the three --catch-up targets.
+
+class _RollupIndex:
+    """`failures()` only, which is all the walk asks. `rollup` is the set of
+    builds whose only failure is the aggregate row; any other id has a real
+    test failure."""
+
+    def __init__(self, rollup):
+        self.rollup = set(rollup)
+        self.fetched = []
+
+    def failures(self, bid):
+        self.fetched.append(bid)
+        if bid in self.rollup:
+            return BuildFailures(build_id=bid, aggregate={1})
+        return BuildFailures(build_id=bid, signatures={SIG_A: [10]})
+
+
+def _window(*rows):
+    ids = [r["id"] for r in rows]
+    return ids, {r["id"]: r for r in rows}
+
+
+def test_the_rollup_streak_walks_past_the_catch_up_targets():
+    ids, by_id = _window(*(build(i, failed=1) for i in (50, 49, 48, 47, 46)))
+    index = _RollupIndex({50, 49, 48, 47})
+    streak, open_ended = S.rollup_streak(50, ids, by_id, index)
+    assert streak == [50, 49, 48, 47]
+    assert open_ended is False
+
+
+def test_a_green_build_ends_the_streak_without_a_fetch():
+    """"Back to X" claims every build since X was in this state. A green build
+    between two roll-up-only ones makes that untrue, so the walk stops there,
+    and the counter says so without reading its case results."""
+    ids, by_id = _window(build(50, failed=1), build(49, failed=0),
+                         build(48, failed=1))
+    index = _RollupIndex({50, 48})
+    streak, open_ended = S.rollup_streak(50, ids, by_id, index)
+    assert streak == [50]
+    assert open_ended is False
+    assert 49 not in index.fetched
+
+
+def test_a_streak_that_outruns_the_window_says_at_least():
+    ids, by_id = _window(*(build(i, failed=1) for i in (50, 49, 48)))
+    streak, open_ended = S.rollup_streak(50, ids, by_id,
+                                         _RollupIndex({50, 49, 48}))
+    assert streak == [50, 49, 48]
+    assert open_ended is True
+
+
+def test_the_walk_is_bounded():
+    ids, by_id = _window(*(build(i, failed=1) for i in range(50, 20, -1)))
+    index = _RollupIndex(set(ids))
+    streak, open_ended = S.rollup_streak(50, ids, by_id, index, limit=5)
+    assert streak == [50, 49, 48, 47, 46, 45]
+    assert open_ended is True
+    assert len(index.fetched) == 5

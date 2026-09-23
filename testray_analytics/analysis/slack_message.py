@@ -648,7 +648,8 @@ def _inherited_note(meta: dict, results: list, report_url: str) -> list[str]:
 
 
 def render_rollup_only(meta: dict, earlier: int = 0,
-                       first_build_id=None, first_build_name: str = "") -> str:
+                       first_build_id=None, first_build_name: str = "",
+                       at_least: bool = False) -> str:
     """The message for a build whose only failure is Testray's roll-up.
 
     Lives here and is called by `scan`, not by `render`, because after the
@@ -672,18 +673,20 @@ def render_rollup_only(meta: dict, earlier: int = 0,
     head = _trim(_short_build_name(build_b), 58)
     where = _link(_build_url(meta, meta.get("build_id_b")), head) if head else ""
 
-    # `earlier` counts the OTHER builds seen in this state, so the run is
-    # `earlier + 1`. Said as "and the same on N earlier builds" rather than
-    # "for N builds since X": scan examines builds that HAVE failures, which
-    # need not be consecutive, so a span would be claiming contiguity it never
-    # established. The first cut said "for 2 builds" about three of them.
+    # `earlier` counts the OTHER consecutive builds in this state. It is not
+    # printed: the first cut stopped at scan's --catch-up targets, so it read
+    # "2 earlier builds" on every tick of a longer run (#49 and #50,
+    # 2026-09-22), and a count that never grows looks like one that is right.
+    # `first_build_id` is where the run began, which is the fact a reader
+    # acts on — or, with `at_least`, the oldest build scan walked back to
+    # before stopping, said as such rather than passed off as the start.
     if earlier and first_build_id:
-        plural = "build" if earlier == 1 else "builds"
         since = _link(_build_url(meta, first_build_id),
                       _short_build_name(first_build_name) or str(first_build_id))
+        back = "back to at least" if at_least else "back to"
         head_line = (f"🔁 *{where or 'This build'}* — Top Level Build is the "
-                     f"only failure recorded, and the same on {earlier} "
-                     f"earlier {plural}, back to {since}.")
+                     f"only failure recorded, and the same on earlier "
+                     f"builds, {back} {since}.")
     else:
         head_line = (f"🔁 *{where or 'This build'}* — Top Level Build is the "
                      f"only failure recorded.")

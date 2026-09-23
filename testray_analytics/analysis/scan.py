@@ -78,6 +78,14 @@ DEFAULT_BUILD_WINDOW = 60
 # scanner keeps up; more lets it catch up after downtime without a cursor.
 DEFAULT_CATCH_UP = 3
 
+# How far back the roll-up-only message walks to find where the condition
+# began. It used to stop at the --catch-up targets, so a longer run was always
+# reported as starting at the third build examined: ticks #49 and #50
+# (2026-09-22) named 20005 and then 20011 as the start of one streak. Each
+# step is one build's case results (~3 pages on Stable), so this is bounded;
+# past it the message says "at least".
+ROLLUP_WALK_LIMIT = 20
+
 
 def recent_done_builds(cfg: dict, routine_id: int,
                        limit: int = DEFAULT_BUILD_WINDOW) -> list[dict]:
@@ -599,7 +607,8 @@ def scan(cfg: dict, routine_id: int, *, queue_dir: Path,
         # Only when nothing else is going to speak. A tick that queued work
         # will produce a real message from submit, and this must not compete
         # with the build that actually has failures to explain.
-        _post_rollup_only(tr, routine_id, rollup_only, by_id, index)
+        _post_rollup_only(tr, routine_id, rollup_only[0], ids, by_id, index,
+                          counters=_counters_populated(builds))
     elif stuck:
         # Said instead of the recurrence message, not beside it: "no new
         # failures, each one was analyzed already" is the opposite of true here.
@@ -621,17 +630,48 @@ def scan(cfg: dict, routine_id: int, *, queue_dir: Path,
             "analysed": n_done}
 
 
-def _post_rollup_only(tr: dict, routine_id, builds: list, by_id: dict,
-                      index) -> None:
+def rollup_streak(target: int, ids: list, by_id: dict, index, *,
+                  counters: bool = True,
+                  limit: int = ROLLUP_WALK_LIMIT) -> tuple[list, bool]:
+    """`target` and the consecutive older builds whose only failure is the
+    roll-up, newest first; and whether the walk stopped before finding where
+    that began.
+
+    Walks every DONE build, not only those with failures: the run ends at the
+    first build that is anything else — real test failures, or nothing failed
+    at all — because "the same on earlier builds, back to X" claims every
+    build between X and now was in this state, and skipping a green one would
+    make that untrue.
+
+    A green build is told apart by its counter, without a fetch. Every other
+    step reads case results, but `scan` has already cached the --catch-up
+    targets, so the first few cost nothing.
+    """
+    streak = [target]
+    older = ids[ids.index(target) + 1:]
+    for bid in older:
+        if len(streak) > limit:
+            return streak, True
+        if counters and int((by_id.get(bid) or {}).get("caseResultFailed") or 0) == 0:
+            return streak, False
+        if not index.failures(bid).aggregate_only:
+            return streak, False
+        streak.append(bid)
+    # Ran out of window while still in the state: its start is further back
+    # than this scan fetched.
+    return streak, bool(older)
+
+
+def _post_rollup_only(tr: dict, routine_id, target: int, ids: list,
+                      by_id: dict, index, *, counters: bool = True) -> None:
     """Speak for a build whose only failure is Testray's own roll-up.
 
     Stable only, like every other message this module writes — the gate is in
     `submit` for the bundle path, and this is its equivalent for the path with
     no bundle. Other routines have nowhere to post.
 
-    How long it has gone on comes from the builds this scan ALREADY examined
-    and cached, so it costs no extra fetch and is honestly bounded: it reports
-    what it can see, not a walk it did not do.
+    Where the condition began comes from `rollup_streak`, which walks past the
+    builds this scan examined — see ROLLUP_WALK_LIMIT for why it must.
 
     Never fatal, for the same reason `_post_recurrence` is not.
     """
@@ -640,10 +680,8 @@ def _post_rollup_only(tr: dict, routine_id, builds: list, by_id: dict,
         if int(routine_id) != recurrence.STABLE_ROUTINE_ID:
             return
 
-        target = builds[0]
-        # Consecutive older builds in the same state, among those already
-        # fetched. `ids` is newest-first, so this walks backwards in time.
-        run = [b for b in builds]
+        run, open_ended = rollup_streak(target, ids, by_id, index,
+                                        counters=counters)
         first = run[-1]
 
         build = by_id.get(target) or {}
@@ -659,14 +697,16 @@ def _post_rollup_only(tr: dict, routine_id, builds: list, by_id: dict,
             meta,
             earlier=len(run) - 1,
             first_build_id=first if len(run) > 1 else None,
-            first_build_name=(by_id.get(first) or {}).get("name", ""))
+            first_build_name=(by_id.get(first) or {}).get("name", ""),
+            at_least=open_ended)
         out = resolve_path(None, slack_message.OUT_REL)
         if os.environ.get("TRIAGE_SLACK_APPEND") == "1":
             slack_message.append_to_post(out, text)
         else:
             out.parent.mkdir(parents=True, exist_ok=True)
             out.write_text(text, encoding="utf-8")
-        print(f"\nOnly the roll-up failed on {len(run)} build(s) — "
+        print(f"\nOnly the roll-up failed on {'at least ' if open_ended else ''}"
+              f"{len(run)} consecutive build(s), back to {first} — "
               f"message written to {out}")
     except (Exception, SystemExit) as e:                          # noqa: BLE001
         print(f"\n! could not write the roll-up-only message: {e}",
